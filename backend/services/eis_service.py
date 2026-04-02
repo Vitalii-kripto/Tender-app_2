@@ -364,7 +364,11 @@ class EisService:
 
                     for n in notices:
                         log(f"--- Processing {n.reg} ---")
-                        d_url = f"{BASE}/epz/order/notice/{n.ntype}/view/documents.html?regNumber={n.reg}"
+                        if n.reg.startswith("223-"):
+                            notice_id = n.reg.replace("223-", "")
+                            d_url = f"{BASE}/epz/order/notice/notice223/documents.html?noticeInfoId={notice_id}"
+                        else:
+                            d_url = f"{BASE}/epz/order/notice/{n.ntype}/view/documents.html?regNumber={n.reg}"
                         
                         try:
                             self.goto_with_human_delays(page, d_url, wait="domcontentloaded", timeout=60000, retries=2)
@@ -562,15 +566,34 @@ class EisService:
         for idx, a in enumerate(links):
             raw_items_on_page += 1
             href = (a.get("href") or "").strip()
-            match = NOTICE_HREF_RE.search(href)
-            if not match:
+            
+            # ФЗ-44 и большинство закупок используют regNumber
+            # ФЗ-223 использует noticeInfoId — нужно поддержать оба формата
+            match_reg    = re.search(r'regNumber=(\d+)', href)
+            match_notice = re.search(r'noticeInfoId=(\d+)', href)
+
+            if match_reg:
+                reg = match_reg.group(1)
+                tender_type = "fz44"
+                m_ntype = re.search(r'/epz/order/notice/([^/]+)/', href)
+                ntype = m_ntype.group(1) if m_ntype else "ea20"
+            elif match_notice:
+                reg = f"223-{match_notice.group(1)}"   # префикс чтобы не путать с ФЗ-44
+                tender_type = "fz223"
+                m_ntype = re.search(r'/epz/order/notice/([^/]+)/', href)
+                ntype = m_ntype.group(1) if m_ntype else "notice223"
+            else:
                 slog.info("SEARCH_ITEM", f"page={page_number} | item={idx+1} | status=skipped | reason=parse_error (no reg match in href) | href={href}")
                 skipped_on_page += 1
                 continue
 
-            ntype = match.group(1)
-            reg = match.group(2)
-            full_href = urljoin(BASE, href)
+            if tender_type == "fz223":
+                # Для ФЗ-223 извлекаем оригинальный noticeInfoId обратно
+                notice_id = reg.replace("223-", "")
+                full_href = f"https://zakupki.gov.ru/epz/order/notice/notice223/common-info.html?noticeInfoId={notice_id}"
+            else:
+                # Используем ntype из ссылки, если есть, иначе ea20
+                full_href = f"https://zakupki.gov.ru/epz/order/notice/{ntype}/view/common-info.html?regNumber={reg}"
 
             title = self._normalize_text(a.get_text(" ", strip=True))
             if not title:

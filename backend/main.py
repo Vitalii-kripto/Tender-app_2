@@ -371,6 +371,12 @@ def search_tenders_endpoint(
         else:
             parsed_price = float(raw_price)
 
+        if n.reg.startswith("223-"):
+            notice_id = n.reg.replace("223-", "")
+            docs_url = f"https://zakupki.gov.ru/epz/order/notice/notice223/documents.html?noticeInfoId={notice_id}"
+        else:
+            docs_url = f"https://zakupki.gov.ru/epz/order/notice/{n.ntype}/view/documents.html?regNumber={n.reg}"
+
         result.append({
             "id": n.reg,
             "eis_number": n.reg,
@@ -385,7 +391,7 @@ def search_tenders_endpoint(
             "region": "РФ",
             "law_type": n.ntype,
             "url": n.href,
-            "docs_url": f"https://zakupki.gov.ru/epz/order/notice/{n.ntype}/view/documents.html?regNumber={n.reg}",
+            "docs_url": docs_url,
             "search_url": n.search_url,
             "keyword": n.keyword,
             "ntype": n.ntype,
