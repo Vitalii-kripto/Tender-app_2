@@ -606,8 +606,9 @@ class EisService:
         if "/contract-info" in path and "/printform/" not in path:
             return 2
 
-        if "/plan.html" in path and "/printform/" not in path:
-            return 3
+        # plan.html - отбрасываем как канонический
+        if "/plan.html" in path:
+            return 100
 
         # printForm/common-info оставляем только как запасной fallback
         if "/printform/" in path and "/common-info" in path:
@@ -617,7 +618,7 @@ class EisService:
         if self._is_technical_notice_href(href):
             return 1000
 
-        return 100
+        return 10
 
     def _choose_better_href(self, current_href: str, candidate_href: str) -> str:
         if not current_href:
@@ -629,6 +630,20 @@ class EisService:
 
     def _find_result_card(self, anchor):
         # Пытаемся найти контейнер карточки результата
+        for parent in anchor.parents:
+            try:
+                if not getattr(parent, "name", None):
+                    continue
+
+                classes = " ".join(parent.get("class") or []).lower()
+
+                # Наиболее точные классы карточки ЕИС
+                if "search-registry-entry-block" in classes or "registry-entry__form" in classes:
+                    return parent
+            except Exception:
+                continue
+
+        # Если не нашли по точным классам, ищем по тексту и общим классам
         for parent in anchor.parents:
             try:
                 if not getattr(parent, "name", None):
@@ -681,6 +696,9 @@ class EisService:
             if not key:
                 continue
 
+            if "/plan.html" in full_href.lower():
+                continue
+
             # Служебные printForm/listModal не используем как самостоятельный сигнал наличия выдачи,
             # кроме случая, когда больше вообще ничего нет
             if self._is_technical_notice_href(full_href) and "/common-info" not in full_href.lower():
@@ -712,114 +730,107 @@ class EisService:
 
     def _extract_notices_from_results(self, html: str, keyword: str, search_url: str, page_number: int, slog: 'SearchLogger') -> List[Notice]:
         soup = BeautifulSoup(html, "html.parser")
-        found_by_key: Dict[str, Notice] = {}
+        results: List[Notice] = []
         
-        raw_items_on_page = 0
-        added_to_collected = 0
-        skipped_on_page = 0
-
+        cards_map = {}
         links = soup.select(NOTICE_LINK_SELECTOR)
         for a in links:
-            raw_items_on_page += 1
-            href = (a.get("href") or "").strip()
-            if not href:
-                slog.info("SEARCH_ITEM", f"page={page_number} | item={raw_items_on_page} | status=skipped | reason=empty_href")
-                skipped_on_page += 1
-                continue
-
-            key = self._extract_notice_key_from_href(href)
-            if not key:
-                slog.info("SEARCH_ITEM", f"page={page_number} | item={raw_items_on_page} | status=skipped | reason=parse_error (no reg match in href) | href={href}")
-                skipped_on_page += 1
-                continue
-
-            key_name, key_value = key
-            full_href = urljoin(BASE, href)
-            ntype = self._extract_notice_type_from_href(full_href)
-
             card = self._find_result_card(a)
-
-            title = self._normalize_text(a.get_text(" ", strip=True))
-            if not title:
-                title = self._normalize_text(a.get("title") or "")
-
-            if card is not None:
-                card_title = ""
-                try:
-                    preferred_links = []
-                    for link in card.select("a[href]"):
-                        link_href = (link.get("href") or "").strip()
-                        if not link_href:
-                            continue
-                        if not self._extract_notice_key_from_href(link_href):
-                            continue
-                        preferred_links.append(link)
-
-                    preferred_links.sort(
-                        key=lambda link: self._href_rank(urljoin(BASE, (link.get("href") or "").strip()))
-                    )
-
-                    for link in preferred_links:
-                        link_text = self._normalize_text(link.get_text(" ", strip=True))
-                        if link_text and len(link_text) > len(card_title):
-                            card_title = link_text
-                except Exception:
-                    card_title = ""
-
-                if len(card_title) > len(title):
-                    title = card_title
-
-            object_info = self._extract_field_by_label(card, ["Объект закупки"]) if card else ""
-            initial_price = self._extract_initial_price(card) if card else ""
-            application_deadline = self._extract_application_deadline(card) if card else ""
-
-            current = found_by_key.get(key_value)
-
-            if current is None:
-                slog.info("SEARCH_ITEM", f"page={page_number} | item={raw_items_on_page} | key={key_name}:{key_value} | title='{title[:50]}...' | price='{initial_price}' | href={full_href} | status=added")
-                current = Notice(
-                    reg=key_value,
-                    ntype=ntype,
-                    keyword=keyword,
-                    search_url=search_url,
-                    title=title,
-                    href=full_href,
-                    object_info=object_info,
-                    initial_price=initial_price,
-                    application_deadline=application_deadline,
-                    seen=is_seen(key_value),
-                    docs_url=full_href if "/documents" in full_href.lower() else "",
-                )
-                current.page_number = page_number
-                found_by_key[key_value] = current
-                added_to_collected += 1
+            if card:
+                cid = id(card)
+                if cid not in cards_map:
+                    cards_map[cid] = {'card': card, 'links': []}
+                cards_map[cid]['links'].append(a)
             else:
-                slog.info("SEARCH_ITEM", f"page={page_number} | item={raw_items_on_page} | key={key_name}:{key_value} | status=merged | reason=duplicate_on_same_page")
-                skipped_on_page += 1
-                if title and len(title) > len(current.title):
-                    current.title = title
+                cid = id(a)
+                cards_map[cid] = {'card': a, 'links': [a]}
 
-                if object_info and len(object_info) > len(current.object_info):
-                    current.object_info = object_info
-
-                if initial_price and len(initial_price) > len(current.initial_price):
-                    current.initial_price = initial_price
-
-                if application_deadline and len(application_deadline) > len(current.application_deadline):
-                    current.application_deadline = application_deadline
-
-                current.href = self._choose_better_href(current.href, full_href)
-
-                if "/documents" in full_href.lower() and (
-                    not current.docs_url or self._href_rank(full_href) < self._href_rank(current.docs_url)
-                ):
-                    current.docs_url = full_href
-
-                if not current.ntype and ntype:
-                    current.ntype = ntype
-
-        slog.info("SEARCH_PAGE_SUMMARY", f"page={page_number} | raw_items_on_page={raw_items_on_page} | added_to_collected={added_to_collected} | skipped_on_page={skipped_on_page}")
-        return list(found_by_key.values())
+        card_index = 0
+        for cid, data in cards_map.items():
+            card_index += 1
+            card = data['card']
+            card_links = data['links']
+            
+            valid_links = []
+            for a in card_links:
+                href = (a.get("href") or "").strip()
+                if not href: continue
+                full_href = urljoin(BASE, href)
+                key = self._extract_notice_key_from_href(full_href)
+                if not key: continue
+                valid_links.append((full_href, key, a))
+                
+            if not valid_links:
+                slog.info("SEARCH_CARD", f"page={page_number} | card_index={card_index} | status=skipped | reason=no_valid_links")
+                continue
+                
+            valid_links.sort(key=lambda x: self._href_rank(x[0]))
+            
+            best_link_tuple = None
+            for vl in valid_links:
+                rank = self._href_rank(vl[0])
+                if rank < 100:
+                    best_link_tuple = vl
+                    break
+                    
+            if not best_link_tuple:
+                slog.info("SEARCH_CARD", f"page={page_number} | card_index={card_index} | status=skipped | reason=only_plan_or_technical_links")
+                continue
+                
+            best_href, best_key, best_a = best_link_tuple
+            key_name, key_value = best_key
+            
+            # Для 223-ФЗ добавляем префикс, чтобы не путать с ФЗ-44
+            if key_name == "noticeInfoId":
+                reg_id = f"223-{key_value}"
+            else:
+                reg_id = key_value
+                
+            ntype = self._extract_notice_type_from_href(best_href)
+            
+            title = self._normalize_text(best_a.get_text(" ", strip=True))
+            if not title:
+                title = self._normalize_text(best_a.get("title") or "")
+                
+            for vl in valid_links:
+                link_text = self._normalize_text(vl[2].get_text(" ", strip=True))
+                if link_text and len(link_text) > len(title):
+                    title = link_text
+                    
+            object_info = self._extract_field_by_label(card, ["Объект закупки", "Наименование объекта закупки"])
+            initial_price = self._extract_initial_price(card)
+            application_deadline = self._extract_application_deadline(card)
+            
+            docs_url = ""
+            for vl in valid_links:
+                if "/documents" in vl[0].lower() and "/printform/" not in vl[0].lower():
+                    docs_url = vl[0]
+                    break
+            if not docs_url and "/documents" in best_href.lower():
+                docs_url = best_href
+                
+            plan_dropped = any('/plan.html' in vl[0].lower() for vl in valid_links)
+            
+            slog.info("SEARCH_CARD", f"page={page_number} | card_index={card_index} | key={key_name}:{key_value} | title='{title[:50]}...' | object_info={'found' if object_info else 'not_found'} | price='{initial_price}' | href={best_href} | plan_dropped={plan_dropped} | status=added")
+            
+            n = Notice(
+                reg=reg_id,
+                ntype=ntype,
+                keyword=keyword,
+                search_url=search_url,
+                title=title,
+                href=best_href,
+                object_info=object_info,
+                initial_price=initial_price,
+                application_deadline=application_deadline,
+                seen=is_seen(reg_id),
+                docs_url=docs_url,
+            )
+            n.page_number = page_number
+            results.append(n)
+            
+        slog.info("SEARCH_PAGE_SUMMARY", f"page={page_number} | cards_found={len(cards_map)} | results_added={len(results)}")
+        return results
 
     def _has_notice_results(self, page) -> bool:
         try:
