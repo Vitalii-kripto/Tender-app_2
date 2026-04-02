@@ -1,8 +1,3 @@
-from backend.logging_setup import setup_logging
-
-logger = setup_logging()
-logger.info("--- [UNIFIED LOGGER INITIALIZED] ---")
-
 import uvicorn
 import asyncio
 import sys
@@ -94,7 +89,7 @@ def parse_markdown_list(text):
             list_items.append(clean_markdown(line))
     return list_items
 
-
+from backend.logger import logger
 
 # --- SETUP ---
 def migrate_db():
@@ -342,20 +337,24 @@ def search_tenders_endpoint(
     _ = Depends(check_eis_service)
 ):
     """Поиск через Playwright"""
-    logger.info(f"Search request received: {query}")
+    import uuid
+    search_id = uuid.uuid4().hex[:8]
+    logger.info(f"[SEARCH_API_START] [SearchID:{search_id}] Search request received: {query}")
     try:
         notices = eis_service.search_tenders(
             query=query, 
             fz44=fz44, 
             fz223=fz223, 
             only_application_stage=only_application_stage, 
-            publish_days_back=publish_days_back
+            publish_days_back=publish_days_back,
+            search_id=search_id
         )
+        logger.info(f"[SEARCH_API_RESPONSE] [SearchID:{search_id}] eis_service returned {len(notices)} items")
     except RuntimeError as e:
-        logger.error(f"Search failed: {e}")
+        logger.error(f"[SEARCH_API_ERROR] [SearchID:{search_id}] Search failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        logger.error(f"Search failed with unexpected error: {e}")
+        logger.error(f"[SEARCH_API_ERROR] [SearchID:{search_id}] Search failed with unexpected error: {e}")
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
     
     # Convert Notice dataclass to dict for JSON response
@@ -392,6 +391,13 @@ def search_tenders_endpoint(
             "ntype": n.ntype,
             "seen": n.seen
         })
+    
+    logger.info(f"[SEARCH_API_RESPONSE] [SearchID:{search_id}] Returning {len(result)} items to frontend.")
+    logger.debug(f"[SEARCH_API_RESPONSE] [SearchID:{search_id}] Regs sent to frontend: {[r['id'] for r in result]}")
+    
+    if len(notices) > len(result):
+        logger.warning(f"[SEARCH_API_WARNING] [SearchID:{search_id}] raw_found_count={len(notices)} | final_returned_count={len(result)} | delta={len(notices) - len(result)} | reason=Some notices were dropped during JSON serialization")
+
     return result
 
 @app.post("/api/search-tenders/process")

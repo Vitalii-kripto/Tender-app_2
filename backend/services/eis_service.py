@@ -293,6 +293,22 @@ def download_file_with_real_name(file_url: str, reg_dir: str, suggested_title: s
 
     return out_path
 
+class SearchLogger:
+    def __init__(self, search_id: str):
+        self.search_id = search_id
+
+    def info(self, prefix: str, msg: str):
+        logger.info(f"[{prefix}] [SearchID:{self.search_id}] {msg}")
+
+    def debug(self, prefix: str, msg: str):
+        logger.debug(f"[{prefix}] [SearchID:{self.search_id}] {msg}")
+
+    def warning(self, prefix: str, msg: str):
+        logger.warning(f"[{prefix}] [SearchID:{self.search_id}] {msg}")
+
+    def error(self, prefix: str, msg: str):
+        logger.error(f"[{prefix}] [SearchID:{self.search_id}] {msg}")
+
 class EisService:
     def process_tenders(self, notices: List[Notice]) -> List[Dict]:
         if sys.platform == 'win32':
@@ -425,157 +441,6 @@ class EisService:
         self._cancel_flag = True
         logger.info("Search cancellation requested.")
 
-    def _ensure_artifacts_dir(self) -> str:
-        artifacts_dir = os.path.join("logs", "artifacts")
-        os.makedirs(artifacts_dir, exist_ok=True)
-        return artifacts_dir
-
-    def _save_search_artifacts(self, page, prefix: str = "search_error"):
-        artifacts_dir = self._ensure_artifacts_dir()
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        png_path = os.path.join(artifacts_dir, f"{prefix}_{stamp}.png")
-        html_path = os.path.join(artifacts_dir, f"{prefix}_{stamp}.html")
-
-        try:
-            page.screenshot(path=png_path, full_page=True)
-        except Exception as e:
-            logger.error("Failed to save screenshot: %s", e)
-
-        try:
-            html = page.content()
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(html)
-        except Exception as e:
-            logger.error("Failed to save html dump: %s", e)
-
-        logger.error("Search artifacts saved. screenshot=%s html=%s", png_path, html_path)
-        return png_path, html_path
-
-    def _wait_search_page_ready(self, page, timeout_ms: int = 45000):
-        last_error = None
-
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-        except Exception as e:
-            last_error = e
-            logger.warning("domcontentloaded wait failed: %s", e)
-
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception as e:
-            last_error = e
-            logger.info("networkidle not reached, continue with DOM-based waits: %s", e)
-
-        selectors = [
-            ".search-registry-entry-block",
-            ".card-item",
-            "div.registerBox",
-            "div.search-results",
-            "text=ничего не найдено",
-            "text=по вашему запросу ничего не найдено",
-        ]
-
-        for selector in selectors:
-            try:
-                page.locator(selector).first.wait_for(timeout=5000)
-                logger.info("Search page ready by selector: %s", selector)
-                return
-            except Exception:
-                pass
-
-        if last_error:
-            logger.warning("Search page readiness fallback used after waits. last_error=%s", last_error)
-
-    def _safe_page_content(self, page, retries: int = 2, delay_sec: float = 1.5) -> str:
-        last_exc = None
-        for attempt in range(1, retries + 1):
-            try:
-                self._wait_search_page_ready(page)
-                return page.content()
-            except Exception as e:
-                last_exc = e
-                logger.warning(
-                    "safe_page_content failed on attempt %s/%s: %s",
-                    attempt, retries, e
-                )
-                time.sleep(delay_sec)
-
-        self._save_search_artifacts(page, "page_content_failure")
-        raise last_exc
-
-    def _click_apply_if_needed(self, page) -> bool:
-        candidates = [
-            page.get_by_role("button", name="Применить"),
-            page.locator("button:has-text('Применить')"),
-            page.locator("input[type='submit'][value='Применить']"),
-        ]
-
-        for button in candidates:
-            try:
-                if button.count() == 0:
-                    continue
-            except Exception:
-                pass
-
-            try:
-                if button.first.is_visible(timeout=2000):
-                    logger.info("Apply button is visible, trying click")
-                    button.first.click(timeout=10000)
-                    self._wait_search_page_ready(page)
-                    logger.info("Apply button clicked successfully")
-                    return True
-            except Exception as e:
-                logger.warning("Apply click failed: %s", e)
-                continue
-
-        logger.info("Apply button not found or not clickable; continuing without click")
-        return False
-
-    def _extract_cards_count(self, page) -> int:
-        selectors = [
-            ".search-registry-entry-block",
-            ".card-item",
-            "div.registerBox",
-        ]
-        for selector in selectors:
-            try:
-                count = page.locator(selector).count()
-                if count:
-                    return count
-            except Exception:
-                pass
-        return 0
-
-    def _page_has_no_results(self, page) -> bool:
-        patterns = [
-            "по вашему запросу ничего не найдено",
-            "ничего не найдено",
-            "результаты не найдены",
-        ]
-        try:
-            text = self._safe_page_content(page).lower()
-        except Exception:
-            return False
-        return any(p in text for p in patterns)
-
-    def _goto_search_page_stable(self, page, url: str, attempts: int = 2):
-        last_exc = None
-        for attempt in range(1, attempts + 1):
-            try:
-                logger.info("GOTO stable -> %s (attempt %s/%s)", url, attempt, attempts)
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                self._wait_search_page_ready(page)
-                return
-            except Exception as e:
-                last_exc = e
-                logger.warning("Stable goto failed: %s", e)
-                try:
-                    self._save_search_artifacts(page, "goto_failure")
-                except Exception:
-                    pass
-                time.sleep(2)
-        raise last_exc
-
     def _publish_date_from_str(self, days_back: int) -> str:
         dt = datetime.now() - timedelta(days=days_back)
         return dt.strftime("%d.%m.%Y")
@@ -685,14 +550,22 @@ class EisService:
             return self._normalize_text(m.group(0))
         return ""
 
-    def _extract_notices_from_results(self, html: str, keyword: str, search_url: str) -> List[Notice]:
+    def _extract_notices_from_results(self, html: str, keyword: str, search_url: str, page_number: int, slog: 'SearchLogger') -> List[Notice]:
         soup = BeautifulSoup(html, "html.parser")
         found_by_reg: Dict[str, Notice] = {}
+        
+        raw_items_on_page = 0
+        added_to_collected = 0
+        skipped_on_page = 0
 
-        for a in soup.select(NOTICE_LINK_SELECTOR):
+        links = soup.select(NOTICE_LINK_SELECTOR)
+        for idx, a in enumerate(links):
+            raw_items_on_page += 1
             href = (a.get("href") or "").strip()
             match = NOTICE_HREF_RE.search(href)
             if not match:
+                slog.info("SEARCH_ITEM", f"page={page_number} | item={idx+1} | status=skipped | reason=parse_error (no reg match in href) | href={href}")
+                skipped_on_page += 1
                 continue
 
             ntype = match.group(1)
@@ -722,8 +595,10 @@ class EisService:
             initial_price = self._extract_initial_price(card) if card else ""
             application_deadline = self._extract_application_deadline(card) if card else ""
 
+            slog.info("SEARCH_ITEM", f"page={page_number} | item={idx+1} | reg={reg} | title='{title[:50]}...' | price='{initial_price}' | href={full_href} | status=added")
+
             if reg not in found_by_reg:
-                found_by_reg[reg] = Notice(
+                n = Notice(
                     reg=reg,
                     ntype=ntype,
                     keyword=keyword,
@@ -734,7 +609,12 @@ class EisService:
                     initial_price=initial_price,
                     application_deadline=application_deadline,
                 )
+                n.page_number = page_number
+                found_by_reg[reg] = n
+                added_to_collected += 1
             else:
+                slog.info("SEARCH_ITEM", f"page={page_number} | item={idx+1} | reg={reg} | status=skipped | reason=duplicate_on_same_page")
+                skipped_on_page += 1
                 current = found_by_reg[reg]
                 if len(title) > len(current.title):
                     current.title = title
@@ -747,6 +627,7 @@ class EisService:
                 if not current.href:
                     current.href = full_href
 
+        slog.info("SEARCH_PAGE_SUMMARY", f"page={page_number} | raw_items_on_page={raw_items_on_page} | added_to_collected={added_to_collected} | skipped_on_page={skipped_on_page}")
         return list(found_by_reg.values())
 
     def _has_notice_results(self, page) -> bool:
@@ -779,30 +660,74 @@ class EisService:
             return ""
 
     def _ensure_fresh_search_results(self, page) -> bool:
-        try:
-            clicked = self._click_apply_if_needed(page)
-            self._wait_search_page_ready(page)
-            logger.info("Fresh search results ensured. apply_clicked=%s final_url=%s", clicked, page.url)
-            return clicked
-        except Exception as e:
-            logger.error("Failed to ensure fresh search results: %s", e, exc_info=True)
-            self._save_search_artifacts(page, "ensure_fresh_results_failure")
+        initial_has_results = self._wait_results_or_empty(page, timeout_ms=15000)
+        if not initial_has_results:
+            logger.info("На странице результатов карточек нет")
             return False
 
-    def goto_with_human_delays(self, page, url: str, wait: str = "domcontentloaded", timeout: int = 60000, op_counter: Optional[int] = None, retries: int = 2):
+        page.wait_for_timeout(300)
+        before_href = self._get_first_notice_href(page)
+
+        try:
+            btn = page.get_by_role("button", name=re.compile(r"применить", re.I))
+            if btn.count() > 0:
+                btn.first.click()
+                logger.info("Нажата кнопка 'Применить' через get_by_role")
+            else:
+                btn2 = page.locator("input[type='submit'][value*='Применить'], button:has-text('Применить')")
+                if btn2.count() > 0:
+                    btn2.first.click()
+                    logger.info("Нажата кнопка 'Применить' через locator")
+                else:
+                    logger.info("Кнопка 'Применить' не найдена, используем текущую выдачу")
+                    return initial_has_results
+        except Exception as e:
+            logger.info(f"Не удалось нажать 'Применить': {e}")
+            return initial_has_results
+
+        page.wait_for_timeout(500)
+
+        try:
+            page.wait_for_function(
+                """(sel, before) => {
+                    const a = document.querySelector(sel);
+                    if (!a) return false;
+                    const now = a.getAttribute('href') || '';
+                    return now && now !== before;
+                }""",
+                arg=(NOTICE_LINK_SELECTOR, before_href),
+                timeout=8000,
+            )
+        except Exception:
+            pass
+
+        page.wait_for_timeout(700)
+        has_results = self._wait_results_or_empty(page, timeout_ms=12000)
+        logger.info(f"После 'Применить': has_results={has_results}")
+        return has_results
+
+    def goto_with_human_delays(self, page, url: str, wait: str = "domcontentloaded", timeout: int = 60000, op_counter: Optional[int] = None, retries: int = 2, slog: 'SearchLogger' = None, page_number: int = 0):
         last_exc = None
         for attempt in range(1, retries + 1):
             try:
                 human_sleep(1.2, 3.2)
-                logger.info(f"GOTO -> {url} (attempt {attempt}/{retries})")
+                if slog:
+                    slog.info("SEARCH_PAGE", f"GOTO -> {url} (attempt {attempt}/{retries})")
+                else:
+                    logger.info(f"GOTO -> {url} (attempt {attempt}/{retries})")
                 page.goto(url, wait_until=wait, timeout=timeout)
                 human_sleep(0.8, 2.2)
                 if op_counter is not None:
                     long_pause_every(25, op_counter)
+                if slog:
+                    slog.info("SEARCH_PAGE", f"page={page_number} | URL loaded successfully")
                 return
             except PwTimeoutError as e:
                 last_exc = e
-                logger.error(f"GOTO timeout on {url} (attempt {attempt}/{retries})")
+                if slog:
+                    slog.warning("SEARCH_PAGE_ERROR", f"page={page_number} | attempt={attempt} | url={url} | type=TimeoutError | outcome={'retry' if attempt < retries else 'abort'}")
+                else:
+                    logger.error(f"GOTO timeout on {url} (attempt {attempt}/{retries})")
                 if attempt < retries:
                     human_sleep(3.0, 7.0)
                     continue
@@ -813,6 +738,10 @@ class EisService:
             except Exception as e:
                 last_exc = e
                 err_msg = str(e)
+                if slog:
+                    slog.warning("SEARCH_PAGE_ERROR", f"page={page_number} | attempt={attempt} | url={url} | type=Exception | outcome={'retry' if attempt < retries else 'abort'} | error={err_msg}")
+                else:
+                    logger.error(f"GOTO error on {url} (attempt {attempt}/{retries}): {err_msg}")
                 if attempt < retries:
                     human_sleep(3.0, 7.0)
                     continue
@@ -826,7 +755,15 @@ class EisService:
         if last_exc:
             raise last_exc
 
-    def search_tenders(self, query: str, fz44: bool = True, fz223: bool = True, only_application_stage: bool = True, publish_days_back: int = 30):
+    def search_tenders(self, query: str, fz44: bool = True, fz223: bool = True, only_application_stage: bool = True, publish_days_back: int = 30, search_id: str = None):
+        import uuid
+        if not search_id:
+            search_id = uuid.uuid4().hex[:8]
+        slog = SearchLogger(search_id)
+        start_time = time.time()
+
+        slog.info("SEARCH_START", f"query='{query}', fz44={fz44}, fz223={fz223}, only_application_stage={only_application_stage}, publish_days_back={publish_days_back}")
+
         # Fix for Windows NotImplementedError with Playwright inside the method
         if sys.platform == 'win32':
             try:
@@ -845,7 +782,7 @@ class EisService:
                 raise e
 
         self._cancel_flag = False
-        logger.info(f"Searching EIS via Playwright for: {query}")
+        slog.info("SEARCH_START", f"Searching EIS via Playwright for: {query}")
         collected: List[Notice] = []
         op_counter = 0
 
@@ -883,111 +820,113 @@ class EisService:
 
                     page = context.new_page()
 
-                    started_at = time.time()
-                    parsed_pages = 0
-                    total_cards = 0
-
-                    logger.info("Search request started. keyword=%s", query)
-
                     keywords = [k.strip() for k in query.split(',')] if ',' in query else [query]
 
                     for kw in keywords:
                         if self._cancel_flag:
-                            logger.info("Search cancelled by user.")
+                            slog.info("SEARCH_START", "Search cancelled by user.")
                             break
                         for pn in range(1, self.MAX_PAGES + 1):
                             if self._cancel_flag:
-                                logger.info("Search cancelled by user.")
+                                slog.info("SEARCH_START", "Search cancelled by user.")
                                 break
                             url = self.build_search_url(kw, pn, fz44, fz223, only_application_stage, publish_days_back)
-                            logger.info("[SEARCH] kw='%s' page=%s", kw, pn)
-                            logger.info("[SEARCH] url: %s", url)
+                            slog.info("SEARCH_START", f"Generated URL for kw='{kw}', page={pn}: {url} | OKPD2: {self.OKPD2_IDS} | OKPD2_CODES: {self.OKPD2_IDS_CODES}")
 
                             try:
-                                self._goto_search_page_stable(page, url)
+                                self.goto_with_human_delays(page, url, op_counter=op_counter, retries=2, slog=slog, page_number=pn)
+                                op_counter += 1
 
-                                apply_clicked = False
-                                try:
-                                    apply_clicked = self._click_apply_if_needed(page)
-                                except Exception as e:
-                                    logger.warning("Apply stage failed: %s", e)
-                                    self._save_search_artifacts(page, "apply_stage_failure")
-
-                                try:
-                                    self._wait_search_page_ready(page)
-                                    cards_count = self._extract_cards_count(page)
-                                    no_results = self._page_has_no_results(page)
-
-                                    logger.info(
-                                        "[SEARCH_STATE] kw=%s page=%s final_url=%s apply_clicked=%s cards=%s no_results=%s",
-                                        kw,
-                                        pn,
-                                        page.url,
-                                        apply_clicked,
-                                        cards_count,
-                                        no_results,
-                                    )
-
-                                    if no_results and cards_count == 0:
-                                        logger.info("[SEARCH] no results on page %s for kw='%s' -> stop pages for this keyword", pn, kw)
-                                        break
-
-                                    html = self._safe_page_content(page)
-                                    items = self._extract_notices_from_results(html, kw, url)
-                                    logger.info(f"[SEARCH] found notices: {len(items)}")
-                                    
-                                    if not items:
-                                        break
-
-                                    collected.extend(items)
-                                    parsed_pages += 1
-                                    total_cards += cards_count
-
-                                except Exception as e:
-                                    logger.error("Search page processing failed: %s", e, exc_info=True)
-                                    self._save_search_artifacts(page, "search_processing_failure")
-                                    raise
+                                has_results = self._ensure_fresh_search_results(page)
+                                if not has_results:
+                                    slog.info("SEARCH_PAGE", f"no results on page {pn} for kw='{kw}' -> stop pages for this keyword")
+                                    break
 
                             except PwTimeoutError as e:
-                                logger.error(f"[SEARCH] timeout kw='{kw}' page={pn}: {e}")
+                                slog.error("SEARCH_PAGE", f"timeout kw='{kw}' page={pn}: {e}")
                                 break
                             except Exception as e:
-                                logger.error(f"[SEARCH] error kw='{kw}' page={pn}: {e}")
+                                slog.error("SEARCH_PAGE", f"error kw='{kw}' page={pn}: {e}")
                                 break
 
-                    logger.info(
-                        "Search request finished. keyword=%s parsed_pages=%s total_cards=%s duration_sec=%.2f",
-                        query,
-                        parsed_pages,
-                        total_cards,
-                        time.time() - started_at,
-                    )
+                            items = self._extract_notices_from_results(page.content(), kw, url, pn, slog)
+                            slog.info("SEARCH_PAGE", f"found notices after per-page dedup: {len(items)}")
+                            
+                            if not items:
+                                break
+
+                            collected.extend(items)
+                            slog.info("SEARCH_PAGE_SUMMARY", f"cumulative_collected_total={len(collected)}")
 
                     ensure_dir(os.path.dirname(STATE_PATH))
                     context.storage_state(path=STATE_PATH)
                     logger.info(f"[state] saved: {STATE_PATH}")
 
                 except Exception as nav_err:
-                    logger.error(f"Navigation/Page Error: {nav_err}")
+                    slog.error("SEARCH_PAGE", f"Navigation/Page Error: {nav_err}")
                 finally:
                     browser.close()
-                    logger.info("Browser closed.")
+                    slog.info("SEARCH_PAGE", "Browser closed.")
 
                 # Filter and merge
-                merged: Dict[str, Notice] = {}
+                slog.info("SEARCH_DEDUP", f"Starting deduplication. Raw items collected: {len(collected)}")
+                slog.info("SEARCH_DEDUP", "deduplication_key = reg")
+
+                from collections import defaultdict
+                grouped = defaultdict(list)
                 for n in collected:
-                    n.seen = is_seen(n.reg)
-                    if n.reg not in merged:
-                        merged[n.reg] = n
+                    grouped[n.reg].append(n)
+
+                merged: Dict[str, Notice] = {}
+                duplicates_removed = 0
+                duplicate_regs = []
+
+                for reg, items in grouped.items():
+                    if len(items) == 1:
+                        n = items[0]
+                        n.seen = is_seen(n.reg)
+                        merged[reg] = n
                     else:
-                        current = merged[n.reg]
-                        if len(n.title) > len(current.title):
-                            current.title = n.title
-                        if n.object_info and len(n.object_info) > len(current.object_info):
-                            current.object_info = n.object_info
+                        duplicates_removed += (len(items) - 1)
+                        duplicate_regs.append(reg)
+                        slog.info("SEARCH_DEDUP_ITEM", f"reg: {reg} | Found {len(items)} records")
+                        for idx, it in enumerate(items):
+                            slog.info("SEARCH_DEDUP_ITEM", f"  Record {idx+1}: title='{it.title[:30]}...', price='{it.initial_price}', href='{it.href}', page='{getattr(it, 'page_number', 'unknown')}'")
+
+                        # Apply merge logic
+                        best = items[0]
+                        for current in items[1:]:
+                            if len(current.title) > len(best.title):
+                                slog.info("SEARCH_DEDUP_ITEM", f"  -> Updating best title: '{best.title[:20]}...' -> '{current.title[:20]}...'")
+                                best.title = current.title
+                            if current.object_info and len(current.object_info) > len(best.object_info):
+                                best.object_info = current.object_info
+                            if current.initial_price and len(current.initial_price) > len(best.initial_price):
+                                best.initial_price = current.initial_price
+                            if current.application_deadline and len(current.application_deadline) > len(best.application_deadline):
+                                best.application_deadline = current.application_deadline
+                            if not best.href:
+                                best.href = current.href
+
+                        best.seen = is_seen(best.reg)
+                        merged[reg] = best
+                        slog.info("SEARCH_DEDUP_ITEM", f"  -> Kept merged record for reg {reg}. Reason: merged longest fields.")
+
+                slog.info("SEARCH_DEDUP", f"Deduplication finished. Before merge: {len(collected)}, After merge: {len(merged)}, Duplicates removed: {duplicates_removed}")
+                if duplicate_regs:
+                    slog.info("SEARCH_DEDUP", f"Duplicate regs: {duplicate_regs}")
                 
-                return list(merged.values())
+                final_results = list(merged.values())
+                slog.info("SEARCH_RESULT", f"final_result_count: {len(final_results)}")
+                slog.debug("SEARCH_RESULT", f"Final regs: {[n.reg for n in final_results]}")
+                slog.debug("SEARCH_RESULT", f"Final titles: {[n.title for n in final_results]}")
+                slog.debug("SEARCH_RESULT", f"Final URLs: {[n.href for n in final_results]}")
+
+                duration = time.time() - start_time
+                slog.info("SEARCH_SUMMARY", f"query='{query}' | raw_found_total={len(collected)} | unique_after_dedup={len(final_results)} | duplicates_removed={duplicates_removed} | returned_to_api={len(final_results)} | duration_seconds={duration:.2f}")
+
+                return final_results
 
         except Exception as global_err:
-            logger.error(f"Playwright Global Error: {global_err}", exc_info=True)
+            slog.error("SEARCH_START", f"Playwright Global Error: {global_err}")
             raise global_err
