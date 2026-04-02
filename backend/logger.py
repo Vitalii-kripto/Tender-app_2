@@ -26,14 +26,14 @@ def setup_unified_logger():
     # Формат логов
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
-    # Хендлер для файла (режим 'a' - append)
-    file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8', mode='a')
+    # Хендлер для файла (режим 'w' - overwrite)
+    file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8', mode='w')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     
     # Хендлер для фронтенд-логов
     frontend_log_file = os.path.join(LOG_DIR, 'frontend.log')
-    frontend_handler = logging.FileHandler(frontend_log_file, encoding='utf-8', mode='a')
+    frontend_handler = logging.FileHandler(frontend_log_file, encoding='utf-8', mode='w')
     frontend_handler.setFormatter(formatter)
     frontend_logger = logging.getLogger("Frontend")
     frontend_logger.setLevel(logging.INFO)
