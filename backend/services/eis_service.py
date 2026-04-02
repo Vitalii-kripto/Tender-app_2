@@ -425,157 +425,6 @@ class EisService:
         self._cancel_flag = True
         logger.info("Search cancellation requested.")
 
-    def _ensure_artifacts_dir(self) -> str:
-        artifacts_dir = os.path.join("logs", "artifacts")
-        os.makedirs(artifacts_dir, exist_ok=True)
-        return artifacts_dir
-
-    def _save_search_artifacts(self, page, prefix: str = "search_error"):
-        artifacts_dir = self._ensure_artifacts_dir()
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        png_path = os.path.join(artifacts_dir, f"{prefix}_{stamp}.png")
-        html_path = os.path.join(artifacts_dir, f"{prefix}_{stamp}.html")
-
-        try:
-            page.screenshot(path=png_path, full_page=True)
-        except Exception as e:
-            logger.error("Failed to save screenshot: %s", e)
-
-        try:
-            html = page.content()
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(html)
-        except Exception as e:
-            logger.error("Failed to save html dump: %s", e)
-
-        logger.error("Search artifacts saved. screenshot=%s html=%s", png_path, html_path)
-        return png_path, html_path
-
-    def _wait_search_page_ready(self, page, timeout_ms: int = 45000):
-        last_error = None
-
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-        except Exception as e:
-            last_error = e
-            logger.warning("domcontentloaded wait failed: %s", e)
-
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception as e:
-            last_error = e
-            logger.info("networkidle not reached, continue with DOM-based waits: %s", e)
-
-        selectors = [
-            ".search-registry-entry-block",
-            ".card-item",
-            "div.registerBox",
-            "div.search-results",
-            "text=ничего не найдено",
-            "text=по вашему запросу ничего не найдено",
-        ]
-
-        for selector in selectors:
-            try:
-                page.locator(selector).first.wait_for(timeout=5000)
-                logger.info("Search page ready by selector: %s", selector)
-                return
-            except Exception:
-                pass
-
-        if last_error:
-            logger.warning("Search page readiness fallback used after waits. last_error=%s", last_error)
-
-    def _safe_page_content(self, page, retries: int = 2, delay_sec: float = 1.5) -> str:
-        last_exc = None
-        for attempt in range(1, retries + 1):
-            try:
-                self._wait_search_page_ready(page)
-                return page.content()
-            except Exception as e:
-                last_exc = e
-                logger.warning(
-                    "safe_page_content failed on attempt %s/%s: %s",
-                    attempt, retries, e
-                )
-                time.sleep(delay_sec)
-
-        self._save_search_artifacts(page, "page_content_failure")
-        raise last_exc
-
-    def _click_apply_if_needed(self, page) -> bool:
-        candidates = [
-            page.get_by_role("button", name="Применить"),
-            page.locator("button:has-text('Применить')"),
-            page.locator("input[type='submit'][value='Применить']"),
-        ]
-
-        for button in candidates:
-            try:
-                if button.count() == 0:
-                    continue
-            except Exception:
-                pass
-
-            try:
-                if button.first.is_visible(timeout=2000):
-                    logger.info("Apply button is visible, trying click")
-                    button.first.click(timeout=10000)
-                    self._wait_search_page_ready(page)
-                    logger.info("Apply button clicked successfully")
-                    return True
-            except Exception as e:
-                logger.warning("Apply click failed: %s", e)
-                continue
-
-        logger.info("Apply button not found or not clickable; continuing without click")
-        return False
-
-    def _extract_cards_count(self, page) -> int:
-        selectors = [
-            ".search-registry-entry-block",
-            ".card-item",
-            "div.registerBox",
-        ]
-        for selector in selectors:
-            try:
-                count = page.locator(selector).count()
-                if count:
-                    return count
-            except Exception:
-                pass
-        return 0
-
-    def _page_has_no_results(self, page) -> bool:
-        patterns = [
-            "по вашему запросу ничего не найдено",
-            "ничего не найдено",
-            "результаты не найдены",
-        ]
-        try:
-            text = self._safe_page_content(page).lower()
-        except Exception:
-            return False
-        return any(p in text for p in patterns)
-
-    def _goto_search_page_stable(self, page, url: str, attempts: int = 2):
-        last_exc = None
-        for attempt in range(1, attempts + 1):
-            try:
-                logger.info("GOTO stable -> %s (attempt %s/%s)", url, attempt, attempts)
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                self._wait_search_page_ready(page)
-                return
-            except Exception as e:
-                last_exc = e
-                logger.warning("Stable goto failed: %s", e)
-                try:
-                    self._save_search_artifacts(page, "goto_failure")
-                except Exception:
-                    pass
-                time.sleep(2)
-        raise last_exc
-
     def _publish_date_from_str(self, days_back: int) -> str:
         dt = datetime.now() - timedelta(days=days_back)
         return dt.strftime("%d.%m.%Y")
@@ -779,15 +628,51 @@ class EisService:
             return ""
 
     def _ensure_fresh_search_results(self, page) -> bool:
-        try:
-            clicked = self._click_apply_if_needed(page)
-            self._wait_search_page_ready(page)
-            logger.info("Fresh search results ensured. apply_clicked=%s final_url=%s", clicked, page.url)
-            return clicked
-        except Exception as e:
-            logger.error("Failed to ensure fresh search results: %s", e, exc_info=True)
-            self._save_search_artifacts(page, "ensure_fresh_results_failure")
+        initial_has_results = self._wait_results_or_empty(page, timeout_ms=15000)
+        if not initial_has_results:
+            logger.info("На странице результатов карточек нет")
             return False
+
+        page.wait_for_timeout(300)
+        before_href = self._get_first_notice_href(page)
+
+        try:
+            btn = page.get_by_role("button", name=re.compile(r"применить", re.I))
+            if btn.count() > 0:
+                btn.first.click()
+                logger.info("Нажата кнопка 'Применить' через get_by_role")
+            else:
+                btn2 = page.locator("input[type='submit'][value*='Применить'], button:has-text('Применить')")
+                if btn2.count() > 0:
+                    btn2.first.click()
+                    logger.info("Нажата кнопка 'Применить' через locator")
+                else:
+                    logger.info("Кнопка 'Применить' не найдена, используем текущую выдачу")
+                    return initial_has_results
+        except Exception as e:
+            logger.info(f"Не удалось нажать 'Применить': {e}")
+            return initial_has_results
+
+        page.wait_for_timeout(500)
+
+        try:
+            page.wait_for_function(
+                """(sel, before) => {
+                    const a = document.querySelector(sel);
+                    if (!a) return false;
+                    const now = a.getAttribute('href') || '';
+                    return now && now !== before;
+                }""",
+                arg=(NOTICE_LINK_SELECTOR, before_href),
+                timeout=8000,
+            )
+        except Exception:
+            pass
+
+        page.wait_for_timeout(700)
+        has_results = self._wait_results_or_empty(page, timeout_ms=12000)
+        logger.info(f"После 'Применить': has_results={has_results}")
+        return has_results
 
     def goto_with_human_delays(self, page, url: str, wait: str = "domcontentloaded", timeout: int = 60000, op_counter: Optional[int] = None, retries: int = 2):
         last_exc = None
@@ -883,12 +768,6 @@ class EisService:
 
                     page = context.new_page()
 
-                    started_at = time.time()
-                    parsed_pages = 0
-                    total_cards = 0
-
-                    logger.info("Search request started. keyword=%s", query)
-
                     keywords = [k.strip() for k in query.split(',')] if ',' in query else [query]
 
                     for kw in keywords:
@@ -900,53 +779,17 @@ class EisService:
                                 logger.info("Search cancelled by user.")
                                 break
                             url = self.build_search_url(kw, pn, fz44, fz223, only_application_stage, publish_days_back)
-                            logger.info("[SEARCH] kw='%s' page=%s", kw, pn)
-                            logger.info("[SEARCH] url: %s", url)
+                            logger.info(f"[SEARCH] kw='{kw}' page={pn}")
+                            logger.info(f"[SEARCH] url: {url}")
 
                             try:
-                                self._goto_search_page_stable(page, url)
+                                self.goto_with_human_delays(page, url, op_counter=op_counter, retries=2)
+                                op_counter += 1
 
-                                apply_clicked = False
-                                try:
-                                    apply_clicked = self._click_apply_if_needed(page)
-                                except Exception as e:
-                                    logger.warning("Apply stage failed: %s", e)
-                                    self._save_search_artifacts(page, "apply_stage_failure")
-
-                                try:
-                                    self._wait_search_page_ready(page)
-                                    cards_count = self._extract_cards_count(page)
-                                    no_results = self._page_has_no_results(page)
-
-                                    logger.info(
-                                        "[SEARCH_STATE] kw=%s page=%s final_url=%s apply_clicked=%s cards=%s no_results=%s",
-                                        kw,
-                                        pn,
-                                        page.url,
-                                        apply_clicked,
-                                        cards_count,
-                                        no_results,
-                                    )
-
-                                    if no_results and cards_count == 0:
-                                        logger.info("[SEARCH] no results on page %s for kw='%s' -> stop pages for this keyword", pn, kw)
-                                        break
-
-                                    html = self._safe_page_content(page)
-                                    items = self._extract_notices_from_results(html, kw, url)
-                                    logger.info(f"[SEARCH] found notices: {len(items)}")
-                                    
-                                    if not items:
-                                        break
-
-                                    collected.extend(items)
-                                    parsed_pages += 1
-                                    total_cards += cards_count
-
-                                except Exception as e:
-                                    logger.error("Search page processing failed: %s", e, exc_info=True)
-                                    self._save_search_artifacts(page, "search_processing_failure")
-                                    raise
+                                has_results = self._ensure_fresh_search_results(page)
+                                if not has_results:
+                                    logger.info(f"[SEARCH] no results on page {pn} for kw='{kw}' -> stop pages for this keyword")
+                                    break
 
                             except PwTimeoutError as e:
                                 logger.error(f"[SEARCH] timeout kw='{kw}' page={pn}: {e}")
@@ -955,13 +798,13 @@ class EisService:
                                 logger.error(f"[SEARCH] error kw='{kw}' page={pn}: {e}")
                                 break
 
-                    logger.info(
-                        "Search request finished. keyword=%s parsed_pages=%s total_cards=%s duration_sec=%.2f",
-                        query,
-                        parsed_pages,
-                        total_cards,
-                        time.time() - started_at,
-                    )
+                            items = self._extract_notices_from_results(page.content(), kw, url)
+                            logger.info(f"[SEARCH] found notices: {len(items)}")
+                            
+                            if not items:
+                                break
+
+                            collected.extend(items)
 
                     ensure_dir(os.path.dirname(STATE_PATH))
                     context.storage_state(path=STATE_PATH)

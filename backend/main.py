@@ -1,8 +1,3 @@
-from backend.logging_setup import setup_logging
-
-logger = setup_logging()
-logger.info("--- [UNIFIED LOGGER INITIALIZED] ---")
-
 import uvicorn
 import asyncio
 import sys
@@ -94,7 +89,7 @@ def parse_markdown_list(text):
             list_items.append(clean_markdown(line))
     return list_items
 
-
+from backend.logger import logger
 
 # --- SETUP ---
 def migrate_db():
