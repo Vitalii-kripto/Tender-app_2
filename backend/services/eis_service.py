@@ -102,8 +102,23 @@ except Exception as e:
 # =========================
 # РЕГЕКСЫ И КОНСТАНТЫ
 # =========================
-NOTICE_HREF_RE = re.compile(r"/epz/order/notice/([^/]+)/view/[^?]+\.html\?[^#]*regNumber=(\d+)")
 NOTICE_LINK_SELECTOR = "a[href*='/epz/order/notice/']"
+
+REGNUMBER_RE = re.compile(r"[?&]regNumber=(\d+)")
+NOTICEINFOID_RE = re.compile(r"[?&]noticeInfoId=(\d+)")
+
+TECHNICAL_NOTICE_PARTS = (
+    "/printForm/",
+    "/print-form/",
+    "listModal",
+)
+
+PREFERRED_NOTICE_PARTS = (
+    "/common-info",
+    "/documents",
+    "/contract-info",
+    "/plan.html",
+)
 
 RUB_PRICE_RE = re.compile(
     r"(\d[\d\s\xa0]*,\d{2}\s*(?:₽|руб\.?|рублей))",
@@ -430,9 +445,9 @@ class EisService:
     def __init__(self):
         self.RECORDS_PER_PAGE = 50
         self.MAX_PAGES = 5
-        self.OKPD2_IDS_WITH_NESTED = False
-        self.OKPD2_IDS = ""
-        self.OKPD2_IDS_CODES = ""
+        self.OKPD2_IDS_WITH_NESTED = True
+        self.OKPD2_IDS = "8873861,8873862,8873863"
+        self.OKPD2_IDS_CODES = "A,B,C"
         self.HEADLESS = True
         self.SLOWMO_MS = 0
         self.REQ_HEADERS = {
@@ -554,97 +569,216 @@ class EisService:
             return self._normalize_text(m.group(0))
         return ""
 
+    def _extract_notice_key_from_href(self, href: str):
+        full_href = urljoin(BASE, (href or "").strip())
+        if "/epz/order/notice/" not in full_href:
+            return None
+
+        m = REGNUMBER_RE.search(full_href)
+        if m:
+            return ("regNumber", m.group(1))
+
+        m = NOTICEINFOID_RE.search(full_href)
+        if m:
+            return ("noticeInfoId", m.group(1))
+
+        return None
+
+    def _extract_notice_type_from_href(self, href: str) -> str:
+        full_href = urljoin(BASE, (href or "").strip())
+        m = re.search(r"/epz/order/notice/([^/]+)/", urlparse(full_href).path)
+        return m.group(1) if m else ""
+
+    def _is_technical_notice_href(self, href: str) -> bool:
+        path = urlparse(urljoin(BASE, (href or "").strip())).path.lower()
+        return any(part.lower() in path for part in TECHNICAL_NOTICE_PARTS)
+
+    def _href_rank(self, href: str) -> int:
+        path = urlparse(urljoin(BASE, (href or "").strip())).path.lower()
+
+        # Самый предпочтительный вариант — обычный common-info, не printForm
+        if "/common-info" in path and "/printform/" not in path:
+            return 0
+
+        if "/documents" in path and "/printform/" not in path:
+            return 1
+
+        if "/contract-info" in path and "/printform/" not in path:
+            return 2
+
+        if "/plan.html" in path and "/printform/" not in path:
+            return 3
+
+        # printForm/common-info оставляем только как запасной fallback
+        if "/printform/" in path and "/common-info" in path:
+            return 50
+
+        # Остальные технические ссылки — самый низкий приоритет
+        if self._is_technical_notice_href(href):
+            return 1000
+
+        return 100
+
+    def _choose_better_href(self, current_href: str, candidate_href: str) -> str:
+        if not current_href:
+            return candidate_href or ""
+        if not candidate_href:
+            return current_href or ""
+
+        return candidate_href if self._href_rank(candidate_href) < self._href_rank(current_href) else current_href
+
+    def _find_result_card(self, anchor):
+        # Пытаемся найти контейнер карточки результата
+        for parent in anchor.parents:
+            try:
+                if not getattr(parent, "name", None):
+                    continue
+
+                parent_text = self._normalize_text(parent.get_text(" ", strip=True))
+                if not parent_text:
+                    continue
+
+                classes = " ".join(parent.get("class") or []).lower()
+
+                if (
+                    "registry-entry" in classes
+                    or "search-registry-entry" in classes
+                    or "card" in classes
+                    or "row" in classes
+                ):
+                    return parent
+
+                if (
+                    "Объект закупки" in parent_text
+                    or "Начальная цена" in parent_text
+                    or "Начальная (максимальная) цена" in parent_text
+                    or "Окончание подачи заявок" in parent_text
+                    or "Дата окончания срока подачи заявок" in parent_text
+                ):
+                    return parent
+            except Exception:
+                continue
+
+        return anchor.parent
+
+    def _collect_notice_hrefs_from_page(self, page) -> List[str]:
+        try:
+            raw_hrefs = page.locator(NOTICE_LINK_SELECTOR).evaluate_all(
+                "els => els.map(el => el.getAttribute('href') || '').filter(Boolean)"
+            )
+        except Exception:
+            return []
+
+        cleaned: List[str] = []
+        seen: Set[str] = set()
+
+        for href in raw_hrefs:
+            full_href = urljoin(BASE, (href or "").strip())
+            if not full_href:
+                continue
+
+            key = self._extract_notice_key_from_href(full_href)
+            if not key:
+                continue
+
+            # Служебные printForm/listModal не используем как самостоятельный сигнал наличия выдачи,
+            # кроме случая, когда больше вообще ничего нет
+            if self._is_technical_notice_href(full_href) and "/common-info" not in full_href.lower():
+                continue
+
+            if full_href not in seen:
+                seen.add(full_href)
+                cleaned.append(full_href)
+
+        cleaned.sort(key=self._href_rank)
+        return cleaned
+
+    def _get_visible_notice_keys(self, page) -> List[str]:
+        keys: List[str] = []
+        seen: Set[str] = set()
+
+        for href in self._collect_notice_hrefs_from_page(page):
+            key = self._extract_notice_key_from_href(href)
+            if not key:
+                continue
+
+            key_name, key_value = key
+            marker = f"{key_name}:{key_value}"
+            if marker not in seen:
+                seen.add(marker)
+                keys.append(marker)
+
+        return keys
+
     def _extract_notices_from_results(self, html: str, keyword: str, search_url: str, page_number: int, slog: 'SearchLogger') -> List[Notice]:
         soup = BeautifulSoup(html, "html.parser")
-        found_by_reg: Dict[str, Notice] = {}
+        found_by_key: Dict[str, Notice] = {}
         
         raw_items_on_page = 0
         added_to_collected = 0
         skipped_on_page = 0
 
-        # Ищем карточки тендеров
-        cards = soup.select(".search-registry-entry-block, .registry-entry__form, .row.no-gutters.registry-entry__form")
-        
-        for idx, card in enumerate(cards):
+        links = soup.select(NOTICE_LINK_SELECTOR)
+        for a in links:
             raw_items_on_page += 1
-            
-            # Ищем все ссылки внутри карточки
-            links = card.select("a[href*='/epz/order/notice/']")
-            
-            # Фильтруем ссылки printForm и служебные
-            valid_links = []
-            for a in links:
-                href = (a.get("href") or "").strip()
-                if "printForm" in href or "supplier-results" in href or "protocol" in href:
-                    continue
-                valid_links.append(a)
-                
-            if not valid_links:
-                slog.info("SEARCH_ITEM", f"page={page_number} | item={idx+1} | status=skipped | reason=no_valid_links_in_card")
-                skipped_on_page += 1
-                continue
-                
-            # Ищем каноническую ссылку (приоритет common-info, затем documents, затем первая попавшаяся)
-            canonical_a = None
-            for a in valid_links:
-                href = (a.get("href") or "").strip()
-                if "common-info.html" in href:
-                    canonical_a = a
-                    break
-            
-            if not canonical_a:
-                for a in valid_links:
-                    href = (a.get("href") or "").strip()
-                    if "documents.html" in href:
-                        canonical_a = a
-                        break
-                        
-            if not canonical_a:
-                canonical_a = valid_links[0]
-                
-            href = (canonical_a.get("href") or "").strip()
-            
-            # ФЗ-44 и большинство закупок используют regNumber
-            # ФЗ-223 использует noticeInfoId — нужно поддержать оба формата
-            match_reg    = re.search(r'regNumber=(\d+)', href)
-            match_notice = re.search(r'noticeInfoId=(\d+)', href)
-
-            if match_reg:
-                reg = match_reg.group(1)
-                tender_type = "fz44"
-                m_ntype = re.search(r'/epz/order/notice/([^/]+)/', href)
-                ntype = m_ntype.group(1) if m_ntype else "ea20"
-            elif match_notice:
-                reg = f"223-{match_notice.group(1)}"   # префикс чтобы не путать с ФЗ-44
-                tender_type = "fz223"
-                m_ntype = re.search(r'/epz/order/notice/([^/]+)/', href)
-                ntype = m_ntype.group(1) if m_ntype else "notice223"
-            else:
-                slog.info("SEARCH_ITEM", f"page={page_number} | item={idx+1} | status=skipped | reason=parse_error (no reg match in href) | href={href}")
+            href = (a.get("href") or "").strip()
+            if not href:
+                slog.info("SEARCH_ITEM", f"page={page_number} | item={raw_items_on_page} | status=skipped | reason=empty_href")
                 skipped_on_page += 1
                 continue
 
-            if tender_type == "fz223":
-                # Для ФЗ-223 извлекаем оригинальный noticeInfoId обратно
-                notice_id = reg.replace("223-", "")
-                full_href = f"https://zakupki.gov.ru/epz/order/notice/notice223/common-info.html?noticeInfoId={notice_id}"
-            else:
-                # Используем ntype из ссылки, если есть, иначе ea20
-                full_href = f"https://zakupki.gov.ru/epz/order/notice/{ntype}/view/common-info.html?regNumber={reg}"
+            key = self._extract_notice_key_from_href(href)
+            if not key:
+                slog.info("SEARCH_ITEM", f"page={page_number} | item={raw_items_on_page} | status=skipped | reason=parse_error (no reg match in href) | href={href}")
+                skipped_on_page += 1
+                continue
 
-            title = self._normalize_text(canonical_a.get_text(" ", strip=True))
+            key_name, key_value = key
+            full_href = urljoin(BASE, href)
+            ntype = self._extract_notice_type_from_href(full_href)
+
+            card = self._find_result_card(a)
+
+            title = self._normalize_text(a.get_text(" ", strip=True))
             if not title:
-                title = self._normalize_text(canonical_a.get("title") or "")
+                title = self._normalize_text(a.get("title") or "")
+
+            if card is not None:
+                card_title = ""
+                try:
+                    preferred_links = []
+                    for link in card.select("a[href]"):
+                        link_href = (link.get("href") or "").strip()
+                        if not link_href:
+                            continue
+                        if not self._extract_notice_key_from_href(link_href):
+                            continue
+                        preferred_links.append(link)
+
+                    preferred_links.sort(
+                        key=lambda link: self._href_rank(urljoin(BASE, (link.get("href") or "").strip()))
+                    )
+
+                    for link in preferred_links:
+                        link_text = self._normalize_text(link.get_text(" ", strip=True))
+                        if link_text and len(link_text) > len(card_title):
+                            card_title = link_text
+                except Exception:
+                    card_title = ""
+
+                if len(card_title) > len(title):
+                    title = card_title
 
             object_info = self._extract_field_by_label(card, ["Объект закупки"]) if card else ""
             initial_price = self._extract_initial_price(card) if card else ""
             application_deadline = self._extract_application_deadline(card) if card else ""
 
-            slog.info("SEARCH_ITEM", f"page={page_number} | item={idx+1} | reg={reg} | title='{title[:50]}...' | price='{initial_price}' | href={full_href} | status=added | canonical_href={href}")
+            current = found_by_key.get(key_value)
 
-            if reg not in found_by_reg:
-                n = Notice(
-                    reg=reg,
+            if current is None:
+                slog.info("SEARCH_ITEM", f"page={page_number} | item={raw_items_on_page} | key={key_name}:{key_value} | title='{title[:50]}...' | price='{initial_price}' | href={full_href} | status=added")
+                current = Notice(
+                    reg=key_value,
                     ntype=ntype,
                     keyword=keyword,
                     search_url=search_url,
@@ -653,31 +787,43 @@ class EisService:
                     object_info=object_info,
                     initial_price=initial_price,
                     application_deadline=application_deadline,
+                    seen=is_seen(key_value),
+                    docs_url=full_href if "/documents" in full_href.lower() else "",
                 )
-                n.page_number = page_number
-                found_by_reg[reg] = n
+                current.page_number = page_number
+                found_by_key[key_value] = current
                 added_to_collected += 1
             else:
-                slog.info("SEARCH_ITEM", f"page={page_number} | item={idx+1} | reg={reg} | status=skipped | reason=duplicate_on_same_page")
+                slog.info("SEARCH_ITEM", f"page={page_number} | item={raw_items_on_page} | key={key_name}:{key_value} | status=merged | reason=duplicate_on_same_page")
                 skipped_on_page += 1
-                current = found_by_reg[reg]
-                if len(title) > len(current.title):
+                if title and len(title) > len(current.title):
                     current.title = title
+
                 if object_info and len(object_info) > len(current.object_info):
                     current.object_info = object_info
+
                 if initial_price and len(initial_price) > len(current.initial_price):
                     current.initial_price = initial_price
+
                 if application_deadline and len(application_deadline) > len(current.application_deadline):
                     current.application_deadline = application_deadline
-                if not current.href:
-                    current.href = full_href
+
+                current.href = self._choose_better_href(current.href, full_href)
+
+                if "/documents" in full_href.lower() and (
+                    not current.docs_url or self._href_rank(full_href) < self._href_rank(current.docs_url)
+                ):
+                    current.docs_url = full_href
+
+                if not current.ntype and ntype:
+                    current.ntype = ntype
 
         slog.info("SEARCH_PAGE_SUMMARY", f"page={page_number} | raw_items_on_page={raw_items_on_page} | added_to_collected={added_to_collected} | skipped_on_page={skipped_on_page}")
-        return list(found_by_reg.values())
+        return list(found_by_key.values())
 
     def _has_notice_results(self, page) -> bool:
         try:
-            return page.locator(".search-registry-entry-block, .registry-entry__form, .row.no-gutters.registry-entry__form").count() > 0
+            return len(self._get_visible_notice_keys(page)) > 0
         except Exception:
             return False
 
@@ -688,21 +834,37 @@ class EisService:
             return False
         return any(p in html for p in NO_RESULTS_PATTERNS)
 
-    def _wait_results_or_empty(self, page, timeout_ms: int = 15000) -> bool:
+    def _wait_results_or_empty(self, page, timeout_ms: int = 15000, stable_rounds: int = 3) -> bool:
         deadline = time.time() + timeout_ms / 1000.0
+        last_keys: List[str] = []
+        stable_hits = 0
+
         while time.time() < deadline:
-            if self._has_notice_results(page):
-                return True
-            if self._has_no_results_banner(page):
-                return False
-            page.wait_for_timeout(400)
-        return False
+            keys = self._get_visible_notice_keys(page)
+
+            if keys:
+                if keys == last_keys:
+                    stable_hits += 1
+                else:
+                    last_keys = keys
+                    stable_hits = 1
+
+                if stable_hits >= stable_rounds:
+                    return True
+            else:
+                if self._has_no_results_banner(page):
+                    return False
+
+            page.wait_for_timeout(500)
+
+        return bool(last_keys)
 
     def _get_first_notice_href(self, page) -> str:
-        try:
-            return page.eval_on_selector(".search-registry-entry-block a[href*='/epz/order/notice/'], .registry-entry__form a[href*='/epz/order/notice/']", "el => el.getAttribute('href') || ''") or ""
-        except Exception:
+        hrefs = self._collect_notice_hrefs_from_page(page)
+        if not hrefs:
             return ""
+        hrefs.sort(key=self._href_rank)
+        return hrefs[0]
 
     def _ensure_fresh_search_results(self, page) -> bool:
         initial_has_results = self._wait_results_or_empty(page, timeout_ms=15000)
@@ -711,6 +873,8 @@ class EisService:
             return False
 
         page.wait_for_timeout(300)
+
+        before_keys = self._get_visible_notice_keys(page)
         before_href = self._get_first_notice_href(page)
 
         try:
@@ -730,32 +894,47 @@ class EisService:
             logger.info(f"Не удалось нажать 'Применить': {e}")
             return initial_has_results
 
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(700)
 
-        try:
-            page.wait_for_function(
-                """(before) => {
-                    const cards = document.querySelectorAll('.search-registry-entry-block, .registry-entry__form, .row.no-gutters.registry-entry__form');
-                    if (cards.length === 0) {
-                        const html = document.body.innerText.toLowerCase();
-                        return html.includes('по вашему запросу ничего не найдено') || 
-                               html.includes('ничего не найдено') || 
-                               html.includes('результаты не найдены');
-                    }
-                    const firstCard = cards[0];
-                    const a = firstCard.querySelector("a[href*='/epz/order/notice/']");
-                    if (!a) return false;
-                    const now = a.getAttribute('href') || '';
-                    return now && now !== before;
-                }""",
-                arg=(before_href),
-                timeout=15000,
-            )
-        except Exception:
-            pass
+        deadline = time.time() + 15.0
+        last_keys: List[str] = []
+        stable_hits = 0
 
-        page.wait_for_timeout(1000) # Дополнительная пауза для стабилизации DOM
-        has_results = self._wait_results_or_empty(page, timeout_ms=12000)
+        while time.time() < deadline:
+            keys = self._get_visible_notice_keys(page)
+
+            if not keys:
+                if self._has_no_results_banner(page):
+                    logger.info("После 'Применить': has_results=False (banner)")
+                    return False
+                page.wait_for_timeout(500)
+                continue
+
+            first_href = self._get_first_notice_href(page)
+            changed = (keys != before_keys) or (first_href != before_href)
+
+            if keys == last_keys:
+                stable_hits += 1
+            else:
+                last_keys = keys
+                stable_hits = 1
+
+            if changed and stable_hits >= 3:
+                logger.info(
+                    f"После 'Применить': has_results=True, unique_notice_keys={len(keys)}, first_href={first_href}"
+                )
+                return True
+
+            # Если выдача не изменилась, но уже стабильно существует, тоже принимаем её как валидную
+            if not changed and stable_hits >= 4:
+                logger.info(
+                    f"После 'Применить': has_results=True, unique_notice_keys={len(keys)}, first_href={first_href}"
+                )
+                return True
+
+            page.wait_for_timeout(500)
+
+        has_results = len(self._get_visible_notice_keys(page)) > 0
         logger.info(f"После 'Применить': has_results={has_results}")
         return has_results
 
