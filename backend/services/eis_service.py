@@ -430,9 +430,9 @@ class EisService:
     def __init__(self):
         self.RECORDS_PER_PAGE = 50
         self.MAX_PAGES = 5
-        self.OKPD2_IDS_WITH_NESTED = True
-        self.OKPD2_IDS = "8873861,8873862,8873863"
-        self.OKPD2_IDS_CODES = "A,B,C"
+        self.OKPD2_IDS_WITH_NESTED = False
+        self.OKPD2_IDS = ""
+        self.OKPD2_IDS_CODES = ""
         self.HEADLESS = True
         self.SLOWMO_MS = 0
         self.REQ_HEADERS = {
@@ -562,10 +562,47 @@ class EisService:
         added_to_collected = 0
         skipped_on_page = 0
 
-        links = soup.select(NOTICE_LINK_SELECTOR)
-        for idx, a in enumerate(links):
+        # Ищем карточки тендеров
+        cards = soup.select(".search-registry-entry-block, .registry-entry__form, .row.no-gutters.registry-entry__form")
+        
+        for idx, card in enumerate(cards):
             raw_items_on_page += 1
-            href = (a.get("href") or "").strip()
+            
+            # Ищем все ссылки внутри карточки
+            links = card.select("a[href*='/epz/order/notice/']")
+            
+            # Фильтруем ссылки printForm и служебные
+            valid_links = []
+            for a in links:
+                href = (a.get("href") or "").strip()
+                if "printForm" in href or "supplier-results" in href or "protocol" in href:
+                    continue
+                valid_links.append(a)
+                
+            if not valid_links:
+                slog.info("SEARCH_ITEM", f"page={page_number} | item={idx+1} | status=skipped | reason=no_valid_links_in_card")
+                skipped_on_page += 1
+                continue
+                
+            # Ищем каноническую ссылку (приоритет common-info, затем documents, затем первая попавшаяся)
+            canonical_a = None
+            for a in valid_links:
+                href = (a.get("href") or "").strip()
+                if "common-info.html" in href:
+                    canonical_a = a
+                    break
+            
+            if not canonical_a:
+                for a in valid_links:
+                    href = (a.get("href") or "").strip()
+                    if "documents.html" in href:
+                        canonical_a = a
+                        break
+                        
+            if not canonical_a:
+                canonical_a = valid_links[0]
+                
+            href = (canonical_a.get("href") or "").strip()
             
             # ФЗ-44 и большинство закупок используют regNumber
             # ФЗ-223 использует noticeInfoId — нужно поддержать оба формата
@@ -595,30 +632,15 @@ class EisService:
                 # Используем ntype из ссылки, если есть, иначе ea20
                 full_href = f"https://zakupki.gov.ru/epz/order/notice/{ntype}/view/common-info.html?regNumber={reg}"
 
-            title = self._normalize_text(a.get_text(" ", strip=True))
+            title = self._normalize_text(canonical_a.get_text(" ", strip=True))
             if not title:
-                title = self._normalize_text(a.get("title") or "")
-
-            card = None
-            for parent in a.parents:
-                try:
-                    parent_text = parent.get_text(" ", strip=True)
-                except Exception:
-                    continue
-                if (
-                    "Объект закупки" in parent_text
-                    or "Начальная цена" in parent_text
-                    or "Начальная (максимальная) цена" in parent_text
-                    or "Окончание подачи заявок" in parent_text
-                ):
-                    card = parent
-                    break
+                title = self._normalize_text(canonical_a.get("title") or "")
 
             object_info = self._extract_field_by_label(card, ["Объект закупки"]) if card else ""
             initial_price = self._extract_initial_price(card) if card else ""
             application_deadline = self._extract_application_deadline(card) if card else ""
 
-            slog.info("SEARCH_ITEM", f"page={page_number} | item={idx+1} | reg={reg} | title='{title[:50]}...' | price='{initial_price}' | href={full_href} | status=added")
+            slog.info("SEARCH_ITEM", f"page={page_number} | item={idx+1} | reg={reg} | title='{title[:50]}...' | price='{initial_price}' | href={full_href} | status=added | canonical_href={href}")
 
             if reg not in found_by_reg:
                 n = Notice(
@@ -655,7 +677,7 @@ class EisService:
 
     def _has_notice_results(self, page) -> bool:
         try:
-            return page.locator(NOTICE_LINK_SELECTOR).count() > 0
+            return page.locator(".search-registry-entry-block, .registry-entry__form, .row.no-gutters.registry-entry__form").count() > 0
         except Exception:
             return False
 
@@ -678,7 +700,7 @@ class EisService:
 
     def _get_first_notice_href(self, page) -> str:
         try:
-            return page.eval_on_selector(NOTICE_LINK_SELECTOR, "el => el.getAttribute('href') || ''") or ""
+            return page.eval_on_selector(".search-registry-entry-block a[href*='/epz/order/notice/'], .registry-entry__form a[href*='/epz/order/notice/']", "el => el.getAttribute('href') || ''") or ""
         except Exception:
             return ""
 
@@ -712,19 +734,27 @@ class EisService:
 
         try:
             page.wait_for_function(
-                """(sel, before) => {
-                    const a = document.querySelector(sel);
+                """(before) => {
+                    const cards = document.querySelectorAll('.search-registry-entry-block, .registry-entry__form, .row.no-gutters.registry-entry__form');
+                    if (cards.length === 0) {
+                        const html = document.body.innerText.toLowerCase();
+                        return html.includes('по вашему запросу ничего не найдено') || 
+                               html.includes('ничего не найдено') || 
+                               html.includes('результаты не найдены');
+                    }
+                    const firstCard = cards[0];
+                    const a = firstCard.querySelector("a[href*='/epz/order/notice/']");
                     if (!a) return false;
                     const now = a.getAttribute('href') || '';
                     return now && now !== before;
                 }""",
-                arg=(NOTICE_LINK_SELECTOR, before_href),
-                timeout=8000,
+                arg=(before_href),
+                timeout=15000,
             )
         except Exception:
             pass
 
-        page.wait_for_timeout(700)
+        page.wait_for_timeout(1000) # Дополнительная пауза для стабилизации DOM
         has_results = self._wait_results_or_empty(page, timeout_ms=12000)
         logger.info(f"После 'Применить': has_results={has_results}")
         return has_results
