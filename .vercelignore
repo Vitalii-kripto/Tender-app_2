@@ -1,0 +1,11 @@
+# Ignore backend files for Frontend-Only Demo deployment
+api/
+backend/
+requirements.txt
+runtime.txt
+backend.py
+*.py
+tendersmart.db
+__pycache__/
+venv/
+.env
