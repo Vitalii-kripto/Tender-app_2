@@ -144,6 +144,30 @@ export default function LegalAnalysis() {
     setCheckedFiles(prev => ({ ...prev, [tenderId]: new Set() }));
   };
 
+  const handleFileUpload = async (tenderId: string, files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const file = files[0];
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const res = await fetch(`/api/tenders/${tenderId}/upload`, {
+        method: "POST",
+        body: formData
+      });
+      if (!res.ok) throw new Error("Upload failed");
+      const data = await res.json();
+      
+      // Обновляем список файлов
+      setTenderFiles(prev => ({
+        ...prev,
+        [tenderId]: [...(prev[tenderId] || []), data.file]
+      }));
+    } catch (err) {
+      console.error("Upload error:", err);
+    }
+  };
+
   // ── ИИ Анализ ─────────────────────────────────────────────────────────────
   const handleAnalyze = async () => {
     const checkedTenders = tenders.filter(t => {
@@ -514,6 +538,16 @@ export default function LegalAnalysis() {
                         <RefreshCw className={`w-3.5 h-3.5 ${refreshingId === selected.id ? "animate-spin" : ""}`} />
                         {refreshingId === selected.id ? "Загрузка..." : "Обновить"}
                       </button>
+                      <span className="text-gray-300">|</span>
+                      <label className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 cursor-pointer">
+                        <Download className="w-3.5 h-3.5 rotate-180" />
+                        Загрузить
+                        <input 
+                          type="file" 
+                          className="hidden" 
+                          onChange={(e) => handleFileUpload(selected.id, e.target.files)} 
+                        />
+                      </label>
                     </div>
                   </div>
 

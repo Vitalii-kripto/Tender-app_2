@@ -1,6 +1,6 @@
 from backend.logging_setup import setup_logging
 
-logger = setup_logging()
+logger = setup_logging("LegalAI")
 logger.info("Starting backend via run_backend.py")
 
 import uvicorn  # noqa: E402

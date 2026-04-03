@@ -438,6 +438,23 @@ export const skipTender = async (tender: Tender): Promise<void> => {
     }
 };
 
+export const refreshTenderFiles = async (tenderId: string): Promise<{ status: string, files: any[] }> => {
+    if (IS_DEMO_MODE) {
+        await delay(2000);
+        return { status: 'success', files: [] };
+    }
+    try {
+        const response = await fetch(`${API_BASE_URL}/api/tenders/${tenderId}/refresh-files`, {
+            method: 'POST'
+        });
+        if (!response.ok) throw new Error("Backend error");
+        return await response.json();
+    } catch (e) {
+        console.error("Error refreshing tender files:", e);
+        throw e;
+    }
+};
+
 export const fetchTenderDocsText = async (tenderUrl: string, eisNumber: string): Promise<string> => {
     // В реальной системе нужно сделать эндпоинт, который качает PDF
     // Пока возвращаем заглушку, так как функционал скачивания сложен

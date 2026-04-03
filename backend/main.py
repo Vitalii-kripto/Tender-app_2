@@ -91,6 +91,232 @@ def parse_markdown_list(text):
             list_items.append(clean_markdown(line))
     return list_items
 
+
+def parse_price_to_float(raw_price: Any) -> float:
+    if raw_price is None or raw_price == "":
+        return 0.0
+    if isinstance(raw_price, (int, float)):
+        return float(raw_price)
+
+    text = str(raw_price).replace("\xa0", " ").strip()
+    cleaned = re.sub(r"[^\d,.\-]", "", text)
+
+    if not cleaned:
+        return 0.0
+
+    # Наиболее частый кейс для RU-формата
+    if cleaned.count(",") == 1 and cleaned.count(".") == 0:
+        cleaned = cleaned.replace(",", ".")
+    elif cleaned.count(",") > 0 and cleaned.count(".") > 0:
+        # Если и точка, и запятая — считаем последнюю запятую десятичным разделителем
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    else:
+        cleaned = cleaned.replace(",", "")
+
+    try:
+        return float(cleaned)
+    except Exception:
+        return 0.0
+
+
+def normalize_law_type(
+    *,
+    reg: str = "",
+    ntype: str = "",
+    url: str = "",
+    docs_url: str = "",
+    explicit: Any = None,
+) -> str:
+    explicit_text = str(explicit or "").strip()
+    if explicit_text in {"44-ФЗ", "223-ФЗ", "Коммерч."}:
+        return explicit_text
+
+    reg = str(reg or "")
+    haystack = " ".join([
+        reg,
+        str(ntype or ""),
+        str(url or ""),
+        str(docs_url or ""),
+    ]).lower()
+
+    if reg.startswith("223-") or "notice223" in haystack:
+        return "223-ФЗ"
+
+    if "коммер" in haystack or "commercial" in haystack:
+        return "Коммерч."
+
+    return "44-ФЗ"
+
+
+def build_docs_url_from_payload(payload: Dict[str, Any]) -> str:
+    docs_url = str(payload.get("docs_url") or "").strip()
+    if docs_url:
+        return docs_url
+
+    reg = str(payload.get("id") or payload.get("eis_number") or "").strip()
+    ntype = str(payload.get("ntype") or "").strip()
+
+    if not reg:
+        return ""
+
+    if reg.startswith("223-"):
+        notice_id = reg.replace("223-", "", 1).strip()
+        if notice_id:
+            return f"https://zakupki.gov.ru/epz/order/notice/notice223/documents.html?noticeInfoId={notice_id}"
+        return ""
+
+    if ntype:
+        return f"https://zakupki.gov.ru/epz/order/notice/{ntype}/view/documents.html?regNumber={reg}"
+
+    return ""
+
+
+def tender_has_local_files(tender_id: str) -> bool:
+    tender_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
+    if not os.path.isdir(tender_dir):
+        return False
+    return any(os.path.isfile(os.path.join(tender_dir, name)) for name in os.listdir(tender_dir))
+
+
+def tender_model_to_payload(tender: TenderModel) -> Dict[str, Any]:
+    return {
+        "id": tender.id,
+        "eis_number": tender.id,
+        "title": tender.title or "",
+        "description": tender.description or "",
+        "initial_price": tender.initial_price or 0,
+        "deadline": tender.deadline or "",
+        "status": tender.status or "Found",
+        "risk_level": tender.risk_level or "Low",
+        "region": tender.region or "РФ",
+        "law_type": normalize_law_type(
+            reg=tender.id,
+            ntype=tender.ntype or "",
+            url=tender.url or "",
+            docs_url=tender.docs_url or "",
+            explicit=tender.law_type,
+        ),
+        "url": tender.url or "",
+        "docs_url": tender.docs_url or "",
+        "search_url": tender.search_url or "",
+        "keyword": tender.keyword or "",
+        "ntype": tender.ntype or "",
+    }
+
+
+def build_notice_from_payload(payload: Dict[str, Any]) -> Notice:
+    reg = str(payload.get("id") or payload.get("eis_number") or "").strip()
+    docs_url = build_docs_url_from_payload(payload)
+
+    return Notice(
+        reg=reg,
+        ntype=str(payload.get("ntype") or "").strip(),
+        keyword=str(payload.get("keyword") or "").strip(),
+        search_url=str(payload.get("search_url") or "").strip(),
+        href=str(payload.get("url") or "").strip(),
+        docs_url=docs_url,
+        title=str(payload.get("title") or "").strip(),
+        object_info=str(payload.get("description") or "").strip(),
+        initial_price=str(payload.get("initial_price") or "").strip(),
+        application_deadline=str(payload.get("deadline") or "").strip(),
+    )
+
+
+def save_or_update_tender_record(
+    *,
+    db: Session,
+    tender_payload: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    force_download: bool = False,
+) -> TenderModel:
+    tender_id = str(tender_payload.get("id") or "").strip()
+    if not tender_id:
+        raise HTTPException(status_code=400, detail="У тендера отсутствует id")
+
+    title = str(tender_payload.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail=f"У тендера {tender_id} отсутствует title")
+
+    docs_url = build_docs_url_from_payload(tender_payload)
+    law_type = normalize_law_type(
+        reg=tender_id,
+        ntype=str(tender_payload.get("ntype") or ""),
+        url=str(tender_payload.get("url") or ""),
+        docs_url=docs_url,
+        explicit=tender_payload.get("law_type"),
+    )
+    parsed_price = parse_price_to_float(tender_payload.get("initial_price", 0))
+
+    existing = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
+
+    if existing:
+        previous_docs_url = existing.docs_url or ""
+
+        existing.title = title
+        existing.description = str(tender_payload.get("description") or "")
+        existing.initial_price = parsed_price
+        existing.deadline = str(tender_payload.get("deadline") or "")
+        existing.status = str(tender_payload.get("status") or existing.status or "Found")
+        existing.risk_level = str(tender_payload.get("risk_level") or existing.risk_level or "Low")
+        existing.region = str(tender_payload.get("region") or existing.region or "РФ")
+        existing.law_type = law_type
+        existing.url = str(tender_payload.get("url") or "")
+        existing.docs_url = docs_url
+        existing.search_url = str(tender_payload.get("search_url") or "")
+        existing.keyword = str(tender_payload.get("keyword") or "")
+        existing.ntype = str(tender_payload.get("ntype") or "")
+
+        db.flush()
+
+        need_download = (
+            force_download
+            or (bool(docs_url) and not tender_has_local_files(existing.id))
+            or (bool(docs_url) and docs_url != previous_docs_url)
+        )
+
+        model = existing
+        logger.info(f"Updated existing tender: {tender_id}")
+    else:
+        model = TenderModel(
+            id=tender_id,
+            title=title,
+            description=str(tender_payload.get("description") or ""),
+            initial_price=parsed_price,
+            deadline=str(tender_payload.get("deadline") or ""),
+            status=str(tender_payload.get("status") or "Found"),
+            risk_level=str(tender_payload.get("risk_level") or "Low"),
+            region=str(tender_payload.get("region") or "РФ"),
+            law_type=law_type,
+            url=str(tender_payload.get("url") or ""),
+            docs_url=docs_url,
+            search_url=str(tender_payload.get("search_url") or ""),
+            keyword=str(tender_payload.get("keyword") or ""),
+            ntype=str(tender_payload.get("ntype") or ""),
+        )
+        db.add(model)
+        db.flush()
+
+        need_download = bool(docs_url)
+        logger.info(f"Created new tender: {tender_id}")
+
+    if need_download and docs_url:
+        notice = build_notice_from_payload(
+            {
+                **tender_payload,
+                "id": tender_id,
+                "title": title,
+                "docs_url": docs_url,
+                "law_type": law_type,
+            }
+        )
+        background_tasks.add_task(eis_service.process_tenders, [notice])
+        logger.info(f"Scheduled document download for tender {tender_id}")
+
+    return model
+
 from backend.logging_setup import setup_logging, get_logger
 logger = setup_logging("LegalAI")
 frontend_logger = get_logger("Frontend")
@@ -233,19 +459,21 @@ def check_legal_service():
 
 @app.post("/api/frontend-log")
 async def post_frontend_log(log_data: FrontendLog):
-    """Принимает логи с фронтенда и записывает их в frontend.log"""
+    """Принимает frontend-логи и пишет их в общий tendersmart.log"""
     f_logger = logging.getLogger("Frontend")
-    msg = f"[{log_data.level.upper()}] {log_data.message}"
+
+    msg = f"[FRONTEND][{log_data.level.upper()}] {log_data.message}"
     if log_data.context:
         msg += f" | Context: {log_data.context}"
-    
-    if log_data.level.lower() == "error":
+
+    level = log_data.level.lower().strip()
+    if level == "error":
         f_logger.error(msg)
-    elif log_data.level.lower() == "warning":
+    elif level == "warning":
         f_logger.warning(msg)
     else:
         f_logger.info(msg)
-        
+
     return {"status": "ok"}
 
 @app.get("/")
@@ -262,92 +490,27 @@ def get_crm_tenders(db: Session = Depends(get_db)):
     return db.query(TenderModel).all()
 
 @app.post("/api/crm/tenders")
-def add_update_tender(background_tasks: BackgroundTasks, tender: dict = Body(...), db: Session = Depends(get_db)):
+def add_update_tender(
+    background_tasks: BackgroundTasks,
+    tender: dict = Body(...),
+    db: Session = Depends(get_db),
+):
     """Добавить или обновить тендер в CRM"""
-    tender_id = tender.get('id')
+    tender_id = str(tender.get("id") or "").strip()
     logger.info(f"Add/Update tender request: {tender_id}")
+
     try:
-        existing = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
-        
-        # Parse initial_price to float
-        raw_price = tender.get('initial_price', 0)
-        parsed_price = 0.0
-        if isinstance(raw_price, str):
-            cleaned = re.sub(r'[^\d,.-]', '', raw_price).replace(',', '.')
-            try:
-                parsed_price = float(cleaned)
-            except ValueError:
-                parsed_price = 0.0
-        else:
-            parsed_price = float(raw_price)
-
-        docs_url = tender.get('docs_url', '')
-        needs_requeue = False
-        action = ""
-
-        if existing:
-            old_docs_url = existing.docs_url
-            docs_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
-            has_docs = os.path.exists(docs_dir) and len(os.listdir(docs_dir)) > 0
-            
-            if (docs_url and docs_url != old_docs_url) or (docs_url and not has_docs):
-                needs_requeue = True
-                
-            existing.title = tender.get('title', existing.title)
-            existing.description = tender.get('description', existing.description)
-            existing.initial_price = parsed_price
-            existing.deadline = tender.get('deadline', existing.deadline)
-            existing.region = tender.get('region', existing.region)
-            existing.law_type = tender.get('law_type', existing.law_type)
-            existing.url = tender.get('url', existing.url)
-            existing.docs_url = docs_url
-            existing.search_url = tender.get('search_url', existing.search_url)
-            existing.keyword = tender.get('keyword', existing.keyword)
-            existing.ntype = tender.get('ntype', existing.ntype)
-            existing.status = tender.get('status', existing.status)
-            existing.risk_level = tender.get('risk_level', existing.risk_level)
-            action = "updated"
-            logger.info(f"Updated existing tender: {tender_id} | docs_url present={bool(docs_url)} | docs_dir exists={has_docs} | action=updated")
-        else:
-            new_tender = TenderModel(
-                id=tender_id,
-                title=tender.get('title', ''),
-                description=tender.get('description', ''),
-                initial_price=parsed_price,
-                deadline=tender.get('deadline', '-'),
-                status=tender.get('status', 'Found'),
-                risk_level=tender.get('risk_level', 'Low'),
-                region=tender.get('region', 'РФ'),
-                law_type=tender.get('law_type', '44-ФЗ'),
-                url=tender.get('url', ''),
-                docs_url=docs_url,
-                search_url=tender.get('search_url', ''),
-                keyword=tender.get('keyword', ''),
-                ntype=tender.get('ntype', '')
-            )
-            db.add(new_tender)
-            needs_requeue = bool(docs_url)
-            action = "created"
-            logger.info(f"Created new tender: {tender_id} | docs_url present={bool(docs_url)} | action=created")
-            
-        if needs_requeue:
-            notice = Notice(
-                reg=tender_id,
-                ntype=tender.get('ntype', ''),
-                keyword=tender.get('keyword', ''),
-                search_url=tender.get('search_url', ''),
-                href=tender.get('url', ''),
-                docs_url=docs_url,
-                title=tender.get('title', ''),
-                object_info=tender.get('description', ''),
-                initial_price=str(tender.get('initial_price', '')),
-                application_deadline=tender.get('deadline', '')
-            )
-            background_tasks.add_task(eis_service.process_tenders, [notice])
-            logger.info(f"Requeued docs for tender: {tender_id}")
-        
+        save_or_update_tender_record(
+            db=db,
+            tender_payload=tender,
+            background_tasks=background_tasks,
+            force_download=False,
+        )
         db.commit()
-        return {"status": "success", "action": action, "requeued_docs": needs_requeue}
+        return {"status": "success"}
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         logger.error(f"Error saving tender: {e}", exc_info=True)
@@ -400,25 +563,26 @@ def cancel_search():
 
 @app.get("/api/search-tenders")
 def search_tenders_endpoint(
-    query: str, 
-    fz44: bool = True, 
-    fz223: bool = True, 
-    only_application_stage: bool = True, 
+    query: str,
+    fz44: bool = True,
+    fz223: bool = True,
+    only_application_stage: bool = True,
     publish_days_back: int = 30,
-    _ = Depends(check_eis_service)
+    _ = Depends(check_eis_service),
 ):
     """Поиск через Playwright"""
     import uuid
+
     search_id = uuid.uuid4().hex[:8]
     logger.info(f"[SEARCH_API_START] [SearchID:{search_id}] Search request received: {query}")
     try:
         notices = eis_service.search_tenders(
-            query=query, 
-            fz44=fz44, 
-            fz223=fz223, 
-            only_application_stage=only_application_stage, 
+            query=query,
+            fz44=fz44,
+            fz223=fz223,
+            only_application_stage=only_application_stage,
             publish_days_back=publish_days_back,
-            search_id=search_id
+            search_id=search_id,
         )
         logger.info(f"[SEARCH_API_RESPONSE] [SearchID:{search_id}] eis_service returned {len(notices)} items")
     except RuntimeError as e:
@@ -427,26 +591,22 @@ def search_tenders_endpoint(
     except Exception as e:
         logger.error(f"[SEARCH_API_ERROR] [SearchID:{search_id}] Search failed with unexpected error: {e}")
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
-    
+
     # Convert Notice dataclass to dict for JSON response
     result = []
     for n in notices:
-        raw_price = n.initial_price
-        parsed_price = 0.0
-        if isinstance(raw_price, str):
-            cleaned = re.sub(r'[^\d,.-]', '', raw_price).replace(',', '.')
-            try:
-                parsed_price = float(cleaned)
-            except ValueError:
-                parsed_price = 0.0
-        else:
-            parsed_price = float(raw_price)
-
-        if n.reg.startswith("223-"):
-            notice_id = n.reg.replace("223-", "")
-            docs_url = f"https://zakupki.gov.ru/epz/order/notice/notice223/documents.html?noticeInfoId={notice_id}"
-        else:
-            docs_url = f"https://zakupki.gov.ru/epz/order/notice/{n.ntype}/view/documents.html?regNumber={n.reg}"
+        docs_url = build_docs_url_from_payload({
+            "id": n.reg,
+            "ntype": n.ntype,
+            "docs_url": n.docs_url
+        })
+        law_type = normalize_law_type(
+            reg=n.reg,
+            ntype=n.ntype,
+            url=n.href,
+            docs_url=docs_url
+        )
+        parsed_price = parse_price_to_float(n.initial_price)
 
         result.append({
             "id": n.reg,
@@ -454,144 +614,46 @@ def search_tenders_endpoint(
             "title": n.title,
             "description": n.object_info,
             "initial_price": parsed_price,
-            "initial_price_text": str(raw_price),
-            "initial_price_value": parsed_price,
+            "initial_price_text": str(n.initial_price),
             "deadline": n.application_deadline,
             "status": "Found",
             "risk_level": "Low",
             "region": "РФ",
-            "law_type": n.ntype,
+            "law_type": law_type,
             "url": n.href,
             "docs_url": docs_url,
             "search_url": n.search_url,
             "keyword": n.keyword,
             "ntype": n.ntype,
-            "seen": n.seen
         })
-    
-    logger.info(f"[SEARCH_API_RESPONSE] [SearchID:{search_id}] Returning {len(result)} items to frontend.")
-    logger.debug(f"[SEARCH_API_RESPONSE] [SearchID:{search_id}] Regs sent to frontend: {[r['id'] for r in result]}")
-    
-    if len(notices) > len(result):
-        logger.warning(f"[SEARCH_API_WARNING] [SearchID:{search_id}] raw_found_count={len(notices)} | final_returned_count={len(result)} | delta={len(notices) - len(result)} | reason=Some notices were dropped during JSON serialization")
 
     return result
 
 @app.post("/api/search-tenders/process")
-def process_tenders(background_tasks: BackgroundTasks, tenders: list = Body(...), db: Session = Depends(get_db)):
-    """Обработать выбранные тендеры"""
-    if not isinstance(tenders, list) or not tenders:
-        raise HTTPException(status_code=400, detail="No tenders selected for processing")
+def process_tenders(
+    background_tasks: BackgroundTasks,
+    tenders: list = Body(...),
+    db: Session = Depends(get_db),
+):
+    """Массовая обработка выбранных тендеров"""
+    if not tenders:
+        return {"status": "ok", "processed": 0}
 
     logger.info(f"Processing {len(tenders)} selected tenders")
-    try:
-        processed = 0
-        created = 0
-        updated = 0
-        requeued_docs = 0
-        
-        for tender in tenders:
-            tender_id = tender.get('id')
-            if not tender_id:
-                continue
-                
-            existing = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
-            
-            # Parse initial_price to float
-            raw_price = tender.get('initial_price', 0)
-            parsed_price = 0.0
-            if isinstance(raw_price, str):
-                cleaned = re.sub(r'[^\d,.-]', '', raw_price).replace(',', '.')
-                try:
-                    parsed_price = float(cleaned)
-                except ValueError:
-                    parsed_price = 0.0
-            else:
-                parsed_price = float(raw_price)
 
-            docs_url = tender.get('docs_url', '')
-            needs_requeue = False
+    for t_payload in tenders:
+        try:
+            save_or_update_tender_record(
+                db=db,
+                tender_payload=t_payload,
+                background_tasks=background_tasks,
+                force_download=False,
+            )
+        except Exception as e:
+            logger.error(f"Failed to process tender in batch: {e}", exc_info=True)
 
-            if existing:
-                old_docs_url = existing.docs_url
-                docs_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
-                has_docs = os.path.exists(docs_dir) and len(os.listdir(docs_dir)) > 0
-                
-                if (docs_url and docs_url != old_docs_url) or (docs_url and not has_docs):
-                    needs_requeue = True
-                    
-                existing.title = tender.get('title', existing.title)
-                existing.description = tender.get('description', existing.description)
-                existing.initial_price = parsed_price
-                existing.deadline = tender.get('deadline', existing.deadline)
-                existing.region = tender.get('region', existing.region)
-                existing.law_type = tender.get('law_type', existing.law_type)
-                existing.url = tender.get('url', existing.url)
-                existing.docs_url = docs_url
-                existing.search_url = tender.get('search_url', existing.search_url)
-                existing.keyword = tender.get('keyword', existing.keyword)
-                existing.ntype = tender.get('ntype', existing.ntype)
-                
-                if 'status' in tender:
-                    existing.status = tender['status']
-                if 'risk_level' in tender:
-                    existing.risk_level = tender['risk_level']
-                
-                updated += 1
-                logger.info(f"Updated existing tender: {tender_id} | docs_url present={bool(docs_url)} | docs_dir exists={has_docs} | action=updated")
-            else:
-                new_tender = TenderModel(
-                    id=tender_id,
-                    title=tender.get('title', ''),
-                    description=tender.get('description', ''),
-                    initial_price=parsed_price,
-                    deadline=tender.get('deadline', '-'),
-                    status=tender.get('status', 'Found'),
-                    risk_level=tender.get('risk_level', 'Low'),
-                    region=tender.get('region', 'РФ'),
-                    law_type=tender.get('law_type', '44-ФЗ'),
-                    url=tender.get('url', ''),
-                    docs_url=docs_url,
-                    search_url=tender.get('search_url', ''),
-                    keyword=tender.get('keyword', ''),
-                    ntype=tender.get('ntype', '')
-                )
-                db.add(new_tender)
-                created += 1
-                needs_requeue = bool(docs_url)
-                logger.info(f"Created new tender: {tender_id} | docs_url present={bool(docs_url)} | action=created")
-                
-            if needs_requeue:
-                notice = Notice(
-                    reg=tender_id,
-                    ntype=tender.get('ntype', ''),
-                    keyword=tender.get('keyword', ''),
-                    search_url=tender.get('search_url', ''),
-                    href=tender.get('url', ''),
-                    docs_url=docs_url,
-                    title=tender.get('title', ''),
-                    object_info=tender.get('description', ''),
-                    initial_price=str(tender.get('initial_price', '')),
-                    application_deadline=tender.get('deadline', '')
-                )
-                background_tasks.add_task(eis_service.process_tenders, [notice])
-                requeued_docs += 1
-                logger.info(f"Requeued docs for tender: {tender_id}")
-                
-            processed += 1
-            
-        db.commit()
-        return {
-            "status": "success", 
-            "processed": processed,
-            "created": created,
-            "updated": updated,
-            "requeued_docs": requeued_docs
-        }
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error processing tenders: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    db.commit()
+    return {"status": "ok", "processed": len(tenders)}
 
 @app.post("/api/search-tenders/skip")
 def skip_tender(tender: dict = Body(...)):
@@ -675,56 +737,40 @@ import shutil
 @app.post("/api/tenders/{tender_id}/refresh-files")
 async def refresh_tender_files(
     tender_id: str,
-    db: Session = Depends(get_db),
-    _ = Depends(check_eis_service),
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
 ):
-    logger.info(f"[REFRESH] Force re-download requested for tender {tender_id}")
-
+    """Очистить кэш файлов и скачать заново"""
     tender = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
     if not tender:
-        raise HTTPException(status_code=404, detail=f"Tender not found: {tender_id}")
+        raise HTTPException(status_code=404, detail="Тендер не найден в БД")
 
+    # Удаляем папку с файлами
     tender_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
-    if os.path.isdir(tender_dir):
+    if os.path.exists(tender_dir):
+        logger.info(f"Deleting files for tender {tender_id} before refresh")
         shutil.rmtree(tender_dir, ignore_errors=True)
-        logger.info(f"[REFRESH] Cache cleared: {tender_dir}")
-    else:
-        logger.info(f"[REFRESH] No cache to clear for {tender_id}")
 
-    notice = build_notice_from_tender_model(tender)
+    # Запускаем свежую загрузку
+    payload = tender_model_to_payload(tender)
+    notice = build_notice_from_payload(payload)
 
-    try:
-        result = await run_in_threadpool(
-            eis_service.redownload_tender_documents,
-            notice,
-            False,
-        )
-    except Exception as e:
-        logger.error(f"[REFRESH] Re-download failed for {tender_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Re-download failed: {e}")
+    # Используем run_in_threadpool для синхронного метода eis_service
+    await run_in_threadpool(eis_service.redownload_tender_documents, notice)
 
-    if not result.get("ok"):
-        reason = result.get("reason") or "unknown_error"
-        logger.error(f"[REFRESH] Re-download finished without files for {tender_id}: {reason}")
-        raise HTTPException(status_code=500, detail=f"No files downloaded: {reason}")
-
+    # Возвращаем актуальный список файлов
     files = []
-    if os.path.isdir(tender_dir):
-        for filename in os.listdir(tender_dir):
-            filepath = os.path.join(tender_dir, filename)
-            if os.path.isfile(filepath):
+    if os.path.exists(tender_dir):
+        for f in os.listdir(tender_dir):
+            f_path = os.path.join(tender_dir, f)
+            if os.path.isfile(f_path):
                 files.append({
-                    "name": filename,
-                    "size": os.path.getsize(filepath),
-                    "ext": os.path.splitext(filename)[1].lower(),
+                    "name": f,
+                    "size": os.path.getsize(f_path),
+                    "path": f_path
                 })
 
-    return {
-        "status": "success",
-        "tender_id": tender_id,
-        "downloaded_count": len(files),
-        "files": files,
-    }
+    return {"status": "success", "files": files}
 
 @app.post("/api/ai/analyze-tenders-batch")
 async def api_analyze_tenders_batch(background_tasks: BackgroundTasks, data: dict = Body(...), _ = Depends(check_legal_service)):
@@ -800,6 +846,35 @@ async def api_check_compliance(data: dict = Body(...), _ = Depends(check_ai_serv
     """Проверка пакета документов"""
     logger.info("AI Document Package Check request.")
     return ai_service.check_compliance(data['title'], data['description'], data['filenames'])
+
+@app.post("/api/tenders/{tender_id}/upload")
+async def upload_tender_file(
+    tender_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """Вручную загрузить файл в папку тендера"""
+    tender = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
+    if not tender:
+        raise HTTPException(status_code=404, detail="Тендер не найден")
+
+    tender_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
+    os.makedirs(tender_dir, exist_ok=True)
+
+    file_path = os.path.join(tender_dir, file.filename)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    logger.info(f"Manually uploaded file {file.filename} for tender {tender_id}")
+    
+    return {
+        "status": "success",
+        "file": {
+            "name": file.filename,
+            "size": os.path.getsize(file_path),
+            "path": file_path
+        }
+    }
 
 @app.post("/api/tenders/upload")
 async def upload_file(file: UploadFile = File(...), _ = Depends(check_doc_service)):

@@ -37,6 +37,20 @@ const TenderSearch = () => {
   const isInCrm = (id: string) => crmTenders.some(t => t.id === id);
   const isSelected = (id: string) => selectedTenders.some(t => t.id === id);
 
+  const handleSendToWork = async (tender: Tender) => {
+    if (submittingTenderId || processing) return;
+    setSubmittingTenderId(tender.id);
+    setActionError(null);
+    try {
+      await processSelectedTenders([tender]);
+      await refreshCrmTenders();
+    } catch (err: any) {
+      setActionError(err.message || "Ошибка при отправке в CRM");
+    } finally {
+      setSubmittingTenderId(null);
+    }
+  };
+
   const toggleTenderSelection = (tender: Tender) => {
     if (tender.id === 'err_msg') return;
     if (loading || processing) return;
@@ -252,7 +266,15 @@ const TenderSearch = () => {
              const isSubmitting = submittingTenderId === tender.id;
 
              return (
-                 <div key={tender.id} className={`relative bg-white p-5 rounded-xl border ${inCrm ? 'border-emerald-200 bg-emerald-50/20' : 'border-slate-200'}`}>
+                 <div key={tender.id} className={`relative bg-white p-5 rounded-xl border ${inCrm ? 'border-emerald-200 bg-emerald-50/20' : 'border-slate-200'} ${isSelected(tender.id) ? 'ring-2 ring-blue-500' : ''}`}>
+                    <div className="absolute top-5 left-5">
+                        <button 
+                            onClick={() => toggleTenderSelection(tender)}
+                            className="text-blue-600 hover:text-blue-700"
+                        >
+                            {isSelected(tender.id) ? <CheckSquare size={24} /> : <Square size={24} className="text-slate-300" />}
+                        </button>
+                    </div>
                     <div className="absolute top-5 right-5">
                         <button
                             onClick={() => handleSendToWork(tender)}
@@ -269,16 +291,18 @@ const TenderSearch = () => {
                             {isSubmitting ? 'Передача...' : inCrm ? 'Обновить в CRM' : 'В работу'}
                         </button>
                     </div>
-                    <h3 className="text-lg font-bold text-slate-800 pr-24">
-                        {tender.title}
-                        {tender.seen && <span className="ml-2 px-2 py-0.5 text-xs font-semibold bg-gray-200 text-gray-700 rounded">Просмотрено</span>}
-                    </h3>
-                    <p className="text-sm text-slate-600 mt-2 line-clamp-2 w-3/4">{tender.description}</p>
-                    <div className="mt-4 flex justify-between items-end border-t pt-3">
-                        <span className="text-xl font-bold text-slate-900">{formatPrice(tender)}</span>
-                        <div className="text-right">
-                             <span className="text-xs text-slate-500 block">№ {tender.eis_number}</span>
-                             {tender.url && <a href={tender.url} target="_blank" className="text-blue-600 text-sm hover:underline flex items-center gap-1 justify-end">ЕИС <ExternalLink size={12}/></a>}
+                    <div className="pl-10">
+                        <h3 className="text-lg font-bold text-slate-800 pr-24">
+                            {tender.title}
+                            {tender.seen && <span className="ml-2 px-2 py-0.5 text-xs font-semibold bg-gray-200 text-gray-700 rounded">Просмотрено</span>}
+                        </h3>
+                        <p className="text-sm text-slate-600 mt-2 line-clamp-2 w-3/4">{tender.description}</p>
+                        <div className="mt-4 flex justify-between items-end border-t pt-3">
+                            <span className="text-xl font-bold text-slate-900">{formatPrice(tender)}</span>
+                            <div className="text-right">
+                                <span className="text-xs text-slate-500 block">№ {tender.eis_number}</span>
+                                {tender.url && <a href={tender.url} target="_blank" className="text-blue-600 text-sm hover:underline flex items-center gap-1 justify-end">ЕИС <ExternalLink size={12}/></a>}
+                            </div>
                         </div>
                     </div>
                  </div>
