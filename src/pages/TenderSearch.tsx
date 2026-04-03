@@ -224,25 +224,20 @@ const TenderSearch = () => {
              return (
                  <div key={tender.id} className={`relative bg-white p-5 rounded-xl border ${inCrm ? 'border-emerald-200 bg-emerald-50/20' : 'border-slate-200'}`}>
                     <div className="absolute top-5 right-5">
-                        {inCrm ? (
-                            <span className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-100 text-slate-500 cursor-not-allowed">
-                                <CheckCircle size={16} />
-                                В CRM
-                            </span>
-                        ) : (
-                            <button
-                                onClick={() => handleSendToWork(tender)}
-                                disabled={isSubmitting}
-                                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium ${
-                                  isSubmitting
-                                    ? 'bg-slate-200 text-slate-500 cursor-wait'
+                        <button
+                            onClick={() => handleSendToWork(tender)}
+                            disabled={isSubmitting}
+                            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium ${
+                              isSubmitting
+                                ? 'bg-slate-200 text-slate-500 cursor-wait'
+                                : inCrm 
+                                    ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200'
                                     : 'bg-blue-600 text-white hover:bg-blue-700'
-                                }`}
-                            >
-                                {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Briefcase size={16} />}
-                                {isSubmitting ? 'Передача...' : 'В работу'}
-                            </button>
-                        )}
+                            }`}
+                        >
+                            {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : inCrm ? <CheckCircle size={16} /> : <Briefcase size={16} />}
+                            {isSubmitting ? 'Передача...' : inCrm ? 'Обновить в CRM' : 'В работу'}
+                        </button>
                     </div>
                     <h3 className="text-lg font-bold text-slate-800 pr-24">
                         {tender.title}

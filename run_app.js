@@ -2,13 +2,38 @@
 // Запускает Python-бэкенд (uvicorn) и Vite-фронтенд параллельно.
 
 import { spawn } from "child_process";
-import { existsSync } from "fs";
+import { existsSync, mkdirSync, createWriteStream } from "fs";
 import { resolve, join } from "path";
 import { fileURLToPath } from "url";
 
 // ── Пути ──────────────────────────────────────────────────────────────────────
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = resolve(__filename, "..");
+
+const LOGS_DIR = join(__dirname, "logs");
+if (!existsSync(LOGS_DIR)) {
+    mkdirSync(LOGS_DIR, { recursive: true });
+}
+const LOG_FILE = join(LOGS_DIR, "tendersmart.log");
+const logStream = createWriteStream(LOG_FILE, { flags: "a", encoding: "utf8" });
+
+function writeLog(label, level, data, color) {
+    const lines = data.toString().trimEnd().split("\n");
+    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    for (const line of lines) {
+        if (line.trim()) {
+            const msg = `${now} | ${level} | RUN_APP | ${label} | ${line.trim()}\n`;
+            logStream.write(msg);
+            
+            const prefix = color ? tag(label, color) : `[${label}]`;
+            if (level === 'ERROR') {
+                console.error(`${prefix} ${line.trim()}`);
+            } else {
+                console.log(`${prefix} ${line.trim()}`);
+            }
+        }
+    }
+}
 
 // ── Настройки ─────────────────────────────────────────────────────────────────
 const VENV_PYTHON_WIN  = join(__dirname, ".venv", "Scripts", "python.exe");
@@ -36,7 +61,7 @@ function tag(name, color) {
 
 // ── Запуск дочернего процесса ─────────────────────────────────────────────────
 function startProcess(label, color, cmd, args, cwd = __dirname) {
-  console.log(`${tag(label, color)} Запуск: ${cmd} ${args.join(" ")}`);
+  writeLog(label, "INFO", `Запуск: ${cmd} ${args.join(" ")}`, color);
 
   const proc = spawn(cmd, args, {
     cwd,
@@ -46,35 +71,27 @@ function startProcess(label, color, cmd, args, cwd = __dirname) {
   });
 
   proc.stdout.on("data", (data) => {
-    const lines = data.toString().trimEnd().split("\n");
-    lines.forEach((line) => console.log(`${tag(label, color)} ${line}`));
+    writeLog(label, "INFO", data, color);
   });
 
   proc.stderr.on("data", (data) => {
-    const lines = data.toString().trimEnd().split("\n");
-    lines.forEach((line) => {
-      // uvicorn пишет INFO в stderr — не считаем это ошибкой
-      const isInfo = /INFO|WARNING|DEBUG/.test(line);
-      const prefix = isInfo ? tag(label, color) : tag(label, C.red);
-      console.log(`${prefix} ${line}`);
-    });
+    // uvicorn пишет INFO в stderr — не считаем это ошибкой
+    const isInfo = /INFO|WARNING|DEBUG/.test(data.toString());
+    writeLog(label, isInfo ? "INFO" : "ERROR", data, isInfo ? color : C.red);
   });
 
   proc.on("close", (code) => {
     if (code !== 0 && code !== null) {
-      console.error(`${tag(label, C.red)} Процесс завершился с кодом ${code}`);
+      writeLog(label, "ERROR", `Процесс завершился с кодом ${code}`, C.red);
     } else {
-      console.log(`${tag(label, color)} Процесс остановлен.`);
+      writeLog(label, "INFO", `Процесс остановлен.`, color);
     }
   });
 
   proc.on("error", (err) => {
-    console.error(`${tag(label, C.red)} Ошибка запуска: ${err.message}`);
+    writeLog(label, "ERROR", `Ошибка запуска: ${err.message}`, C.red);
     if (err.code === "ENOENT") {
-      console.error(
-        `${tag(label, C.red)} Команда не найдена: "${cmd}". ` +
-        `Убедитесь, что venv создан и активирован, или Python доступен в PATH.`
-      );
+      writeLog(label, "ERROR", `Команда не найдена: "${cmd}". Убедитесь, что venv создан и активирован, или Python доступен в PATH.`, C.red);
     }
   });
 
@@ -83,18 +100,15 @@ function startProcess(label, color, cmd, args, cwd = __dirname) {
 
 // ── Главная функция ───────────────────────────────────────────────────────────
 function main() {
-  console.log(`\n${C.cyan}╔══════════════════════════════════════╗`);
-  console.log(`║    TenderSmart — запуск приложения   ║`);
-  console.log(`╚══════════════════════════════════════╝${C.reset}\n`);
-  console.log(`${C.yellow}Python:${C.reset}   ${PYTHON_CMD}`);
-  console.log(`${C.yellow}Рабочая папка:${C.reset} ${__dirname}\n`);
+  const header = `\n╔══════════════════════════════════════╗\n║    TenderSmart — запуск приложения   ║\n╚══════════════════════════════════════╝\n\nPython:   ${PYTHON_CMD}\nРабочая папка: ${__dirname}\n`;
+  writeLog("APP", "INFO", header, C.cyan);
 
   const backend  = startProcess("BACKEND",  C.blue,  PYTHON_CMD, BACKEND_CMD);
   const frontend = startProcess("FRONTEND", C.green, "npm",       FRONTEND_CMD);
 
   // ── Graceful shutdown: Ctrl+C останавливает оба процесса ──────────────────
   function shutdown(signal) {
-    console.log(`\n${C.yellow}[APP] Получен ${signal}, останавливаем процессы...${C.reset}`);
+    writeLog("APP", "INFO", `Получен ${signal}, останавливаем процессы...`, C.yellow);
     [backend, frontend].forEach((p) => {
       if (!p.killed) {
         // На Windows нужно SIGTERM через taskkill, иначе дочерние не гасятся
@@ -105,7 +119,10 @@ function main() {
         }
       }
     });
-    setTimeout(() => process.exit(0), 2000);
+    setTimeout(() => {
+        logStream.end();
+        process.exit(0);
+    }, 2000);
   }
 
   process.on("SIGINT",  () => shutdown("SIGINT"));

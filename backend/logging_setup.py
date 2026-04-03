@@ -2,35 +2,29 @@
 
 import logging
 import os
+import sys
 from logging.handlers import RotatingFileHandler
 
+_unified_logger_configured = False
 
 def setup_logging(name: str = "LegalAI") -> logging.Logger:
-    """
-    Настраивает и возвращает логгер приложения.
-    Пишет одновременно в консоль и в файл logs/tendersmart.log
-    с автоматической ротацией (макс. 10 МБ, 5 архивов).
-    """
+    global _unified_logger_configured
     logger = logging.getLogger(name)
 
-    # Если уже настроен — не дублируем хендлеры
-    if logger.handlers:
+    if _unified_logger_configured:
         return logger
 
-    logger.setLevel(logging.DEBUG)
+    _unified_logger_configured = True
 
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(filename)s:%(lineno)d | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # --- Хендлер: консоль ---
-    console = logging.StreamHandler()
+    console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.INFO)
     console.setFormatter(formatter)
-    logger.addHandler(console)
 
-    # --- Хендлер: файл с ротацией ---
     try:
         log_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -47,9 +41,43 @@ def setup_logging(name: str = "LegalAI") -> logging.Logger:
         )
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
     except Exception as e:
-        logger.warning(f"Не удалось создать файловый лог: {e}")
+        print(f"Не удалось создать файловый лог: {e}")
+        file_handler = None
+
+    # Configure root logger and specific loggers
+    loggers_to_configure = [
+        logging.getLogger(),  # root
+        logging.getLogger("LegalAI"),
+        logging.getLogger("Frontend"),
+        logging.getLogger("uvicorn"),
+        logging.getLogger("uvicorn.error"),
+        logging.getLogger("uvicorn.access"),
+        logging.getLogger("fastapi"),
+        logging.getLogger("asyncio"),
+        logging.getLogger("py.warnings"),
+    ]
+
+    for l in loggers_to_configure:
+        l.handlers.clear()
+        l.setLevel(logging.INFO)
+        l.addHandler(console)
+        if file_handler:
+            l.addHandler(file_handler)
+        l.propagate = False
+
+    logging.captureWarnings(True)
+
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        logging.getLogger("LegalAI").error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+    sys.excepthook = handle_exception
 
     logger.info("--- [UNIFIED LOGGER INITIALIZED] ---")
     return logger
+
+def get_logger(name: str = "LegalAI") -> logging.Logger:
+    return logging.getLogger(name)

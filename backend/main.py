@@ -89,7 +89,9 @@ def parse_markdown_list(text):
             list_items.append(clean_markdown(line))
     return list_items
 
-from backend.logger import logger
+from backend.logging_setup import setup_logging, get_logger
+logger = setup_logging("LegalAI")
+frontend_logger = get_logger("Frontend")
 
 # --- SETUP ---
 def migrate_db():
@@ -246,9 +248,10 @@ def get_crm_tenders(db: Session = Depends(get_db)):
 @app.post("/api/crm/tenders")
 def add_update_tender(background_tasks: BackgroundTasks, tender: dict = Body(...), db: Session = Depends(get_db)):
     """Добавить или обновить тендер в CRM"""
-    logger.info(f"Add/Update tender request: {tender.get('id')}")
+    tender_id = tender.get('id')
+    logger.info(f"Add/Update tender request: {tender_id}")
     try:
-        existing = db.query(TenderModel).filter(TenderModel.id == tender['id']).first()
+        existing = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
         
         # Parse initial_price to float
         raw_price = tender.get('initial_price', 0)
@@ -262,14 +265,37 @@ def add_update_tender(background_tasks: BackgroundTasks, tender: dict = Body(...
         else:
             parsed_price = float(raw_price)
 
+        docs_url = tender.get('docs_url', '')
+        needs_requeue = False
+        action = ""
+
         if existing:
+            old_docs_url = existing.docs_url
+            docs_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
+            has_docs = os.path.exists(docs_dir) and len(os.listdir(docs_dir)) > 0
+            
+            if (docs_url and docs_url != old_docs_url) or (docs_url and not has_docs):
+                needs_requeue = True
+                
+            existing.title = tender.get('title', existing.title)
+            existing.description = tender.get('description', existing.description)
+            existing.initial_price = parsed_price
+            existing.deadline = tender.get('deadline', existing.deadline)
+            existing.region = tender.get('region', existing.region)
+            existing.law_type = tender.get('law_type', existing.law_type)
+            existing.url = tender.get('url', existing.url)
+            existing.docs_url = docs_url
+            existing.search_url = tender.get('search_url', existing.search_url)
+            existing.keyword = tender.get('keyword', existing.keyword)
+            existing.ntype = tender.get('ntype', existing.ntype)
             existing.status = tender.get('status', existing.status)
             existing.risk_level = tender.get('risk_level', existing.risk_level)
-            logger.info(f"Updated existing tender: {tender['id']}")
+            action = "updated"
+            logger.info(f"Updated existing tender: {tender_id} | docs_url present={bool(docs_url)} | docs_dir exists={has_docs} | action=updated")
         else:
             new_tender = TenderModel(
-                id=tender['id'],
-                title=tender['title'],
+                id=tender_id,
+                title=tender.get('title', ''),
                 description=tender.get('description', ''),
                 initial_price=parsed_price,
                 deadline=tender.get('deadline', '-'),
@@ -278,35 +304,64 @@ def add_update_tender(background_tasks: BackgroundTasks, tender: dict = Body(...
                 region=tender.get('region', 'РФ'),
                 law_type=tender.get('law_type', '44-ФЗ'),
                 url=tender.get('url', ''),
-                docs_url=tender.get('docs_url', ''),
+                docs_url=docs_url,
                 search_url=tender.get('search_url', ''),
                 keyword=tender.get('keyword', ''),
                 ntype=tender.get('ntype', '')
             )
             db.add(new_tender)
-            logger.info(f"Created new tender: {tender['id']}")
+            needs_requeue = bool(docs_url)
+            action = "created"
+            logger.info(f"Created new tender: {tender_id} | docs_url present={bool(docs_url)} | action=created")
             
-            # Если это новый тендер, запускаем скачивание документов
-            if tender.get('docs_url'):
-                notice = Notice(
-                    reg=tender['id'],
-                    ntype=tender.get('ntype', ''),
-                    keyword=tender.get('keyword', ''),
-                    search_url=tender.get('search_url', ''),
-                    href=tender.get('url', ''),
-                    docs_url=tender.get('docs_url', ''),
-                    title=tender.get('title', ''),
-                    object_info=tender.get('description', ''),
-                    initial_price=str(tender.get('initial_price', '')),
-                    application_deadline=tender.get('deadline', '')
-                )
-                background_tasks.add_task(eis_service.process_tenders, [notice])
+        if needs_requeue:
+            notice = Notice(
+                reg=tender_id,
+                ntype=tender.get('ntype', ''),
+                keyword=tender.get('keyword', ''),
+                search_url=tender.get('search_url', ''),
+                href=tender.get('url', ''),
+                docs_url=docs_url,
+                title=tender.get('title', ''),
+                object_info=tender.get('description', ''),
+                initial_price=str(tender.get('initial_price', '')),
+                application_deadline=tender.get('deadline', '')
+            )
+            background_tasks.add_task(eis_service.process_tenders, [notice])
+            logger.info(f"Requeued docs for tender: {tender_id}")
         
         db.commit()
-        return {"status": "success"}
+        return {"status": "success", "action": action, "requeued_docs": needs_requeue}
     except Exception as e:
+        db.rollback()
         logger.error(f"Error saving tender: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/crm/tenders/{tender_id}/requeue-docs")
+def requeue_tender_docs(tender_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """Повторно запустить скачивание документов для тендера"""
+    tender = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
+    if not tender:
+        raise HTTPException(status_code=404, detail="Tender not found")
+        
+    if not tender.docs_url:
+        raise HTTPException(status_code=400, detail="Tender has no docs_url")
+        
+    notice = Notice(
+        reg=tender.id,
+        ntype=tender.ntype or "",
+        keyword=tender.keyword or "",
+        search_url=tender.search_url or "",
+        title=tender.title or "",
+        href=tender.url or "",
+        object_info=tender.description or "",
+        initial_price=str(tender.initial_price or ""),
+        application_deadline=tender.deadline or "",
+        docs_url=tender.docs_url
+    )
+    background_tasks.add_task(eis_service.process_tenders, [notice])
+    logger.info(f"Manually requeued docs for tender: {tender_id}")
+    return {"status": "requeued"}
 
 @app.delete("/api/crm/tenders/{tender_id}")
 def delete_tender(tender_id: str, db: Session = Depends(get_db)):
@@ -411,8 +466,17 @@ def process_tenders(background_tasks: BackgroundTasks, tenders: list = Body(...)
     """Обработать выбранные тендеры"""
     logger.info(f"Processing {len(tenders)} selected tenders")
     try:
+        processed = 0
+        created = 0
+        updated = 0
+        requeued_docs = 0
+        
         for tender in tenders:
-            existing = db.query(TenderModel).filter(TenderModel.id == tender['id']).first()
+            tender_id = tender.get('id')
+            if not tender_id:
+                continue
+                
+            existing = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
             
             # Parse initial_price to float
             raw_price = tender.get('initial_price', 0)
@@ -426,14 +490,40 @@ def process_tenders(background_tasks: BackgroundTasks, tenders: list = Body(...)
             else:
                 parsed_price = float(raw_price)
 
+            docs_url = tender.get('docs_url', '')
+            needs_requeue = False
+
             if existing:
-                existing.status = tender.get('status', existing.status)
-                existing.risk_level = tender.get('risk_level', existing.risk_level)
-                logger.info(f"Updated existing tender: {tender['id']}")
+                old_docs_url = existing.docs_url
+                docs_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
+                has_docs = os.path.exists(docs_dir) and len(os.listdir(docs_dir)) > 0
+                
+                if (docs_url and docs_url != old_docs_url) or (docs_url and not has_docs):
+                    needs_requeue = True
+                    
+                existing.title = tender.get('title', existing.title)
+                existing.description = tender.get('description', existing.description)
+                existing.initial_price = parsed_price
+                existing.deadline = tender.get('deadline', existing.deadline)
+                existing.region = tender.get('region', existing.region)
+                existing.law_type = tender.get('law_type', existing.law_type)
+                existing.url = tender.get('url', existing.url)
+                existing.docs_url = docs_url
+                existing.search_url = tender.get('search_url', existing.search_url)
+                existing.keyword = tender.get('keyword', existing.keyword)
+                existing.ntype = tender.get('ntype', existing.ntype)
+                
+                if 'status' in tender:
+                    existing.status = tender['status']
+                if 'risk_level' in tender:
+                    existing.risk_level = tender['risk_level']
+                
+                updated += 1
+                logger.info(f"Updated existing tender: {tender_id} | docs_url present={bool(docs_url)} | docs_dir exists={has_docs} | action=updated")
             else:
                 new_tender = TenderModel(
-                    id=tender['id'],
-                    title=tender['title'],
+                    id=tender_id,
+                    title=tender.get('title', ''),
                     description=tender.get('description', ''),
                     initial_price=parsed_price,
                     deadline=tender.get('deadline', '-'),
@@ -442,33 +532,45 @@ def process_tenders(background_tasks: BackgroundTasks, tenders: list = Body(...)
                     region=tender.get('region', 'РФ'),
                     law_type=tender.get('law_type', '44-ФЗ'),
                     url=tender.get('url', ''),
-                    docs_url=tender.get('docs_url', ''),
+                    docs_url=docs_url,
                     search_url=tender.get('search_url', ''),
                     keyword=tender.get('keyword', ''),
                     ntype=tender.get('ntype', '')
                 )
                 db.add(new_tender)
-                logger.info(f"Created new tender: {tender['id']}")
+                created += 1
+                needs_requeue = bool(docs_url)
+                logger.info(f"Created new tender: {tender_id} | docs_url present={bool(docs_url)} | action=created")
                 
-                # Если это новый тендер, запускаем скачивание документов
-                if tender.get('docs_url'):
-                    notice = Notice(
-                        reg=tender['id'],
-                        ntype=tender.get('ntype', ''),
-                        keyword=tender.get('keyword', ''),
-                        search_url=tender.get('search_url', ''),
-                        href=tender.get('url', ''),
-                        docs_url=tender.get('docs_url', ''),
-                        title=tender.get('title', ''),
-                        object_info=tender.get('description', ''),
-                        initial_price=str(tender.get('initial_price', '')),
-                        application_deadline=tender.get('deadline', '')
-                    )
-                    background_tasks.add_task(eis_service.process_tenders, [notice])
+            if needs_requeue:
+                notice = Notice(
+                    reg=tender_id,
+                    ntype=tender.get('ntype', ''),
+                    keyword=tender.get('keyword', ''),
+                    search_url=tender.get('search_url', ''),
+                    href=tender.get('url', ''),
+                    docs_url=docs_url,
+                    title=tender.get('title', ''),
+                    object_info=tender.get('description', ''),
+                    initial_price=str(tender.get('initial_price', '')),
+                    application_deadline=tender.get('deadline', '')
+                )
+                background_tasks.add_task(eis_service.process_tenders, [notice])
+                requeued_docs += 1
+                logger.info(f"Requeued docs for tender: {tender_id}")
+                
+            processed += 1
             
         db.commit()
-        return {"status": "success", "processed": len(tenders)}
+        return {
+            "status": "success", 
+            "processed": processed,
+            "created": created,
+            "updated": updated,
+            "requeued_docs": requeued_docs
+        }
     except Exception as e:
+        db.rollback()
         logger.error(f"Error processing tenders: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 

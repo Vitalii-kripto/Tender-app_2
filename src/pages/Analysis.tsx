@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { MOCK_CATALOG } from './ProductCatalog';
-import { findProductEquivalent, startBatchAnalysisJob, getJobStatus, getTendersFromBackend, deleteTenderFromBackend } from '../services/geminiService';
+import { findProductEquivalent, startBatchAnalysisJob, getJobStatus, getTendersFromBackend, deleteTenderFromBackend, requeueTenderDocs } from '../services/geminiService';
 import { AnalysisResult, Tender, LegalAnalysisResult } from '../types';
 import { FileText, Shield, ArrowRight, CheckCircle, AlertTriangle, Cpu, Trash2, FileDown, ScanEye, Loader2, Square, CheckSquare, ShieldAlert, Layout, ChevronDown, Table } from 'lucide-react';
 
@@ -175,6 +175,16 @@ const Analysis = () => {
         setLoading(false);
         setStatusText("");
     }
+  };
+
+  const refreshTenderFiles = async (tenderId: string) => {
+      try {
+          const response = await fetch(`/api/tenders/${tenderId}/files`);
+          const files = await response.json();
+          setTenderFiles(prev => ({ ...prev, [tenderId]: files }));
+      } catch (e) {
+          console.error(`Failed to load files for tender ${tenderId}`, e);
+      }
   };
 
   const removeTender = async (id: string) => {
@@ -362,15 +372,50 @@ const Analysis = () => {
                                         <p className="text-[11px] text-slate-500 line-clamp-2 mb-2 leading-tight">{tender.description}</p>
                                         
                                         {/* File List for Selection */}
-                                        {tenderFiles[tender.id] && tenderFiles[tender.id].length > 0 && (
-                                            <div className="mt-2 pt-2 border-t border-slate-100">
-                                                <div className="flex justify-between items-center mb-1">
-                                                    <span className="text-[10px] font-bold text-slate-400 uppercase">Документы ({tenderFiles[tender.id].length})</span>
-                                                    <div className="flex gap-2">
-                                                        <button onClick={(e) => { e.stopPropagation(); selectAllFiles(tender.id); }} className="text-[10px] text-blue-500 hover:underline">Все</button>
-                                                        <button onClick={(e) => { e.stopPropagation(); deselectAllFiles(tender.id); }} className="text-[10px] text-slate-400 hover:underline">Ничего</button>
-                                                    </div>
+                                        <div className="mt-2 pt-2 border-t border-slate-100">
+                                            <div className="flex justify-between items-center mb-1">
+                                                <span className="text-[10px] font-bold text-slate-400 uppercase">
+                                                    Документы ({tenderFiles[tender.id]?.length || 0})
+                                                </span>
+                                                <div className="flex gap-2 items-center">
+                                                    <button 
+                                                        onClick={(e) => { e.stopPropagation(); refreshTenderFiles(tender.id); }} 
+                                                        className="text-[10px] text-blue-500 hover:underline flex items-center gap-1"
+                                                    >
+                                                        Обновить
+                                                    </button>
+                                                    {tenderFiles[tender.id] && tenderFiles[tender.id].length > 0 && (
+                                                        <>
+                                                            <span className="text-slate-300">|</span>
+                                                            <button onClick={(e) => { e.stopPropagation(); selectAllFiles(tender.id); }} className="text-[10px] text-blue-500 hover:underline">Все</button>
+                                                            <button onClick={(e) => { e.stopPropagation(); deselectAllFiles(tender.id); }} className="text-[10px] text-slate-400 hover:underline">Ничего</button>
+                                                        </>
+                                                    )}
                                                 </div>
+                                            </div>
+                                            
+                                            {!tenderFiles[tender.id] || tenderFiles[tender.id].length === 0 ? (
+                                                <div className="text-[11px] text-amber-600 bg-amber-50 p-2 rounded border border-amber-100 flex flex-col gap-2">
+                                                    <div className="flex items-start gap-2">
+                                                        <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                                                        <span>Файлы еще не загружены или ожидается их обработка. Нажмите «Обновить» или запросите повторную загрузку.</span>
+                                                    </div>
+                                                    <button 
+                                                        onClick={async (e) => {
+                                                            e.stopPropagation();
+                                                            try {
+                                                                await requeueTenderDocs(tender.id);
+                                                                alert('Запрошена повторная загрузка документов. Пожалуйста, подождите и обновите список файлов.');
+                                                            } catch (err) {
+                                                                alert('Ошибка при запросе повторной загрузки.');
+                                                            }
+                                                        }}
+                                                        className="self-start px-2 py-1 bg-amber-100 hover:bg-amber-200 text-amber-700 rounded text-[10px] font-medium transition-colors"
+                                                    >
+                                                        Повторить загрузку документов
+                                                    </button>
+                                                </div>
+                                            ) : (
                                                 <div className="max-h-24 overflow-y-auto space-y-1 pr-1 custom-scrollbar">
                                                     {tenderFiles[tender.id].map(file => (
                                                         <div 
@@ -388,8 +433,8 @@ const Analysis = () => {
                                                         </div>
                                                     ))}
                                                 </div>
-                                            </div>
-                                        )}
+                                            )}
+                                        </div>
                                     </div>
                                     <button 
                                         onClick={(e) => { e.stopPropagation(); removeTender(tender.id); }}

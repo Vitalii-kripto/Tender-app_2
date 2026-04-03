@@ -332,6 +332,30 @@ export const processSelectedTenders = async (
     }
 };
 
+export const requeueTenderDocs = async (tenderId: string): Promise<{ status: string }> => {
+    if (IS_DEMO_MODE) {
+        await delay(1000);
+        return { status: 'requeued' };
+    }
+
+    try {
+        const response = await fetch(`${API_BASE_URL}/api/crm/tenders/${tenderId}/requeue-docs`, {
+            method: 'POST'
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            throw new Error(data.detail || `Server error: ${response.status}`);
+        }
+
+        return data;
+    } catch (error: any) {
+        console.error('requeueTenderDocs failed:', error);
+        throw error;
+    }
+};
+
 export const searchTenders = async (
     query: string, 
     catalogContext: string, 
