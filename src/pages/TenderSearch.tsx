@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, Filter, Play, CheckCircle, ExternalLink, AlertCircle, Loader2, CheckSquare, Square, WifiOff, Briefcase, XCircle, Settings } from 'lucide-react';
+import { Search, Filter, Play, CheckCircle, ExternalLink, AlertCircle, Loader2, WifiOff, Briefcase, XCircle } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { MOCK_CATALOG } from './ProductCatalog';
 import { searchTenders, getTendersFromBackend, processSelectedTenders, cancelSearch } from '../services/geminiService';
@@ -20,51 +20,52 @@ const TenderSearch = () => {
 
   // CRM State from Backend
   const [crmTenders, setCrmTenders] = useState<Tender[]>([]);
-  const [selectedTenders, setSelectedTenders] = useState<Tender[]>([]);
-  
+  const [submittingTenderId, setSubmittingTenderId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    // Initial fetch of what is already in CRM to show correct checkboxes
-    getTendersFromBackend().then(setCrmTenders).catch(console.error);
+    refreshCrmTenders().catch(console.error);
   }, []);
 
-  const isInCrm = (id: string) => crmTenders.some(t => t.id === id);
-  const isSelected = (id: string) => selectedTenders.some(t => t.id === id);
-
-  const toggleTenderSelection = (tender: Tender) => {
-    if (tender.id === 'err_msg') return;
-    
-    if (isSelected(tender.id)) {
-      setSelectedTenders(prev => prev.filter(t => t.id !== tender.id));
-    } else {
-      setSelectedTenders(prev => [...prev, tender]);
-    }
+  const refreshCrmTenders = async () => {
+    const fresh = await getTendersFromBackend();
+    setCrmTenders(fresh);
   };
 
-  const handleProcessSelected = async () => {
-    if (selectedTenders.length === 0) return;
-    setProcessing(true);
+  const isInCrm = (id: string) => crmTenders.some(t => t.id === id);
+
+  const handleSendToWork = async (tender: Tender) => {
+    if (!tender || tender.id === 'err_msg') return;
+    if (isInCrm(tender.id)) return;
+
+    setActionError(null);
+    setSubmittingTenderId(tender.id);
+
     try {
-      await processSelectedTenders(selectedTenders);
-      // Update CRM state locally
-      const newCrmTenders = [...crmTenders, ...selectedTenders.map(t => ({...t, status: 'Found' as const}))];
-      setCrmTenders(newCrmTenders);
-      setSelectedTenders([]);
-      // Optionally navigate to CRM
-      // navigate('/crm');
-    } catch (error) {
-      console.error(error);
+      await processSelectedTenders([tender]);
+      await refreshCrmTenders();
+
+      setResults(prev =>
+        prev.map(item =>
+          item.id === tender.id
+            ? { ...item, status: 'Found' as const }
+            : item
+        )
+      );
+    } catch (error: any) {
+      console.error('Failed to send tender to CRM:', error);
+      setActionError(error?.message || 'Не удалось передать тендер в CRM');
     } finally {
-      setProcessing(false);
+      setSubmittingTenderId(null);
     }
   };
 
   const handleSearch = async () => {
     setLoading(true);
     setResults([]);
-    setSelectedTenders([]);
     setError(null);
+    setActionError(null);
     
     abortControllerRef.current = new AbortController();
 
@@ -132,16 +133,6 @@ const TenderSearch = () => {
 
       {/* Floating Action Bar */}
       <div className="absolute top-6 right-6 z-10 flex gap-3">
-        {selectedTenders.length > 0 && (
-            <button 
-                onClick={handleProcessSelected}
-                disabled={processing}
-                className="bg-emerald-600 text-white px-4 py-3 rounded-full shadow-lg hover:bg-emerald-700 transition-all flex items-center gap-2 border border-emerald-700 disabled:opacity-50"
-            >
-                {processing ? <Loader2 size={16} className="animate-spin" /> : <Settings size={16} />}
-                <span className="text-sm font-bold">Обработать выбранные ({selectedTenders.length})</span>
-            </button>
-        )}
         {crmTenders.length > 0 && (
             <button 
                 onClick={() => navigate('/crm')}
@@ -212,13 +203,26 @@ const TenderSearch = () => {
         </div>
       )}
 
+      {actionError && (
+        <div className="mb-8 p-4 bg-amber-50 border border-amber-200 rounded-xl">
+          <div className="flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-500 mt-0.5" />
+            <div>
+              <p className="font-medium text-amber-800">Ошибка передачи в CRM</p>
+              <p className="text-amber-700 mt-1">{actionError}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Results List */}
       <div className="flex-1 overflow-auto space-y-4 pb-6">
          {results.map((tender) => {
              const inCrm = isInCrm(tender.id);
-             const selected = isSelected(tender.id);
+             const isSubmitting = submittingTenderId === tender.id;
+
              return (
-                 <div key={tender.id} className={`relative bg-white p-5 rounded-xl border ${selected ? 'border-blue-500 bg-blue-50/10' : 'border-slate-200'}`}>
+                 <div key={tender.id} className={`relative bg-white p-5 rounded-xl border ${inCrm ? 'border-emerald-200 bg-emerald-50/20' : 'border-slate-200'}`}>
                     <div className="absolute top-5 right-5">
                         {inCrm ? (
                             <span className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-100 text-slate-500 cursor-not-allowed">
@@ -226,9 +230,17 @@ const TenderSearch = () => {
                                 В CRM
                             </span>
                         ) : (
-                            <button onClick={() => toggleTenderSelection(tender)} className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium ${selected ? 'bg-blue-600 text-white' : 'bg-slate-100 hover:bg-slate-200'}`}>
-                                {selected ? <CheckSquare size={16} /> : <Square size={16} />}
-                                В работу
+                            <button
+                                onClick={() => handleSendToWork(tender)}
+                                disabled={isSubmitting}
+                                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium ${
+                                  isSubmitting
+                                    ? 'bg-slate-200 text-slate-500 cursor-wait'
+                                    : 'bg-blue-600 text-white hover:bg-blue-700'
+                                }`}
+                            >
+                                {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Briefcase size={16} />}
+                                {isSubmitting ? 'Передача...' : 'В работу'}
                             </button>
                         )}
                     </div>

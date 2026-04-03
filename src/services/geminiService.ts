@@ -303,24 +303,31 @@ export const cancelSearch = async (): Promise<void> => {
     }
 };
 
-export const processSelectedTenders = async (tenders: Tender[]): Promise<void> => {
+export const processSelectedTenders = async (
+    tenders: Tender[]
+): Promise<{ status: string; processed?: number }> => {
     if (IS_DEMO_MODE) {
         await delay(1000);
         tenders.forEach(t => saveLocalTender(t));
-        return;
+        return { status: 'success', processed: tenders.length };
     }
+
     try {
         const response = await fetch(`${API_BASE_URL}/api/search-tenders/process`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(tenders)
         });
+
+        const data = await response.json().catch(() => ({}));
+
         if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.detail || `Server error: ${response.status}`);
+            throw new Error(data.detail || `Server error: ${response.status}`);
         }
-    } catch (error) {
-        console.error("Failed to process tenders", error);
+
+        return data;
+    } catch (error: any) {
+        console.error('processSelectedTenders failed:', error);
         throw error;
     }
 };
