@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, Filter, Play, CheckCircle, ExternalLink, AlertCircle, Loader2, WifiOff, Briefcase, XCircle } from 'lucide-react';
+import { Search, Filter, Play, CheckCircle, ExternalLink, AlertCircle, Loader2, WifiOff, Briefcase, XCircle, CheckSquare, Square } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { MOCK_CATALOG } from './ProductCatalog';
 import { searchTenders, getTendersFromBackend, processSelectedTenders, cancelSearch } from '../services/geminiService';
@@ -17,6 +17,7 @@ const TenderSearch = () => {
   const [fz44, setFz44] = useState(true);
   const [fz223, setFz223] = useState(true);
   const [publishDaysBack, setPublishDaysBack] = useState(30);
+  const [selectedTenders, setSelectedTenders] = useState<Tender[]>([]);
 
   // CRM State from Backend
   const [crmTenders, setCrmTenders] = useState<Tender[]>([]);
@@ -34,36 +35,53 @@ const TenderSearch = () => {
   };
 
   const isInCrm = (id: string) => crmTenders.some(t => t.id === id);
+  const isSelected = (id: string) => selectedTenders.some(t => t.id === id);
 
-  const handleSendToWork = async (tender: Tender) => {
-    if (!tender || tender.id === 'err_msg') return;
-    if (isInCrm(tender.id)) return;
+  const toggleTenderSelection = (tender: Tender) => {
+    if (tender.id === 'err_msg') return;
+    if (loading || processing) return;
 
-    setActionError(null);
-    setSubmittingTenderId(tender.id);
+    if (isSelected(tender.id)) {
+      setSelectedTenders(prev => prev.filter(t => t.id !== tender.id));
+    } else {
+      setSelectedTenders(prev => [...prev, tender]);
+    }
+  };
+
+  const handleProcessSelected = async () => {
+    if (processing || loading) return;
+    if (selectedTenders.length === 0) return;
+
+    const snapshot = [...selectedTenders];
+    setProcessing(true);
 
     try {
-      await processSelectedTenders([tender]);
-      await refreshCrmTenders();
+      await processSelectedTenders(snapshot);
 
-      setResults(prev =>
-        prev.map(item =>
-          item.id === tender.id
-            ? { ...item, status: 'Found' as const }
-            : item
-        )
+      setCrmTenders(prev => {
+        const existingIds = new Set(prev.map(t => t.id));
+        const toAdd = snapshot
+          .filter(t => !existingIds.has(t.id))
+          .map(t => ({ ...t, status: 'Found' as const }));
+        return [...prev, ...toAdd];
+      });
+
+      setSelectedTenders(prev =>
+        prev.filter(t => !snapshot.some(s => s.id === t.id))
       );
-    } catch (error: any) {
-      console.error('Failed to send tender to CRM:', error);
-      setActionError(error?.message || 'Не удалось передать тендер в CRM');
+    } catch (error) {
+      console.error(error);
     } finally {
-      setSubmittingTenderId(null);
+      setProcessing(false);
     }
   };
 
   const handleSearch = async () => {
+    if (loading || processing) return;
+
     setLoading(true);
     setResults([]);
+    setSelectedTenders([]);
     setError(null);
     setActionError(null);
     
@@ -133,6 +151,18 @@ const TenderSearch = () => {
 
       {/* Floating Action Bar */}
       <div className="absolute top-6 right-6 z-10 flex gap-3">
+        {selectedTenders.length > 0 && (
+          <button
+            onClick={handleProcessSelected}
+            disabled={processing || loading}
+            className="bg-blue-600 text-white px-6 py-3 rounded-full shadow-lg hover:bg-blue-700 transition-all flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {processing ? <Loader2 size={20} className="animate-spin" /> : <CheckCircle size={20} />}
+            <span className="font-medium">
+              {processing ? 'Обработка...' : `Обработать выбранные (${selectedTenders.length})`}
+            </span>
+          </button>
+        )}
         {crmTenders.length > 0 && (
             <button 
                 onClick={() => navigate('/crm')}

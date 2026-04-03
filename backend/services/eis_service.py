@@ -1,16 +1,15 @@
 import os
 import re
+import shutil
 import sqlite3
 import time
 import random
 import traceback
 import asyncio
 import sys
-import html
-from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Optional, Set, Dict
+from typing import List, Optional, Set, Dict, Any, Tuple
 from urllib.parse import urlencode, urljoin, urlparse, parse_qs, unquote
 import logging
 import requests
@@ -138,6 +137,97 @@ NO_RESULTS_PATTERNS = [
     "не найдено",
 ]
 
+DOC_URL_MARKERS = (
+    "download",
+    "downloadfile",
+    "download.html?id=",
+    "attachment",
+    "filestore",
+)
+
+FILE_EXT_RE = re.compile(r"\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|rtf|ods)\b", re.IGNORECASE)
+
+
+def safe_log_text(value: str) -> str:
+    text = (value or "").replace("\n", " ").replace("\r", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:500]
+
+
+def normalize_candidate_filename(value: str) -> str:
+    value = fix_header_filename(value or "")
+    value = value.replace("\xa0", " ").strip()
+    value = re.sub(r"\s+", " ", value)
+    return safe_filename(value)
+
+
+def guess_filename_from_anchor(a) -> str:
+    candidates = []
+
+    for attr in ("download", "title", "data-original-title", "aria-label"):
+        val = a.get(attr)
+        if val:
+            candidates.append(val)
+
+    text = a.get_text(" ", strip=True)
+    if text:
+        candidates.append(text)
+
+    row = a.find_parent(["tr", "li", "div"])
+    if row is not None:
+        row_text = row.get_text(" ", strip=True)
+        if row_text:
+            candidates.append(row_text)
+
+    for raw in candidates:
+        cleaned = normalize_candidate_filename(raw)
+        if not cleaned:
+            continue
+        if FILE_EXT_RE.search(cleaned):
+            return cleaned
+
+    for raw in candidates:
+        cleaned = normalize_candidate_filename(raw)
+        if cleaned and len(cleaned) >= 3:
+            return cleaned
+
+    return ""
+
+
+def build_documents_url(notice: "Notice") -> str:
+    if notice.docs_url:
+        return notice.docs_url
+
+    href = notice.href or ""
+    parsed = urlparse(href)
+    qs = parse_qs(parsed.query)
+
+    notice_info_id = qs.get("noticeInfoId", [""])[0]
+    reg_number = qs.get("regNumber", [""])[0] or notice.reg
+
+    if notice_info_id and "notice223" in href:
+        return f"{BASE}/epz/order/notice/notice223/documents.html?noticeInfoId={notice_info_id}"
+
+    if notice.ntype and reg_number:
+        return f"{BASE}/epz/order/notice/{notice.ntype}/view/documents.html?regNumber={reg_number}"
+
+    return href
+
+
+def analyze_docs_page(html: str) -> Tuple[bool, bool, str]:
+    soup = BeautifulSoup(html, "html.parser")
+    has_card_attachments = bool(
+        soup.select("div.blockFilesTabDocs, .attachment, .attachments, .card-attachment, table, tr a[href]")
+    )
+    has_download_href = False
+    for a in soup.select("a[href]"):
+        href = (a.get("href") or "").strip().lower()
+        if any(marker in href for marker in DOC_URL_MARKERS):
+            has_download_href = True
+            break
+    page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    return has_card_attachments, has_download_href, safe_log_text(page_title)
+
 def human_sleep(min_s: float = 1.5, max_s: float = 4.5):
     time.sleep(random.uniform(min_s, max_s))
 
@@ -236,30 +326,44 @@ def uid_from_url(u: str) -> str:
 
 def parse_docs_block(docs_html: str) -> List[tuple[str, str]]:
     soup = BeautifulSoup(docs_html, "html.parser")
-    block = soup.select_one("div.blockFilesTabDocs")
-    if not block:
-        return []
 
-    items: List[tuple[str, str]] = []
-    for a in block.select("a[href]"):
+    items: List[Tuple[str, str]] = []
+    seen_urls = set()
+
+    for a in soup.select("a[href]"):
         href = (a.get("href") or "").strip()
         if not href:
             continue
-        if href.startswith("/"):
-            href = urljoin(BASE, href)
 
-        if "filestore" in href and "download" in href:
-            title = (a.get("title") or "").strip()
-            text = (a.get_text() or "").strip()
-            suggested = safe_filename(title or text)
-            items.append((href, suggested))
+        href_lower = href.lower()
+        onclick_lower = (a.get("onclick") or "").lower()
 
-    out, seen = [], set()
-    for u, t in items:
-        if u not in seen:
-            seen.add(u)
-            out.append((u, t))
-    return out
+        is_download_link = (
+            any(marker in href_lower for marker in DOC_URL_MARKERS)
+            or any(marker in onclick_lower for marker in DOC_URL_MARKERS)
+        )
+
+        if not is_download_link:
+            continue
+
+        if href.startswith("javascript:"):
+            continue
+
+        full_href = urljoin(BASE, href)
+        if full_href in seen_urls:
+            continue
+
+        suggested = guess_filename_from_anchor(a)
+        if not suggested:
+            uid = uid_from_url(full_href) or str(abs(hash(full_href)))
+            suggested = f"file_{uid}"
+
+        suggested = normalize_candidate_filename(suggested) or "file.bin"
+
+        seen_urls.add(full_href)
+        items.append((full_href, suggested))
+
+    return items
 
 def get_http_client():
     global RF_CLIENT_PROXY, RF_CLIENT_DIRECT
@@ -645,6 +749,25 @@ class EisService:
                 browser.close()
                 logger.info(f"[FRESH_RETRY] Browser closed for {reg_number}")
 
+    def redownload_tender_documents(self, notice: Notice, clear_dir: bool = True) -> Dict[str, Any]:
+        tender_dir = os.path.join(DOCUMENTS_ROOT, notice.reg)
+
+        if clear_dir and os.path.isdir(tender_dir):
+            shutil.rmtree(tender_dir, ignore_errors=True)
+
+        result = self.process_tenders([notice])
+        if not result:
+            return {"ok": False, "reason": "empty_result", "files": []}
+
+        item = result[0]
+        ok = item.get("status") == "selected" and bool(item.get("files"))
+        return {
+            "ok": ok,
+            "reason": item.get("reason", ""),
+            "files": item.get("files", []),
+            "meta": item,
+        }
+
     def process_tenders(self, notices: List[Notice]) -> List[Dict]:
         if sys.platform == 'win32':
             try:
@@ -699,79 +822,47 @@ class EisService:
 
                     for n in notices:
                         log(f"--- Processing {n.reg} ---")
-                        if n.reg.startswith("223-"):
-                            notice_id = n.reg.replace("223-", "")
-                            tender_url = f"{BASE}/epz/order/notice/notice223/common-info.html?noticeInfoId={notice_id}"
-                        else:
-                            tender_url = f"{BASE}/epz/order/notice/{n.ntype}/view/common-info.html?regNumber={n.reg}"
+                        d_url = build_documents_url(n)
                         
                         try:
-                            self.goto_with_human_delays(page, tender_url, wait="domcontentloaded", timeout=60000, retries=2)
-                            
-                            docs_url = self._resolve_documents_url(page, tender_url)
-                            logger.info(f"GOTO -> {docs_url}")
-                            self.goto_with_human_delays(page, docs_url, wait="domcontentloaded", timeout=60000, retries=2)
+                            self.goto_with_human_delays(page, d_url, wait="domcontentloaded", timeout=60000, retries=2)
                             page.wait_for_timeout(1200)
 
-                            page_title = page.title()
-                            current_url = page.url
-
-                            HOMEPAGE_MARKERS = [
-                                "Главная страница",
-                                "Единая информационная система",
-                                "zakupki.gov.ru",
-                            ]
-                            is_redirected = any(m in page_title for m in HOMEPAGE_MARKERS) and \
-                                            "documents" not in current_url and \
-                                            "notice" not in current_url
-
-                            if is_redirected:
-                                logger.warning(
-                                    f"REDIRECT_TO_HOMEPAGE detected for {n.reg} | "
-                                    f"page_title='{page_title}' | current_url={current_url} | "
-                                    f"Clearing stale state and retrying with fresh context..."
-                                )
-                                if os.path.exists(STATE_PATH):
-                                    os.remove(STATE_PATH)
-                                    logger.info(f"[state] Stale pw_state.json removed.")
-
-                                files = self._download_files_fresh(n.reg)
-                            else:
-                                files = self._wait_and_extract_docs_files(page, docs_url, n.reg)
-
-                            if not files:
-                                html_text = page.content()
-                                page_title = ""
-                                try:
-                                    page_title = page.title()
-                                except Exception:
-                                    pass
-
+                            html = page.content()
+                            items = parse_docs_block(html)
+                            if not items:
+                                has_card_attachments, has_download_href, page_title = analyze_docs_page(html)
                                 logger.info(
-                                    "No files found on docs page for %s | url=%s | has_card_attachments=%s | has_download_href=%s | page_title=%r",
+                                    "No files found on docs page for %s | url=%s | has_card_attachments=%s | has_download_href=%s | page_title='%s'",
                                     n.reg,
-                                    docs_url,
-                                    "card-attachments-container" in html_text,
-                                    "download.html?id=" in html_text,
+                                    d_url,
+                                    has_card_attachments,
+                                    has_download_href,
                                     page_title,
                                 )
                                 log_skip(f"SKIP:no_files_found for {n.reg}")
-                                mark_seen(n.reg)
-                                results.append({"reg": n.reg, "status": "skip", "reason": "no_files_found", "docs_url": docs_url, "files": []})
+                                results.append({
+                                    "reg": n.reg,
+                                    "status": "skip",
+                                    "reason": "no_files_found",
+                                    "docs_url": d_url,
+                                    "files": [],
+                                    "has_card_attachments": has_card_attachments,
+                                    "has_download_href": has_download_href,
+                                    "page_title": page_title,
+                                })
                                 continue
 
-                            logger.info("Found %s files on docs page for %s", len(files), n.reg)
-
-                            items = [(f["download_url"], f["name"]) for f in files]
+                            logger.info("Found %s files on docs page for %s", len(items), n.reg)
 
                         except PwTimeoutError as e:
-                            log_exception(f"Timeout fetching docs page {tender_url}", e)
+                            log_exception(f"Timeout fetching docs page {d_url}", e)
                             log_skip(f"SKIP:documents_timeout for {n.reg}")
-                            results.append({"reg": n.reg, "status": "skip", "reason": "documents_timeout", "docs_url": tender_url, "files": []})
+                            results.append({"reg": n.reg, "status": "skip", "reason": "documents_timeout", "docs_url": d_url, "files": []})
                             continue
                         except Exception as e:
-                            log_exception(f"Failed to fetch docs page {tender_url}", e)
-                            results.append({"reg": n.reg, "status": "error", "reason": f"fetch_docs_page:{e}", "docs_url": tender_url, "files": []})
+                            log_exception(f"Failed to fetch docs page {d_url}", e)
+                            results.append({"reg": n.reg, "status": "error", "reason": f"fetch_docs_page:{e}", "docs_url": d_url, "files": []})
                             continue
 
                         reg_dir = os.path.join(DOCUMENTS_ROOT, n.reg)
@@ -790,10 +881,10 @@ class EisService:
 
                         if downloaded_files:
                             mark_seen(n.reg)
-                            results.append({"reg": n.reg, "status": "selected", "docs_url": docs_url, "files": downloaded_files})
+                            results.append({"reg": n.reg, "status": "selected", "docs_url": d_url, "files": downloaded_files})
                         else:
                             log_skip(f"SKIP:all_downloads_failed for {n.reg}")
-                            results.append({"reg": n.reg, "status": "skip", "reason": "all_downloads_failed", "docs_url": docs_url, "files": []})
+                            results.append({"reg": n.reg, "status": "skip", "reason": "all_downloads_failed", "docs_url": d_url, "files": []})
 
                     try:
                         neutral_page = context.new_page()

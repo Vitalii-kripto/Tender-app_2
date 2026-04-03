@@ -18,6 +18,8 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body, Bac
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+import shutil
+from starlette.concurrency import run_in_threadpool
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -191,6 +193,20 @@ except Exception as e:
     logger.error(f"[FAILED] AiService initialization error: {e}")
 
 logger.info("Service initialization phase completed.")
+
+def build_notice_from_tender_model(tender: TenderModel) -> Notice:
+    return Notice(
+        reg=tender.id,
+        ntype=tender.ntype or "",
+        keyword=tender.keyword or "",
+        search_url=tender.search_url or "",
+        href=tender.url or "",
+        docs_url=tender.docs_url or "",
+        title=tender.title or "",
+        object_info=tender.description or "",
+        initial_price=str(tender.initial_price or ""),
+        application_deadline=tender.deadline or "",
+    )
 
 # --- DEGRADED MODE CHECKS ---
 def check_eis_service():
@@ -464,6 +480,9 @@ def search_tenders_endpoint(
 @app.post("/api/search-tenders/process")
 def process_tenders(background_tasks: BackgroundTasks, tenders: list = Body(...), db: Session = Depends(get_db)):
     """Обработать выбранные тендеры"""
+    if not isinstance(tenders, list) or not tenders:
+        raise HTTPException(status_code=400, detail="No tenders selected for processing")
+
     logger.info(f"Processing {len(tenders)} selected tenders")
     try:
         processed = 0
@@ -654,59 +673,57 @@ def get_tender_files(tender_id: str, _ = Depends(check_doc_service)):
 import shutil
 
 @app.post("/api/tenders/{tender_id}/refresh-files")
-async def refresh_tender_files(tender_id: str):
-    """
-    Принудительно перескачивает документы тендера с zakupki.gov.ru.
-    1. Удаляет папку с кэшированными файлами
-    2. Запускает скачивание заново через EisService
-    3. Возвращает обновлённый список файлов
-    """
+async def refresh_tender_files(
+    tender_id: str,
+    db: Session = Depends(get_db),
+    _ = Depends(check_eis_service),
+):
     logger.info(f"[REFRESH] Force re-download requested for tender {tender_id}")
 
-    # Путь к папке с кэшем документов тендера
-    docs_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
+    tender = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
+    if not tender:
+        raise HTTPException(status_code=404, detail=f"Tender not found: {tender_id}")
 
-    # Шаг 1: Удаляем кэш
-    if os.path.exists(docs_dir):
-        shutil.rmtree(docs_dir)
-        logger.info(f"[REFRESH] Cache cleared: {docs_dir}")
+    tender_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
+    if os.path.isdir(tender_dir):
+        shutil.rmtree(tender_dir, ignore_errors=True)
+        logger.info(f"[REFRESH] Cache cleared: {tender_dir}")
     else:
         logger.info(f"[REFRESH] No cache to clear for {tender_id}")
 
-    # Шаг 2: Запускаем скачивание
+    notice = build_notice_from_tender_model(tender)
+
     try:
-        # Вызов метода скачивания
-        eis_service._download_files_fresh(tender_id)
-        logger.info(f"[REFRESH] Re-download completed for {tender_id}")
-
+        result = await run_in_threadpool(
+            eis_service.redownload_tender_documents,
+            notice,
+            False,
+        )
     except Exception as e:
-        logger.error(f"[REFRESH] Re-download failed for {tender_id}: {e}")
-        return {
-            "status": "error",
-            "tender_id": tender_id,
-            "message": str(e),
-            "files": []
-        }
+        logger.error(f"[REFRESH] Re-download failed for {tender_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Re-download failed: {e}")
 
-    # Шаг 3: Возвращаем обновлённый список файлов
+    if not result.get("ok"):
+        reason = result.get("reason") or "unknown_error"
+        logger.error(f"[REFRESH] Re-download finished without files for {tender_id}: {reason}")
+        raise HTTPException(status_code=500, detail=f"No files downloaded: {reason}")
+
     files = []
-    if os.path.exists(docs_dir):
-        for fname in os.listdir(docs_dir):
-            fpath = os.path.join(docs_dir, fname)
-            if os.path.isfile(fpath):
+    if os.path.isdir(tender_dir):
+        for filename in os.listdir(tender_dir):
+            filepath = os.path.join(tender_dir, filename)
+            if os.path.isfile(filepath):
                 files.append({
-                    "name": fname,
-                    "size": os.path.getsize(fpath),
-                    "path": fpath,
-                    "url": f"/api/tenders/{tender_id}/download/{fname}"
+                    "name": filename,
+                    "size": os.path.getsize(filepath),
+                    "ext": os.path.splitext(filename)[1].lower(),
                 })
 
-    logger.info(f"[REFRESH] Returning {len(files)} files for {tender_id}")
     return {
-        "status": "ok",
+        "status": "success",
         "tender_id": tender_id,
+        "downloaded_count": len(files),
         "files": files,
-        "count": len(files)
     }
 
 @app.post("/api/ai/analyze-tenders-batch")
