@@ -92,36 +92,83 @@ class DocumentService:
 
         return doc_path
 
+    def _is_html_file(self, file_path: str) -> bool:
+        """
+        Проверяет, не является ли файл HTML-страницей (бывает при ошибках скачивания с ЕИС).
+        """
+        try:
+            with open(file_path, 'rb') as f:
+                chunk = f.read(2048)
+                # Ищем типичные HTML теги
+                chunk_str = chunk.decode('utf-8', errors='ignore').lower()
+                if '<html' in chunk_str or '<!doctype html' in chunk_str or '<head' in chunk_str:
+                    return True
+        except Exception as e:
+            logger.warning(f"Error checking if file is HTML: {e}")
+        return False
+
     def extract_document_data(self, file_path: str, use_cache: bool = True) -> Dict[str, Any]:
         """
         Извлечение структурированных данных из документа (страницы, листы, статус).
         """
+        filename = os.path.basename(file_path)
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        result = {
+            "filename": filename,
+            "file_path": file_path,
+            "file_extension": ext,
+            "file_size": 0,
+            "status": "failed_unknown",
+            "extract_method": "none",
+            "text_length": 0,
+            "extracted_text": "",
+            "error_message": "",
+            "pages": []
+        }
+
         if not os.path.exists(file_path):
-            return {"filename": os.path.basename(file_path), "text": "", "status": "error", "error_message": "Файл не найден"}
+            result["status"] = "skipped_not_found"
+            result["error_message"] = "Файл не найден"
+            return result
             
+        file_size = os.path.getsize(file_path)
+        result["file_size"] = file_size
+
+        if file_size == 0:
+            result["status"] = "skipped_empty"
+            result["error_message"] = "Файл пуст"
+            return result
+
+        if self._is_html_file(file_path):
+            result["status"] = "skipped_invalid_file"
+            result["error_message"] = "Файл является HTML-страницей (ошибка скачивания)"
+            return result
+
         mtime = os.path.getmtime(file_path)
         cache_key = (file_path, mtime)
         
         if use_cache and cache_key in self.text_cache:
             logger.info(f"Returning cached text for {file_path}")
-            return self.text_cache[cache_key]
+            cached = self.text_cache[cache_key]
+            # Update result with cached data
+            result.update({
+                "extracted_text": cached.get("text", ""),
+                "text_length": len(cached.get("text", "")),
+                "status": cached.get("status", "success"),
+                "error_message": cached.get("error_message", ""),
+                "pages": cached.get("pages", []),
+                "extract_method": cached.get("extract_method", "cache")
+            })
+            return result
 
-        ext = os.path.splitext(file_path)[1].lower()
-        filename = os.path.basename(file_path)
         logger.info(f"--- [START STRUCTURED EXTRACTION] ---")
         logger.info(f"File path: {file_path}")
         logger.info(f"Extension: {ext}")
         
-        result = {
-            "filename": filename,
-            "text": "",
-            "pages": [],
-            "status": "ok",
-            "error_message": ""
-        }
-
         try:
             if ext == '.doc':
+                result["extract_method"] = "antiword/striprtf"
                 docx_path = file_path + "x"
                 if os.path.exists(docx_path):
                     file_path = docx_path
@@ -133,18 +180,23 @@ class DocumentService:
                         ext = '.docx'
                     else:
                         full_text = self._extract_text_from_doc(file_path)
-                        result["text"] = full_text
+                        result["extracted_text"] = full_text
                         result["pages"] = [{"page_num": 1, "text": full_text}]
                         if not full_text.strip() or full_text.startswith("[ОШИБКА"):
-                            result["status"] = "error"
+                            result["status"] = "failed_text_extraction"
                             result["error_message"] = full_text
+                        else:
+                            result["status"] = "success"
+                        
+                        result["text_length"] = len(result["extracted_text"])
                         return result
 
             if ext == '.docx':
+                result["extract_method"] = "python-docx"
                 import docx
                 doc = docx.Document(file_path)
                 full_text = "\n".join([para.text for para in doc.paragraphs])
-                result["text"] = full_text
+                result["extracted_text"] = full_text
                 result["pages"] = [{"page_num": 1, "text": full_text}]
                 
                 tables_data = []
@@ -157,9 +209,12 @@ class DocumentService:
                 
                 if tables_data:
                     result["pages"][0]["tables"] = tables_data
-                    result["text"] += "\n\n--- ТАБЛИЦЫ ---\n" + "\n\n".join(tables_data)
+                    result["extracted_text"] += "\n\n--- ТАБЛИЦЫ ---\n" + "\n\n".join(tables_data)
+                
+                result["status"] = "success"
             
             elif ext == '.xlsx':
+                result["extract_method"] = "openpyxl"
                 import openpyxl
                 wb = openpyxl.load_workbook(file_path, data_only=True)
                 sheets_text = []
@@ -173,9 +228,11 @@ class DocumentService:
                         sheet_text = f"=== ЛИСТ: {sheet.title} ===\n" + "\n".join(sheet_data)
                         sheets_text.append(sheet_text)
                         result["pages"].append({"page_num": sheet.title, "text": sheet_text, "is_sheet": True, "tables": ["\n".join(sheet_data)]})
-                result["text"] = "\n\n".join(sheets_text)
+                result["extracted_text"] = "\n\n".join(sheets_text)
+                result["status"] = "success"
             
             elif ext == '.xls':
+                result["extract_method"] = "xlrd"
                 import xlrd
                 wb = xlrd.open_workbook(file_path)
                 sheets_text = []
@@ -190,9 +247,11 @@ class DocumentService:
                         sheet_text = f"=== ЛИСТ: {sheet.name} ===\n" + "\n".join(sheet_data)
                         sheets_text.append(sheet_text)
                         result["pages"].append({"page_num": sheet.name, "text": sheet_text, "is_sheet": True, "tables": ["\n".join(sheet_data)]})
-                result["text"] = "\n\n".join(sheets_text)
+                result["extracted_text"] = "\n\n".join(sheets_text)
+                result["status"] = "success"
             
             elif ext == '.pdf':
+                result["extract_method"] = "pypdf"
                 reader = PdfReader(file_path)
                 text_pages = []
                 for i, page in enumerate(reader.pages):
@@ -209,48 +268,56 @@ class DocumentService:
                 
                 if not is_quality_good:
                     logger.info(f"PDF text quality is POOR. Triggering OCR fallback...")
+                    result["extract_method"] = "paddleocr"
                     try:
                         ocr_pages = self._perform_ocr(file_path)
                         result["pages"] = ocr_pages
-                        result["text"] = "\n\n".join([f"--- Page {p['page_num']} ---\n{p['text']}" for p in ocr_pages])
+                        result["extracted_text"] = "\n\n".join([f"--- Page {p['page_num']} ---\n{p['text']}" for p in ocr_pages])
                         result["ocr_used"] = True
+                        result["status"] = "success"
 
-                        if not result["text"].strip() or "[OCR WARNING]" in result["text"]:
-                            result["status"] = "ocr_failed"
+                        if not result["extracted_text"].strip() or "[OCR WARNING]" in result["extracted_text"]:
+                            result["status"] = "failed_ocr"
                             result["error_message"] = "OCR отработал, но текст не найден или найден только мусор"
-                            result["text"] = full_text
+                            result["extracted_text"] = full_text
                             result["pages"] = [{"page_num": i + 1, "text": p} for i, p in enumerate(text_pages)]
                     except Exception as e:
                         logger.error(f"OCR failed: {e}")
-                        result["status"] = "ocr_failed"
+                        result["status"] = "failed_ocr"
                         result["error_message"] = f"OCR failed: {str(e)}"
-                        result["text"] = full_text
+                        result["extracted_text"] = full_text
                         result["pages"] = [{"page_num": i + 1, "text": p} for i, p in enumerate(text_pages)]
                         result["ocr_used"] = True
                 else:
-                    result["text"] = full_text
+                    result["extracted_text"] = full_text
+                    result["status"] = "success"
 
                 filename_lower = filename.lower()
-                if result.get("status") == "ocr_failed" and any(x in filename_lower for x in ["нмцк", "обоснование", "смет"]):
+                if result.get("status") == "failed_ocr" and any(x in filename_lower for x in ["нмцк", "обоснование", "смет"]):
                     result["critical_for_analysis"] = True
                 else:
                     result["critical_for_analysis"] = False
 
             else:
-                result["status"] = "error"
+                result["status"] = "skipped_unsupported_type"
                 result["error_message"] = f"Unsupported file extension: {ext}"
 
-            if not result["text"].strip() and result["status"] == "ok":
-                result["status"] = "empty"
+            if result["status"] == "success" and not result["extracted_text"].strip():
+                result["status"] = "skipped_empty"
                 result["error_message"] = "Файл пуст или текст не извлечен"
 
         except Exception as e:
             logger.error(f"Extraction error for {file_path}: {e}", exc_info=True)
-            result["status"] = "error"
+            result["status"] = "failed_text_extraction"
             result["error_message"] = str(e)
 
-        if result.get("status") == "ok":
-            self.text_cache[cache_key] = result
+        result["text_length"] = len(result["extracted_text"])
+
+        if result.get("status") == "success":
+            # For cache compatibility, we store it in the old format too
+            cache_data = result.copy()
+            cache_data["text"] = result["extracted_text"]
+            self.text_cache[cache_key] = cache_data
             
         return result
 

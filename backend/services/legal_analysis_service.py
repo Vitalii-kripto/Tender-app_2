@@ -24,15 +24,26 @@ class LegalAnalysisService:
         job_id: str = "N/A",
         callback: Optional[Callable[[str, int, str], None]] = None,
     ) -> Dict[str, Any]:
-        logger.info(f"Starting unified legal analysis for tender {tender_id} (Job: {job_id})")
+        documents_block, context_meta = self._build_documents_block(files_data)
+        
+        logger.info(f"[TENDER_ANALYSIS_START] tender_id={tender_id} job_id={job_id} files_in_packet={context_meta['documents_count']}")
 
         if callback:
             callback("Подготовка полного контекста документов", 20, "running")
 
         try:
             start_time = time.time()
+            
+            # Add information about skipped files to the prompt or report
+            skipped_block = ""
+            if context_meta["skipped_files"]:
+                skipped_block = "\n\n## Необработанные документы\n\n"
+                for skip in context_meta["skipped_files"]:
+                    filename = skip.get("filename", "Unknown")
+                    reason = skip.get("reason", "unknown")
+                    error = skip.get("error_message", "")
+                    skipped_block += f"- **{filename}**: {reason} {f'({error})' if error else ''}\n"
 
-            documents_block, context_meta = self._build_documents_block(files_data)
             prompt = PROMPT_UNIFIED_LEGAL_ANALYSIS.replace("__DOCUMENTS__", documents_block)
 
             if callback:
@@ -47,6 +58,11 @@ class LegalAnalysisService:
 
             raw_text = response.text if response else ""
             final_report_markdown = self._normalize_report(raw_text)
+            
+            # Append skipped files block if any
+            if skipped_block:
+                final_report_markdown += skipped_block
+
             validation = self._validate_report(final_report_markdown)
 
             if callback:
@@ -75,8 +91,8 @@ class LegalAnalysisService:
             })
 
             logger.info(
-                f"Unified legal analysis finished for tender {tender_id} "
-                f"in {end_time - start_time:.2f}s, status={final_status}, report_len={len(final_report_markdown)}"
+                f"[TENDER_ANALYSIS_DONE] tender_id={tender_id} "
+                f"status={final_status} duration={end_time - start_time:.2f}s"
             )
 
             return {
@@ -137,14 +153,17 @@ class LegalAnalysisService:
 
     def _render_pages(self, file_data: Dict[str, Any]) -> str:
         filename = file_data.get("filename", "Unknown")
-        status = file_data.get("status", "ok")
+        status = file_data.get("status", "success")
         error_message = file_data.get("error_message", "")
         pages = file_data.get("pages", []) or []
-        text = file_data.get("text", "") or ""
+        text = file_data.get("extracted_text", "") or ""
+        
+        priority, doc_type = self._document_priority(filename)
+        text_len = len(text)
 
-        header = f"=== ФАЙЛ: {filename} | STATUS: {status} ===\n"
+        header = f"=== ФАЙЛ: {filename} | ТИП: {doc_type} | ПРИОРИТЕТ: {priority} | ДЛИНА: {text_len} | STATUS: {status} ===\n"
 
-        if status != "ok":
+        if status != "success":
             fallback_text = self._clean_text(text)
             return (
                 header
@@ -188,6 +207,16 @@ class LegalAnalysisService:
 
         for file_data in sorted_files:
             filename = file_data.get("filename", "Unknown")
+            status = file_data.get("status", "success")
+            
+            if status != "success":
+                skipped_files.append({
+                    "filename": filename, 
+                    "reason": f"status_{status}", 
+                    "error_message": file_data.get("error_message", "")
+                })
+                continue
+
             rendered = self._render_pages(file_data)
             if not rendered.strip():
                 skipped_files.append({"filename": filename, "reason": "empty_render"})

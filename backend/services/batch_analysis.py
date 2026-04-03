@@ -86,42 +86,44 @@ def analyze_tenders_batch_job(
         
         extraction_start_time = time.time()
         for filename in filtered_files:
+            logger.info(f"[FILE_PROCESS_START] tender_id={tid} filename={filename}")
+            
             if filename not in available_files:
                 logger.warning(f"File {filename} not found in {tender_dir}")
-                file_statuses.append({"filename": filename, "status": "error", "message": "Файл не найден на диске"})
+                file_statuses.append({"filename": filename, "status": "skipped_not_found", "message": "Файл не найден на диске"})
+                logger.info(f"[FILE_PROCESS_RESULT] tender_id={tid} filename={filename} status=skipped_not_found text_length=0")
                 continue
                 
             filepath = os.path.join(tender_dir, filename)
-            logger.info(f"Processing file: {filename}")
             try:
                 doc_data = doc_service.extract_document_data(filepath)
-                text = doc_data.get("text", "")
-                if text and len(text.strip()) > 0:
-                    char_count = len(text)
-                    logger.info(f"Successfully extracted {char_count} chars from {filename}")
-                    
-                    if "[SYSTEM INFO]" in text:
-                        logger.warning(f"File {filename} processed with SYSTEM INFO (possibly DEGRADED).")
-                    
-                    files_data.append(doc_data)
-                    file_statuses.append({"filename": filename, "status": doc_data.get("status", "ok"), "message": doc_data.get("error_message", "Текст успешно извлечен")})
-                    
-                    if doc_data.get("critical_for_analysis"):
-                        logger.warning(f"Critical document degraded for tender {tid}: {filename}")
-                else:
-                    logger.warning(f"File {filename} is empty or no text extracted.")
-                    file_statuses.append({"filename": filename, "status": "warning", "message": "Файл пуст или текст не извлечен"})
+                status = doc_data.get("status", "failed_unknown")
+                text_len = doc_data.get("text_length", 0)
+                
+                logger.info(f"[FILE_PROCESS_RESULT] tender_id={tid} filename={filename} status={status} text_length={text_len}")
+                
+                # We always add doc_data to files_data, LegalAnalysisService will filter by status
+                files_data.append(doc_data)
+                file_statuses.append({
+                    "filename": filename, 
+                    "status": status, 
+                    "message": doc_data.get("error_message") or ("Текст успешно извлечен" if status == "success" else status)
+                })
+                
             except Exception as e:
                 logger.error(f"Failed to extract text from {filename}: {e}")
-                file_statuses.append({"filename": filename, "status": "error", "message": f"Ошибка извлечения: {str(e)}"})
+                file_statuses.append({"filename": filename, "status": "failed_unknown", "message": f"Ошибка извлечения: {str(e)}"})
+                logger.info(f"[FILE_PROCESS_RESULT] tender_id={tid} filename={filename} status=failed_unknown text_length=0")
+
         extraction_end_time = time.time()
         extraction_time = extraction_end_time - extraction_start_time
 
-        has_critical_degraded_file = any(
-            f.get("critical_for_analysis") is True for f in files_data
-        )
+        success_files = [f["filename"] for f in files_data if f.get("status") == "success"]
+        failed_files = [f["filename"] for f in files_data if f.get("status") != "success"]
+        
+        logger.info(f"[TENDER_PACKET_READY] tender_id={tid} success_files={len(success_files)} failed_files={len(failed_files)}")
 
-        if not files_data:
+        if not success_files:
             logger.error(f"No text extracted from any of the selected files for tender {tid}")
             job_service.complete_tender(job_id, tid, {
                 "status": "error",
