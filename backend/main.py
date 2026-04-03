@@ -651,6 +651,64 @@ def get_tender_files(tender_id: str, _ = Depends(check_doc_service)):
             })
     return files
 
+import shutil
+
+@app.post("/api/tenders/{tender_id}/refresh-files")
+async def refresh_tender_files(tender_id: str):
+    """
+    Принудительно перескачивает документы тендера с zakupki.gov.ru.
+    1. Удаляет папку с кэшированными файлами
+    2. Запускает скачивание заново через EisService
+    3. Возвращает обновлённый список файлов
+    """
+    logger.info(f"[REFRESH] Force re-download requested for tender {tender_id}")
+
+    # Путь к папке с кэшем документов тендера
+    docs_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
+
+    # Шаг 1: Удаляем кэш
+    if os.path.exists(docs_dir):
+        shutil.rmtree(docs_dir)
+        logger.info(f"[REFRESH] Cache cleared: {docs_dir}")
+    else:
+        logger.info(f"[REFRESH] No cache to clear for {tender_id}")
+
+    # Шаг 2: Запускаем скачивание
+    try:
+        # Вызов метода скачивания
+        eis_service._download_files_fresh(tender_id)
+        logger.info(f"[REFRESH] Re-download completed for {tender_id}")
+
+    except Exception as e:
+        logger.error(f"[REFRESH] Re-download failed for {tender_id}: {e}")
+        return {
+            "status": "error",
+            "tender_id": tender_id,
+            "message": str(e),
+            "files": []
+        }
+
+    # Шаг 3: Возвращаем обновлённый список файлов
+    files = []
+    if os.path.exists(docs_dir):
+        for fname in os.listdir(docs_dir):
+            fpath = os.path.join(docs_dir, fname)
+            if os.path.isfile(fpath):
+                files.append({
+                    "name": fname,
+                    "size": os.path.getsize(fpath),
+                    "path": fpath,
+                    "url": f"/api/tenders/{tender_id}/download/{fname}"
+                })
+
+    logger.info(f"[REFRESH] Returning {len(files)} files for {tender_id}")
+    return {
+        "status": "ok",
+        "tender_id": tender_id,
+        "files": files,
+        "count": len(files)
+    }
+
 @app.post("/api/ai/analyze-tenders-batch")
 async def api_analyze_tenders_batch(background_tasks: BackgroundTasks, data: dict = Body(...), _ = Depends(check_legal_service)):
     logger.info("Batch AI Analysis request received.")
