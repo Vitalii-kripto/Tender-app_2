@@ -6,6 +6,8 @@ import random
 import traceback
 import asyncio
 import sys
+import html
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Optional, Set, Dict
@@ -325,6 +327,236 @@ class SearchLogger:
         logger.error(f"[{prefix}] [SearchID:{self.search_id}] {msg}")
 
 class EisService:
+    _DOC_LINK_RE = re.compile(
+        r"/download/(?:download|file)\.html\?(?:[^\"'#>\s]*\b)?id=\d+",
+        re.IGNORECASE,
+    )
+    _SIGN_LINK_RE = re.compile(
+        r"/download/signs/render\.html\?(?:[^\"'#>\s]*\b)?id=\d+",
+        re.IGNORECASE,
+    )
+    _FILE_EXT_RE = re.compile(
+        r"\.(pdf|doc|docx|xls|xlsx|rtf|zip|rar|7z|jpg|jpeg|png|tif|tiff)($|\s)",
+        re.IGNORECASE,
+    )
+    _GENERIC_FILE_NAMES = {
+        "microsoft word document",
+        "microsoft excel document",
+        "adobe acrobat document",
+        "просмотреть эп",
+    }
+
+    def _clean_ws(self, value: str | None) -> str:
+        if not value:
+            return ""
+        value = html.unescape(value)
+        value = re.sub(r"\s+", " ", value)
+        return value.strip()
+
+    def _tooltip_to_text(self, raw: str | None) -> str:
+        if not raw:
+            return ""
+        raw = html.unescape(raw)
+        raw = re.sub(r"<[^>]+>", " ", raw)
+        raw = re.sub(r"\s+", " ", raw)
+        return raw.strip()
+
+    def _extract_id_from_href(self, href: str) -> str:
+        try:
+            parsed = urlparse(href)
+            q = parse_qs(parsed.query)
+            value = q.get("id", [""])[0]
+            return str(value).strip()
+        except Exception:
+            return ""
+
+    def _looks_like_filename(self, value: str) -> bool:
+        if not value:
+            return False
+        value_l = value.strip().lower()
+        if value_l in self._GENERIC_FILE_NAMES:
+            return False
+        return bool(self._FILE_EXT_RE.search(value))
+
+    def _guess_ext(self, file_name: str, file_url: str) -> str:
+        for candidate in (file_name or "", urlparse(file_url).path or ""):
+            ext = Path(candidate).suffix.lower().strip()
+            if ext:
+                return ext
+        return ""
+
+    def _extract_section_title_for_anchor(self, a_tag) -> str:
+        current = a_tag
+        while current is not None:
+            classes = current.get("class") or []
+            if isinstance(classes, str):
+                classes = classes.split()
+            if "card-attachments__block" in classes:
+                title_tag = current.find("div", class_="title")
+                if title_tag:
+                    return self._clean_ws(title_tag.get_text(" ", strip=True))
+            current = current.parent
+        return ""
+
+    def _extract_file_name_from_anchor(self, a_tag) -> str:
+        candidates: list[str] = []
+
+        for attr in ("data-tooltip", "title", "aria-label"):
+            raw = a_tag.get(attr)
+            if raw:
+                text = self._tooltip_to_text(raw)
+                if text:
+                    candidates.append(text)
+
+        text_inside = self._clean_ws(a_tag.get_text(" ", strip=True))
+        if text_inside:
+            candidates.append(text_inside)
+
+        parent_text = self._clean_ws(a_tag.parent.get_text(" ", strip=True) if a_tag.parent else "")
+        if parent_text:
+            candidates.append(parent_text)
+
+        # сначала ищем реальное имя файла с расширением
+        for candidate in candidates:
+            if self._looks_like_filename(candidate):
+                return candidate
+
+        # потом берём самый длинный непустой текст, если расширения нет
+        filtered = [x for x in candidates if x and x.lower() not in self._GENERIC_FILE_NAMES]
+        if filtered:
+            return max(filtered, key=len)
+
+        return ""
+
+    def _parse_docs_html_universal(self, html_text: str, base_url: str) -> list[dict]:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+
+        sign_urls_by_id: dict[str, str] = {}
+        for a_tag in soup.select("a[href]"):
+            raw_href = self._clean_ws(a_tag.get("href"))
+            if not raw_href:
+                continue
+            if self._SIGN_LINK_RE.search(raw_href):
+                abs_href = urljoin(base_url, raw_href)
+                file_id = self._extract_id_from_href(abs_href)
+                if file_id:
+                    sign_urls_by_id[file_id] = abs_href
+
+        files: list[dict] = []
+        seen_urls: set[str] = set()
+
+        for a_tag in soup.select("a[href]"):
+            raw_href = self._clean_ws(a_tag.get("href"))
+            if not raw_href:
+                continue
+            if not self._DOC_LINK_RE.search(raw_href):
+                continue
+
+            abs_href = urljoin(base_url, raw_href)
+            if abs_href in seen_urls:
+                continue
+            seen_urls.add(abs_href)
+
+            file_id = self._extract_id_from_href(abs_href)
+            file_name = self._extract_file_name_from_anchor(a_tag)
+            section_title = self._extract_section_title_for_anchor(a_tag)
+            ext = self._guess_ext(file_name, abs_href)
+
+            files.append(
+                {
+                    "file_id": file_id,
+                    "name": file_name or (f"file_{file_id}" if file_id else "unknown_file"),
+                    "url": abs_href,
+                    "download_url": abs_href,
+                    "sign_url": sign_urls_by_id.get(file_id, ""),
+                    "section_title": section_title,
+                    "ext": ext,
+                    "source_page": base_url,
+                }
+            )
+
+        return files
+
+    def _resolve_documents_url(self, page, tender_url: str) -> str:
+        current_url = page.url or tender_url
+        if "documents.html" in current_url:
+            return current_url
+
+        candidates = [
+            'a.tabsNav__item[href*="documents"]',
+            'a[href*="documents"]:has-text("Документы")',
+            'a[href*="documents"]',
+        ]
+
+        for selector in candidates:
+            try:
+                locator = page.locator(selector).first
+                count = locator.count()
+                if count > 0:
+                    href = locator.get_attribute("href")
+                    if href:
+                        return urljoin(current_url, href)
+            except Exception:
+                pass
+
+        rewritten = re.sub(r"/view/common-info\.html", "/view/documents.html", current_url)
+        if rewritten != current_url:
+            return rewritten
+
+        rewritten = re.sub(r"/common-info\.html", "/documents.html", current_url)
+        if rewritten != current_url:
+            return rewritten
+
+        return current_url
+
+    def _wait_and_extract_docs_files(self, page, docs_url: str, tender_id: str, timeout_ms: int = 20000) -> list[dict]:
+        started = time.monotonic()
+        deadline = started + timeout_ms / 1000.0
+        last_html = ""
+
+        selectors = [
+            'a[href*="/download/download.html?id="]',
+            'a[href*="/download/file.html?id="]',
+            '.card-attachments-container',
+            '.card-attachments__block',
+            'text=Документация по закупке',
+            'text=Документы',
+        ]
+
+        while time.monotonic() < deadline:
+            for selector in selectors:
+                try:
+                    locator = page.locator(selector)
+                    if locator.count() > 0:
+                        last_html = page.content()
+                        files = self._parse_docs_html_universal(last_html, docs_url)
+                        if files:
+                            return files
+                except Exception:
+                    pass
+
+            try:
+                page.mouse.wheel(0, 3000)
+            except Exception:
+                pass
+
+            page.wait_for_timeout(750)
+            last_html = page.content()
+            if "download.html?id=" in last_html or "card-attachments-container" in last_html:
+                files = self._parse_docs_html_universal(last_html, docs_url)
+                if files:
+                    return files
+
+        # финальная попытка после reload
+        try:
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+            last_html = page.content()
+        except Exception:
+            pass
+
+        return self._parse_docs_html_universal(last_html, docs_url)
+
     def process_tenders(self, notices: List[Notice]) -> List[Dict]:
         if sys.platform == 'win32':
             try:
@@ -381,29 +613,53 @@ class EisService:
                         log(f"--- Processing {n.reg} ---")
                         if n.reg.startswith("223-"):
                             notice_id = n.reg.replace("223-", "")
-                            d_url = f"{BASE}/epz/order/notice/notice223/documents.html?noticeInfoId={notice_id}"
+                            tender_url = f"{BASE}/epz/order/notice/notice223/common-info.html?noticeInfoId={notice_id}"
                         else:
-                            d_url = f"{BASE}/epz/order/notice/{n.ntype}/view/documents.html?regNumber={n.reg}"
+                            tender_url = f"{BASE}/epz/order/notice/{n.ntype}/view/common-info.html?regNumber={n.reg}"
                         
                         try:
-                            self.goto_with_human_delays(page, d_url, wait="domcontentloaded", timeout=60000, retries=2)
-                            html = page.content()
+                            self.goto_with_human_delays(page, tender_url, wait="domcontentloaded", timeout=60000, retries=2)
+                            
+                            docs_url = self._resolve_documents_url(page, tender_url)
+                            logger.info(f"GOTO -> {docs_url}")
+                            self.goto_with_human_delays(page, docs_url, wait="domcontentloaded", timeout=60000, retries=2)
+                            page.wait_for_timeout(1200)
+
+                            files = self._wait_and_extract_docs_files(page, docs_url, n.reg)
+
+                            if not files:
+                                html_text = page.content()
+                                page_title = ""
+                                try:
+                                    page_title = page.title()
+                                except Exception:
+                                    pass
+
+                                logger.info(
+                                    "No files found on docs page for %s | url=%s | has_card_attachments=%s | has_download_href=%s | page_title=%r",
+                                    n.reg,
+                                    docs_url,
+                                    "card-attachments-container" in html_text,
+                                    "download.html?id=" in html_text,
+                                    page_title,
+                                )
+                                log_skip(f"SKIP:no_files_found for {n.reg}")
+                                mark_seen(n.reg)
+                                results.append({"reg": n.reg, "status": "skip", "reason": "no_files_found", "docs_url": docs_url, "files": []})
+                                continue
+
+                            logger.info("Found %s files on docs page for %s", len(files), n.reg)
+
+                            items = [(f["download_url"], f["name"]) for f in files]
+
                         except PwTimeoutError as e:
-                            log_exception(f"Timeout fetching docs page {d_url}", e)
+                            log_exception(f"Timeout fetching docs page {tender_url}", e)
                             log_skip(f"SKIP:documents_timeout for {n.reg}")
-                            results.append({"reg": n.reg, "status": "skip", "reason": "documents_timeout", "docs_url": d_url, "files": []})
+                            results.append({"reg": n.reg, "status": "skip", "reason": "documents_timeout", "docs_url": tender_url, "files": []})
                             continue
                         except Exception as e:
-                            log_exception(f"Failed to fetch docs page {d_url}", e)
-                            results.append({"reg": n.reg, "status": "error", "reason": f"fetch_docs_page:{e}", "docs_url": d_url, "files": []})
-                            continue
-
-                        items = parse_docs_block(html)
-                        if not items:
-                            log(f"No files found on docs page for {n.reg}")
-                            log_skip(f"SKIP:no_files_found for {n.reg}")
-                            mark_seen(n.reg)
-                            results.append({"reg": n.reg, "status": "skip", "reason": "no_files_found", "docs_url": d_url, "files": []})
+                            log_exception(f"Failed to fetch docs page {tender_url}", e)
+                            results.append({"reg": n.reg, "status": "error", "reason": f"fetch_docs_page:{e}", "docs_url": tender_url, "files": []})
                             continue
 
                         reg_dir = os.path.join(DOCUMENTS_ROOT, n.reg)
@@ -422,10 +678,10 @@ class EisService:
 
                         if downloaded_files:
                             mark_seen(n.reg)
-                            results.append({"reg": n.reg, "status": "selected", "docs_url": d_url, "files": downloaded_files})
+                            results.append({"reg": n.reg, "status": "selected", "docs_url": docs_url, "files": downloaded_files})
                         else:
                             log_skip(f"SKIP:all_downloads_failed for {n.reg}")
-                            results.append({"reg": n.reg, "status": "skip", "reason": "all_downloads_failed", "docs_url": d_url, "files": []})
+                            results.append({"reg": n.reg, "status": "skip", "reason": "all_downloads_failed", "docs_url": docs_url, "files": []})
 
                     ensure_dir(os.path.dirname(STATE_PATH))
                     context.storage_state(path=STATE_PATH)
