@@ -15,7 +15,7 @@ if (!existsSync(LOGS_DIR)) {
     mkdirSync(LOGS_DIR, { recursive: true });
 }
 const LOG_FILE = join(LOGS_DIR, "tendersmart.log");
-const logStream = createWriteStream(LOG_FILE, { flags: "a", encoding: "utf8" });
+const logStream = createWriteStream(LOG_FILE, { flags: "w", encoding: "utf8" });
 
 function writeLog(label, level, data, color) {
     const lines = data.toString().trimEnd().split("\n");
