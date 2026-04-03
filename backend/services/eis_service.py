@@ -7,6 +7,8 @@ import random
 import traceback
 import asyncio
 import sys
+import html
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Optional, Set, Dict, Any, Tuple
@@ -365,54 +367,180 @@ def parse_docs_block(docs_html: str) -> List[tuple[str, str]]:
 
     return items
 
-def get_http_client():
+def get_http_client(force_direct: bool = False):
     global RF_CLIENT_PROXY, RF_CLIENT_DIRECT
-    if USE_PROXY:
-        if RF_CLIENT_PROXY is None:
-            from backend.services.auto_ssh import RfProxyHttpClient
-            RF_CLIENT_PROXY = RfProxyHttpClient(RF_CFG)
-        return RF_CLIENT_PROXY
-    else:
+
+    if force_direct or not USE_PROXY:
         if RF_CLIENT_DIRECT is None:
             RF_CLIENT_DIRECT = requests.Session()
+            RF_CLIENT_DIRECT.headers.update({
+                "User-Agent": "Mozilla/5.0",
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            })
         return RF_CLIENT_DIRECT
 
+    if RF_CLIENT_PROXY is None:
+        from backend.services.auto_ssh import RfProxyHttpClient
+        RF_CLIENT_PROXY = RfProxyHttpClient(RF_CFG)
+    return RF_CLIENT_PROXY
+
+
+def _looks_like_html_bytes(blob: bytes) -> bool:
+    if not blob:
+        return False
+    try:
+        text = blob[:4096].decode("utf-8", errors="ignore").lower()
+    except Exception:
+        return False
+    return (
+        "<html" in text
+        or "<!doctype html" in text
+        or "<head" in text
+        or "<body" in text
+    )
+
+
+def _looks_like_pdf_bytes(blob: bytes) -> bool:
+    return bool(blob[:5] == b"%PDF-")
+
+
+def _looks_like_zip_bytes(blob: bytes) -> bool:
+    return bool(blob[:4] == b"PK\x03\x04" or blob[:4] == b"PK\x05\x06" or blob[:4] == b"PK\x07\x08")
+
+
+def _looks_like_ole_bytes(blob: bytes) -> bool:
+    return bool(blob[:8] == b"\xD0\xCF\11\xE0\xA1\xB1\x1A\xE1")
+
+
+def _guess_file_family(filename: str, content_type: str) -> str:
+    filename = (filename or "").lower()
+    content_type = (content_type or "").lower()
+
+    if filename.endswith(".pdf") or "pdf" in content_type:
+        return "pdf"
+    if filename.endswith(".docx") or "wordprocessingml" in content_type:
+        return "zip_docx"
+    if filename.endswith(".xlsx") or "spreadsheetml" in content_type:
+        return "zip_xlsx"
+    if filename.endswith(".zip") or "application/zip" in content_type:
+        return "zip"
+    if filename.endswith(".doc") or "msword" in content_type:
+        return "ole_doc"
+    if filename.endswith(".xls") or "application/vnd.ms-excel" in content_type:
+        return "ole_xls"
+    return "generic"
+
+
+def _validate_download_prefix(prefix: bytes, filename: str, content_type: str) -> None:
+    if not prefix:
+        raise ValueError("Пустой ответ от сервера")
+
+    if _looks_like_html_bytes(prefix):
+        raise ValueError("Сервер вернул HTML вместо файла")
+
+    family = _guess_file_family(filename, content_type)
+
+    if family == "pdf" and not _looks_like_pdf_bytes(prefix):
+        raise ValueError("Файл заявлен как PDF, но сигнатура PDF отсутствует")
+
+    if family in {"zip_docx", "zip_xlsx", "zip"} and not _looks_like_zip_bytes(prefix):
+        raise ValueError("Файл заявлен как DOCX/XLSX/ZIP, но ZIP-сигнатура отсутствует")
+
+    if family in {"ole_doc", "ole_xls"} and not _looks_like_ole_bytes(prefix):
+        raise ValueError("Файл заявлен как DOC/XLS, но OLE-сигнатура отсутствует")
+
+
+def _validate_saved_file(path: str, filename: str, content_type: str) -> None:
+    if not os.path.exists(path):
+        raise ValueError("Файл не был сохранен на диск")
+
+    size = os.path.getsize(path)
+    if size <= 0:
+        raise ValueError("Сохраненный файл пустой")
+
+    family = _guess_file_family(filename, content_type)
+
+    if family in {"zip_docx", "zip_xlsx", "zip"} and not zipfile.is_zipfile(path):
+        raise ValueError("Сохраненный DOCX/XLSX/ZIP поврежден или неполон")
+
 def download_file_with_real_name(file_url: str, reg_dir: str, suggested_title: str) -> str:
-    client = get_http_client()
-    # RfProxyHttpClient handles tunnel ensure and warmup internally in .get()
-    r = client.get(file_url, timeout=120, stream=True)
-    r.raise_for_status()
+    last_errors = []
 
-    cd = r.headers.get("Content-Disposition", "")
-    ct = r.headers.get("Content-Type", "")
+    for force_direct in ([False, True] if USE_PROXY else [True]):
+        mode = "direct" if force_direct else "proxy"
+        temp_path = None
 
-    filename = filename_from_content_disposition(cd)
-    if not filename:
-        ext = guess_extension_from_content_type(ct)
-        if suggested_title:
-            if ext and suggested_title.lower().endswith(ext):
-                filename = suggested_title
-            else:
-                filename = suggested_title + (ext if ext else "")
-        else:
-            uid = uid_from_url(file_url) or str(abs(hash(file_url)))
-            filename = uid + (ext if ext else ".bin")
+        try:
+            client = get_http_client(force_direct=force_direct)
+            response = client.get(file_url, timeout=120, stream=True)
+            response.raise_for_status()
 
-    filename = safe_filename(filename) or "file.bin"
+            cd = response.headers.get("Content-Disposition", "")
+            ct = response.headers.get("Content-Type", "")
 
-    base, ext = os.path.splitext(filename)
-    out_path = os.path.join(reg_dir, filename)
-    counter = 1
-    while os.path.exists(out_path):
-        out_path = os.path.join(reg_dir, f"{base}_{counter}{ext}")
-        counter += 1
+            filename = filename_from_content_disposition(cd)
+            if not filename:
+                ext = guess_extension_from_content_type(ct)
+                if suggested_title:
+                    if ext and suggested_title.lower().endswith(ext):
+                        filename = suggested_title
+                    else:
+                        filename = suggested_title + (ext if ext else "")
+                else:
+                    uid = uid_from_url(file_url) or str(abs(hash(file_url)))
+                    filename = uid + (ext if ext else ".bin")
 
-    with open(out_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 128):
-            if chunk:
-                f.write(chunk)
+            filename = safe_filename(filename) or "file.bin"
 
-    return out_path
+            base, ext = os.path.splitext(filename)
+            out_path = os.path.join(reg_dir, filename)
+            counter = 1
+            while os.path.exists(out_path):
+                out_path = os.path.join(reg_dir, f"{base}_{counter}{ext}")
+                counter += 1
+
+            prefix = b""
+            first_chunks = []
+            bytes_read = 0
+
+            for chunk in response.iter_content(chunk_size=1024 * 128):
+                if not chunk:
+                    continue
+                first_chunks.append(chunk)
+                bytes_read += len(chunk)
+                if len(prefix) < 16384:
+                    need = 16384 - len(prefix)
+                    prefix += chunk[:need]
+                if bytes_read >= 16384:
+                    break
+
+            _validate_download_prefix(prefix, filename, ct)
+
+            temp_path = out_path + ".part"
+            with open(temp_path, "wb") as f:
+                for chunk in first_chunks:
+                    f.write(chunk)
+                for chunk in response.iter_content(chunk_size=1024 * 128):
+                    if chunk:
+                        f.write(chunk)
+
+            _validate_saved_file(temp_path, filename, ct)
+            os.replace(temp_path, out_path)
+
+            logger.info("Downloaded file successfully | mode=%s | url=%s | path=%s", mode, file_url, out_path)
+            return out_path
+
+        except Exception as e:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+            error_text = f"{mode}: {e}"
+            last_errors.append(error_text)
+            logger.warning("Download attempt failed | %s | url=%s", error_text, file_url)
+
+    raise RuntimeError(" ; ".join(last_errors))
 
 class SearchLogger:
     def __init__(self, search_id: str):
@@ -661,13 +789,14 @@ class EisService:
 
         return self._parse_docs_html_universal(last_html, docs_url)
 
-    def _download_files_fresh(self, reg_number: str) -> list:
+    def _download_files_fresh(self, reg_number: str, use_proxy_override: Optional[bool] = None) -> list:
         """
-        Повторная попытка найти и скачать файлы тендера с чистым
-        браузерным контекстом (без pw_state.json).
+        Повторная попытка найти ссылки на документы с чистым браузерным контекстом.
+        Возвращает список словарей формата _parse_docs_html_universal().
         """
-        logger.info(f"[FRESH_RETRY] Starting fresh browser for {reg_number}")
+        logger.info("[FRESH_RETRY] Starting fresh browser for %s", reg_number)
 
+        proxy_enabled = USE_PROXY if use_proxy_override is None else use_proxy_override
         is_fz223 = reg_number.startswith("223-")
 
         if is_fz223:
@@ -694,60 +823,32 @@ class EisService:
             browser = p.chromium.launch(
                 headless=self.HEADLESS,
                 slow_mo=self.SLOWMO_MS,
-                proxy={"server": f"socks5://127.0.0.1:{LOCAL_SOCKS_PORT}"} if USE_PROXY else None
+                proxy={"server": f"socks5://127.0.0.1:{LOCAL_SOCKS_PORT}"} if proxy_enabled else None,
             )
             context = browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 user_agent=self.REQ_HEADERS["User-Agent"],
             )
             page = context.new_page()
-            try:
-                logger.info(f"[FRESH_RETRY] Step 1/2 GOTO common-info: {common_url}")
-                self.goto_with_human_delays(page, common_url, wait="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(2000)
 
-                logger.info(f"[FRESH_RETRY] Step 2/2 GOTO documents: {docs_url}")
+            try:
+                self.goto_with_human_delays(page, common_url, wait="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
+
                 self.goto_with_human_delays(page, docs_url, wait="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(1500)
 
-                title_fresh = page.title()
-                url_fresh = page.url
-
-                HOMEPAGE_MARKERS = [
-                    "Главная страница",
-                    "Единая информационная система",
-                    "zakupki.gov.ru",
-                ]
-                still_redirected = any(m in title_fresh for m in HOMEPAGE_MARKERS) and \
-                                   "documents" not in url_fresh and \
-                                   "notice" not in url_fresh
-
-                if still_redirected:
-                    logger.error(
-                        f"[FRESH_RETRY] Still redirected for {reg_number} | "
-                        f"title='{title_fresh}' | url={url_fresh} | Giving up."
-                    )
-                    return []
-
-                logger.info(
-                    f"[FRESH_RETRY] Documents page loaded for {reg_number} | "
-                    f"title='{title_fresh}'"
-                )
-
                 files = self._wait_and_extract_docs_files(page, docs_url, reg_number)
-
-                logger.info(
-                    f"[FRESH_RETRY] SUCCESS: found {len(files)} files "
-                    f"for {reg_number}"
-                )
+                logger.info("[FRESH_RETRY] Found %s files for %s", len(files), reg_number)
                 return files
 
             except Exception as e:
-                logger.error(f"[FRESH_RETRY] Exception for {reg_number}: {e}")
+                logger.error("[FRESH_RETRY] Exception for %s: %s", reg_number, e, exc_info=True)
                 return []
+
             finally:
                 browser.close()
-                logger.info(f"[FRESH_RETRY] Browser closed for {reg_number}")
+                logger.info("[FRESH_RETRY] Browser closed for %s", reg_number)
 
     def redownload_tender_documents(self, notice: Notice, clear_dir: bool = True) -> Dict[str, Any]:
         tender_dir = os.path.join(DOCUMENTS_ROOT, notice.reg)
@@ -757,34 +858,36 @@ class EisService:
 
         result = self.process_tenders([notice])
         if not result:
-            return {"ok": False, "reason": "empty_result", "files": []}
+            return {"ok": False, "reason": "empty_result", "files": [], "meta": {}}
 
         item = result[0]
         ok = item.get("status") == "selected" and bool(item.get("files"))
+
         return {
             "ok": ok,
-            "reason": item.get("reason", ""),
+            "reason": item.get("reason", "" if ok else "download_failed"),
             "files": item.get("files", []),
             "meta": item,
         }
 
     def process_tenders(self, notices: List[Notice]) -> List[Dict]:
-        if sys.platform == 'win32':
+        if sys.platform == "win32":
             try:
                 asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
             except Exception:
                 pass
 
-        if USE_PROXY:
+        results = []
+        proxy_enabled = USE_PROXY
+
+        if proxy_enabled:
             try:
-                client = get_http_client()
+                client = get_http_client(force_direct=False)
                 logger.info("Warming up proxy session...")
                 client.warmup()
             except Exception as e:
-                logger.error(f"Proxy warmup failed: {e}")
-                raise e
-
-        results = []
+                logger.warning("Proxy warmup failed, switching to direct mode: %s", e)
+                proxy_enabled = False
 
         try:
             with sync_playwright() as p:
@@ -793,28 +896,31 @@ class EisService:
                     browser = p.chromium.launch(
                         headless=self.HEADLESS,
                         slow_mo=self.SLOWMO_MS,
-                        proxy={"server": f"socks5://127.0.0.1:{LOCAL_SOCKS_PORT}"} if USE_PROXY else None
+                        proxy={"server": f"socks5://127.0.0.1:{LOCAL_SOCKS_PORT}"} if proxy_enabled else None,
                     )
                 except Exception as browser_err:
                     err_msg = str(browser_err)
                     if "playwright install" in err_msg.lower() or "executable doesn't exist" in err_msg.lower():
-                        raise RuntimeError("Браузер Playwright не найден. Пожалуйста, выполните команду в терминале: .venv\\Scripts\\python.exe -m playwright install chromium")
+                        raise RuntimeError(
+                            "Браузер Playwright не найден. Пожалуйста, выполните команду в терминале: "
+                            ".venv\\Scripts\\python.exe -m playwright install chromium"
+                        )
                     raise browser_err
-                
+
                 try:
                     if os.path.exists(STATE_PATH):
                         context = browser.new_context(
                             locale="ru-RU",
                             user_agent=self.REQ_HEADERS["User-Agent"],
                             storage_state=STATE_PATH,
-                            viewport={"width": 1920, "height": 1080}
+                            viewport={"width": 1920, "height": 1080},
                         )
-                        logger.info(f"[state] loaded: {STATE_PATH}")
+                        logger.info("[state] loaded: %s", STATE_PATH)
                     else:
                         context = browser.new_context(
                             locale="ru-RU",
                             user_agent=self.REQ_HEADERS["User-Agent"],
-                            viewport={"width": 1920, "height": 1080}
+                            viewport={"width": 1920, "height": 1080},
                         )
                         logger.info("[state] fresh context (no saved state yet)")
 
@@ -823,24 +929,22 @@ class EisService:
                     for n in notices:
                         log(f"--- Processing {n.reg} ---")
                         d_url = build_documents_url(n)
-                        
+
                         try:
                             self.goto_with_human_delays(page, d_url, wait="domcontentloaded", timeout=60000, retries=2)
-                            page.wait_for_timeout(1200)
+                            page.wait_for_timeout(1500)
 
-                            html = page.content()
-                            items = parse_docs_block(html)
-                            if not items:
-                                has_card_attachments, has_download_href, page_title = analyze_docs_page(html)
-                                logger.info(
-                                    "No files found on docs page for %s | url=%s | has_card_attachments=%s | has_download_href=%s | page_title='%s'",
+                            raw_items = self._wait_and_extract_docs_files(page, d_url, n.reg)
+                            if not raw_items:
+                                logger.warning(
+                                    "No files found on primary docs page for %s. Trying fresh browser retry.",
                                     n.reg,
-                                    d_url,
-                                    has_card_attachments,
-                                    has_download_href,
-                                    page_title,
                                 )
-                                log_skip(f"SKIP:no_files_found for {n.reg}")
+                                raw_items = self._download_files_fresh(n.reg, use_proxy_override=proxy_enabled)
+
+                            if not raw_items:
+                                html_text = page.content()
+                                has_card_attachments, has_download_href, page_title = analyze_docs_page(html_text)
                                 results.append({
                                     "reg": n.reg,
                                     "status": "skip",
@@ -853,63 +957,118 @@ class EisService:
                                 })
                                 continue
 
-                            logger.info("Found %s files on docs page for %s", len(items), n.reg)
-
                         except PwTimeoutError as e:
                             log_exception(f"Timeout fetching docs page {d_url}", e)
-                            log_skip(f"SKIP:documents_timeout for {n.reg}")
-                            results.append({"reg": n.reg, "status": "skip", "reason": "documents_timeout", "docs_url": d_url, "files": []})
+                            results.append({
+                                "reg": n.reg,
+                                "status": "skip",
+                                "reason": "documents_timeout",
+                                "docs_url": d_url,
+                                "files": [],
+                            })
                             continue
                         except Exception as e:
                             log_exception(f"Failed to fetch docs page {d_url}", e)
-                            results.append({"reg": n.reg, "status": "error", "reason": f"fetch_docs_page:{e}", "docs_url": d_url, "files": []})
+                            results.append({
+                                "reg": n.reg,
+                                "status": "error",
+                                "reason": f"fetch_docs_page:{e}",
+                                "docs_url": d_url,
+                                "files": [],
+                            })
+                            continue
+
+                        normalized_items = []
+                        seen_downloads = set()
+
+                        for item in raw_items:
+                            if isinstance(item, dict):
+                                file_url = (item.get("download_url") or item.get("url") or "").strip()
+                                suggested_title = normalize_candidate_filename(item.get("name") or "")
+                            else:
+                                file_url = (item[0] or "").strip()
+                                suggested_title = normalize_candidate_filename(item[1] or "")
+
+                            if not file_url:
+                                continue
+
+                            dedup_key = (file_url, suggested_title)
+                            if dedup_key in seen_downloads:
+                                continue
+
+                            seen_downloads.add(dedup_key)
+                            normalized_items.append((file_url, suggested_title or "file.bin"))
+
+                        if not normalized_items:
+                            results.append({
+                                "reg": n.reg,
+                                "status": "skip",
+                                "reason": "no_valid_download_links",
+                                "docs_url": d_url,
+                                "files": [],
+                            })
                             continue
 
                         reg_dir = os.path.join(DOCUMENTS_ROOT, n.reg)
                         ensure_dir(reg_dir)
 
                         downloaded_files = []
-                        for file_url, suggested_title in items:
+                        failed_downloads = []
+
+                        for file_url, suggested_title in normalized_items:
                             try:
-                                log(f"  Downloading {file_url}")
                                 out_path = download_file_with_real_name(file_url, reg_dir, suggested_title)
-                                log(f"  -> Saved to {out_path}")
                                 downloaded_files.append(out_path)
-                                time.sleep(random.uniform(0.5, 1.5))
+                                time.sleep(random.uniform(0.3, 1.0))
                             except Exception as e:
-                                log_exception(f"  Failed to download {file_url}", e)
+                                log_exception(f"Failed to download {file_url}", e)
+                                failed_downloads.append({
+                                    "url": file_url,
+                                    "title": suggested_title,
+                                    "error": str(e),
+                                })
 
                         if downloaded_files:
                             mark_seen(n.reg)
-                            results.append({"reg": n.reg, "status": "selected", "docs_url": d_url, "files": downloaded_files})
+                            results.append({
+                                "reg": n.reg,
+                                "status": "selected",
+                                "docs_url": d_url,
+                                "files": downloaded_files,
+                                "failed_downloads": failed_downloads,
+                            })
                         else:
-                            log_skip(f"SKIP:all_downloads_failed for {n.reg}")
-                            results.append({"reg": n.reg, "status": "skip", "reason": "all_downloads_failed", "docs_url": d_url, "files": []})
+                            results.append({
+                                "reg": n.reg,
+                                "status": "skip",
+                                "reason": "all_downloads_failed",
+                                "docs_url": d_url,
+                                "files": [],
+                                "failed_downloads": failed_downloads,
+                            })
 
                     try:
                         neutral_page = context.new_page()
                         neutral_page.goto(
                             "https://zakupki.gov.ru",
                             wait_until="domcontentloaded",
-                            timeout=15000
+                            timeout=15000,
                         )
                         ensure_dir(os.path.dirname(STATE_PATH))
                         context.storage_state(path=STATE_PATH)
                         neutral_page.close()
-                        logger.info(f"[state] saved (from neutral page): {STATE_PATH}")
+                        logger.info("[state] saved (from neutral page): %s", STATE_PATH)
                     except Exception as e:
-                        logger.warning(f"[state] Failed to save state: {e}")
+                        logger.warning("[state] Failed to save state: %s", e)
 
-                except Exception as nav_err:
-                    logger.error(f"Navigation/Page Error: {nav_err}")
                 finally:
                     browser.close()
                     logger.info("Browser closed.")
 
         except Exception as global_err:
-            logger.error(f"Playwright Global Error: {global_err}", exc_info=True)
+            logger.error("Playwright Global Error: %s", global_err, exc_info=True)
             return [{"status": "error", "reason": str(global_err)}]
-        
+
         return results
     def __init__(self):
         self.RECORDS_PER_PAGE = 50

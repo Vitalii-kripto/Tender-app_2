@@ -324,11 +324,12 @@ class DocumentService:
     def extract_text(self, file_path: str) -> str:
         """
         Обертка для обратной совместимости.
+        Возвращает именно extracted_text, а не несуществующий ключ text.
         """
         data = self.extract_document_data(file_path)
-        if data["status"] in ["error", "ocr_failed", "empty"]:
-            logger.warning(f"Extraction issue: {data['status']} - {data['error_message']}")
-        return data.get("text", "")
+        if data["status"] not in {"success"}:
+            logger.warning("Extraction issue: %s - %s", data["status"], data["error_message"])
+        return data.get("extracted_text", "")
 
     def _is_text_quality_good(self, text: str) -> bool:
         """

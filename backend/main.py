@@ -745,20 +745,25 @@ async def refresh_tender_files(
     if not tender:
         raise HTTPException(status_code=404, detail="Тендер не найден в БД")
 
-    # Удаляем папку с файлами
     tender_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
     if os.path.exists(tender_dir):
-        logger.info(f"Deleting files for tender {tender_id} before refresh")
+        logger.info("Deleting files for tender %s before refresh", tender_id)
         shutil.rmtree(tender_dir, ignore_errors=True)
 
-    # Запускаем свежую загрузку
     payload = tender_model_to_payload(tender)
     notice = build_notice_from_payload(payload)
 
-    # Используем run_in_threadpool для синхронного метода eis_service
-    await run_in_threadpool(eis_service.redownload_tender_documents, notice)
+    result = await run_in_threadpool(eis_service.redownload_tender_documents, notice)
 
-    # Возвращаем актуальный список файлов
+    if not result or not result.get("ok"):
+        detail = {
+            "message": "Не удалось скачать документы тендера",
+            "reason": (result or {}).get("reason", "unknown"),
+            "meta": (result or {}).get("meta", {}),
+        }
+        logger.error("Refresh tender files failed for %s | detail=%s", tender_id, detail)
+        raise HTTPException(status_code=502, detail=detail)
+
     files = []
     if os.path.exists(tender_dir):
         for f in os.listdir(tender_dir):
@@ -770,6 +775,16 @@ async def refresh_tender_files(
                     "path": f_path
                 })
 
+    if not files:
+        detail = {
+            "message": "Документы формально перекачаны, но папка тендера пуста",
+            "reason": "empty_directory_after_refresh",
+            "meta": result.get("meta", {}),
+        }
+        logger.error("Refresh tender files produced empty directory for %s", tender_id)
+        raise HTTPException(status_code=502, detail=detail)
+
+    logger.info("Refresh tender files completed for %s | files=%s", tender_id, len(files))
     return {"status": "success", "files": files}
 
 @app.post("/api/ai/analyze-tenders-batch")
