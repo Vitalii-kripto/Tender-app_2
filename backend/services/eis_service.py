@@ -557,6 +557,94 @@ class EisService:
 
         return self._parse_docs_html_universal(last_html, docs_url)
 
+    def _download_files_fresh(self, reg_number: str) -> list:
+        """
+        Повторная попытка найти и скачать файлы тендера с чистым
+        браузерным контекстом (без pw_state.json).
+        """
+        logger.info(f"[FRESH_RETRY] Starting fresh browser for {reg_number}")
+
+        is_fz223 = reg_number.startswith("223-")
+
+        if is_fz223:
+            notice_id = reg_number.replace("223-", "")
+            common_url = (
+                f"https://zakupki.gov.ru/epz/order/notice/notice223/"
+                f"common-info.html?noticeInfoId={notice_id}"
+            )
+            docs_url = (
+                f"https://zakupki.gov.ru/epz/order/notice/notice223/"
+                f"documents.html?noticeInfoId={notice_id}"
+            )
+        else:
+            common_url = (
+                f"https://zakupki.gov.ru/epz/order/notice/ea20/view/"
+                f"common-info.html?regNumber={reg_number}"
+            )
+            docs_url = (
+                f"https://zakupki.gov.ru/epz/order/notice/ea20/view/"
+                f"documents.html?regNumber={reg_number}"
+            )
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=self.HEADLESS,
+                slow_mo=self.SLOWMO_MS,
+                proxy={"server": f"socks5://127.0.0.1:{LOCAL_SOCKS_PORT}"} if USE_PROXY else None
+            )
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=self.REQ_HEADERS["User-Agent"],
+            )
+            page = context.new_page()
+            try:
+                logger.info(f"[FRESH_RETRY] Step 1/2 GOTO common-info: {common_url}")
+                self.goto_with_human_delays(page, common_url, wait="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+
+                logger.info(f"[FRESH_RETRY] Step 2/2 GOTO documents: {docs_url}")
+                self.goto_with_human_delays(page, docs_url, wait="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
+
+                title_fresh = page.title()
+                url_fresh = page.url
+
+                HOMEPAGE_MARKERS = [
+                    "Главная страница",
+                    "Единая информационная система",
+                    "zakupki.gov.ru",
+                ]
+                still_redirected = any(m in title_fresh for m in HOMEPAGE_MARKERS) and \
+                                   "documents" not in url_fresh and \
+                                   "notice" not in url_fresh
+
+                if still_redirected:
+                    logger.error(
+                        f"[FRESH_RETRY] Still redirected for {reg_number} | "
+                        f"title='{title_fresh}' | url={url_fresh} | Giving up."
+                    )
+                    return []
+
+                logger.info(
+                    f"[FRESH_RETRY] Documents page loaded for {reg_number} | "
+                    f"title='{title_fresh}'"
+                )
+
+                files = self._wait_and_extract_docs_files(page, docs_url, reg_number)
+
+                logger.info(
+                    f"[FRESH_RETRY] SUCCESS: found {len(files)} files "
+                    f"for {reg_number}"
+                )
+                return files
+
+            except Exception as e:
+                logger.error(f"[FRESH_RETRY] Exception for {reg_number}: {e}")
+                return []
+            finally:
+                browser.close()
+                logger.info(f"[FRESH_RETRY] Browser closed for {reg_number}")
+
     def process_tenders(self, notices: List[Notice]) -> List[Dict]:
         if sys.platform == 'win32':
             try:
@@ -625,7 +713,31 @@ class EisService:
                             self.goto_with_human_delays(page, docs_url, wait="domcontentloaded", timeout=60000, retries=2)
                             page.wait_for_timeout(1200)
 
-                            files = self._wait_and_extract_docs_files(page, docs_url, n.reg)
+                            page_title = page.title()
+                            current_url = page.url
+
+                            HOMEPAGE_MARKERS = [
+                                "Главная страница",
+                                "Единая информационная система",
+                                "zakupki.gov.ru",
+                            ]
+                            is_redirected = any(m in page_title for m in HOMEPAGE_MARKERS) and \
+                                            "documents" not in current_url and \
+                                            "notice" not in current_url
+
+                            if is_redirected:
+                                logger.warning(
+                                    f"REDIRECT_TO_HOMEPAGE detected for {n.reg} | "
+                                    f"page_title='{page_title}' | current_url={current_url} | "
+                                    f"Clearing stale state and retrying with fresh context..."
+                                )
+                                if os.path.exists(STATE_PATH):
+                                    os.remove(STATE_PATH)
+                                    logger.info(f"[state] Stale pw_state.json removed.")
+
+                                files = self._download_files_fresh(n.reg)
+                            else:
+                                files = self._wait_and_extract_docs_files(page, docs_url, n.reg)
 
                             if not files:
                                 html_text = page.content()
@@ -683,9 +795,19 @@ class EisService:
                             log_skip(f"SKIP:all_downloads_failed for {n.reg}")
                             results.append({"reg": n.reg, "status": "skip", "reason": "all_downloads_failed", "docs_url": docs_url, "files": []})
 
-                    ensure_dir(os.path.dirname(STATE_PATH))
-                    context.storage_state(path=STATE_PATH)
-                    logger.info(f"[state] saved: {STATE_PATH}")
+                    try:
+                        neutral_page = context.new_page()
+                        neutral_page.goto(
+                            "https://zakupki.gov.ru",
+                            wait_until="domcontentloaded",
+                            timeout=15000
+                        )
+                        ensure_dir(os.path.dirname(STATE_PATH))
+                        context.storage_state(path=STATE_PATH)
+                        neutral_page.close()
+                        logger.info(f"[state] saved (from neutral page): {STATE_PATH}")
+                    except Exception as e:
+                        logger.warning(f"[state] Failed to save state: {e}")
 
                 except Exception as nav_err:
                     logger.error(f"Navigation/Page Error: {nav_err}")
