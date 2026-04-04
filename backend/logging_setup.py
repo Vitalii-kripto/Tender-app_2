@@ -43,7 +43,17 @@ def _configure_root_logger() -> None:
         except Exception:
             pass
 
-    console_handler = logging.StreamHandler(sys.stdout)
+    import sys
+    console_handler = logging.StreamHandler(
+        stream=open(
+            sys.stdout.fileno(),
+            mode="w",
+            encoding="utf-8",
+            errors="replace",
+            closefd=False,
+            buffering=1,
+        )
+    )
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
 

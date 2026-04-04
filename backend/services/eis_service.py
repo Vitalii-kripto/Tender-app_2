@@ -394,7 +394,7 @@ def get_http_client(force_direct: bool = False):
 
 def _request_timeout(force_direct: bool):
     if force_direct:
-        return (DIRECT_CONNECT_TIMEOUT, DIRECT_READ_TIMEOUT)
+        return 10   # Быстрый фейл: если DNS не резолвится за 10 сек — не ждём
     return (PROXY_CONNECT_TIMEOUT, PROXY_READ_TIMEOUT)
 
 
@@ -520,33 +520,66 @@ def download_file_with_real_name(file_url: str, reg_dir: str, suggested_title: s
                 out_path = os.path.join(reg_dir, f"{base}_{counter}{ext}")
                 counter += 1
 
-            prefix = b""
-            first_chunks = []
-            bytes_read = 0
+            content = response.content
+            url = file_url
 
-            for chunk in response.iter_content(chunk_size=1024 * 128):
-                if not chunk:
-                    continue
-                first_chunks.append(chunk)
-                bytes_read += len(chunk)
-                if len(prefix) < 16384:
-                    need = 16384 - len(prefix)
-                    prefix += chunk[:need]
-                if bytes_read >= 16384:
-                    break
+            # Проверяем что скачанный контент является реальным документом,
+            # а не HTML-страницей редиректа или ошибки
+            content_lower = content[:2000].lower() if content else b""
+            is_html_response = (
+                content_lower.startswith(b"<!doctype html") or
+                content_lower.startswith(b"<html") or
+                b"<html" in content_lower[:500]
+            )
 
-            _validate_download_prefix(prefix, filename, ct)
+            if is_html_response:
+                html_preview = content[:500].decode("utf-8", errors="replace")
+                logger.error(
+                    f"[DOWNLOAD_VALIDATION] Got HTML instead of file content! "
+                    f"url={url} | size={len(content)} | "
+                    f"preview={html_preview[:200]!r}"
+                )
+                raise ValueError(
+                    f"Server returned HTML page instead of file content. "
+                    f"URL may require authentication or redirect. url={url}"
+                )
 
-            temp_path = out_path + ".part"
-            with open(temp_path, "wb") as f:
-                for chunk in first_chunks:
-                    f.write(chunk)
-                for chunk in response.iter_content(chunk_size=1024 * 128):
-                    if chunk:
-                        f.write(chunk)
+            # Проверяем минимальный размер файла (менее 100 байт — явно ошибка)
+            if len(content) < 100:
+                logger.error(
+                    f"[DOWNLOAD_VALIDATION] File too small ({len(content)} bytes), "
+                    f"likely an error page. url={url}"
+                )
+                raise ValueError(
+                    f"Downloaded content too small ({len(content)} bytes). "
+                    f"Likely an error response. url={url}"
+                )
 
-            _validate_saved_file(temp_path, filename, ct)
-            os.replace(temp_path, out_path)
+            if ext in ("doc", "xls"):
+                ole_magic = b'\xD0\xCF\x11\xE0'
+                xml_magic_variants = [b'<?xml', b'<html', b'PK\x03\x04']
+                is_ole = content[:4] == ole_magic[:4]
+                is_xml_or_zip = any(
+                    content[:len(m)] == m for m in xml_magic_variants
+                )
+                if not is_ole and not is_xml_or_zip:
+                    # Предупреждаем но НЕ бросаем исключение
+                    # Файлы с госзакупок могут быть RTF или другого формата
+                    logger.warning(
+                        f"[OLE_CHECK] File {filename} has unexpected signature. "
+                        f"First bytes: {content[:8].hex()}. "
+                        f"Saving anyway — user can open manually."
+                    )
+                elif not is_ole and is_xml_or_zip:
+                    logger.info(
+                        f"[OLE_CHECK] File {filename} is XML/ZIP format "
+                        f"(not binary OLE). This is normal for modern .doc/.xls files."
+                    )
+                # НЕ бросаем исключение ни в каком случае — просто сохраняем
+
+            # Всё в порядке — сохраняем файл
+            with open(out_path, "wb") as f:
+                f.write(content)
 
             logger.info(
                 "Downloaded file successfully | mode=%s | url=%s | path=%s",
@@ -824,25 +857,61 @@ class EisService:
         logger.info("[FRESH_RETRY_HTTP] Starting HTTP fallback for %s", reg_number)
 
         proxy_enabled = USE_PROXY if use_proxy_override is None else use_proxy_override
+        # Определяем тип тендера по ntype из БД или по формату ID
+        # zk20 = конкурентная закупка малого объёма ФЗ-44
+        # ea20 = электронный аукцион ФЗ-44
+        # notice223 = ФЗ-223
         is_fz223 = reg_number.startswith("223-")
 
+        # Получаем ntype из БД если возможно, иначе определяем по редиректу
+        ntype = getattr(self, '_last_ntype', None)
+        if ntype is None:
+            # Пробуем определить ntype через HEAD-запрос (следим за редиректом)
+            try:
+                probe_url = f"https://zakupki.gov.ru/epz/order/notice/ea20/view/documents.html?regNumber={reg_number}"
+                probe_resp = self.session.get(
+                    probe_url,
+                    allow_redirects=True,
+                    timeout=15,
+                    stream=True
+                )
+                probe_resp.close()
+                final_url = probe_resp.url
+                if "zk20" in final_url:
+                    ntype = "zk20"
+                elif "ea20" in final_url:
+                    ntype = "ea20"
+                else:
+                    ntype = "ea20"
+                logger.info(
+                    f"[FRESH_RETRY_HTTP] Detected ntype={ntype} "
+                    f"for {reg_number} via redirect probe"
+                )
+            except Exception as probe_err:
+                ntype = "ea20"
+                logger.warning(
+                    f"[FRESH_RETRY_HTTP] ntype probe failed for {reg_number}: "
+                    f"{probe_err}. Defaulting to ea20."
+                )
+
         if is_fz223:
-            notice_id = reg_number.replace("223-", "")
+            notice_id  = reg_number.replace("223-", "")
             common_url = (
                 f"https://zakupki.gov.ru/epz/order/notice/notice223/"
                 f"common-info.html?noticeInfoId={notice_id}"
             )
-            docs_url = (
+            docs_url   = (
                 f"https://zakupki.gov.ru/epz/order/notice/notice223/"
                 f"documents.html?noticeInfoId={notice_id}"
             )
         else:
+            # Используем реальный ntype, а не жёстко ea20
             common_url = (
-                f"https://zakupki.gov.ru/epz/order/notice/ea20/view/"
+                f"https://zakupki.gov.ru/epz/order/notice/{ntype}/view/"
                 f"common-info.html?regNumber={reg_number}"
             )
-            docs_url = (
-                f"https://zakupki.gov.ru/epz/order/notice/ea20/view/"
+            docs_url   = (
+                f"https://zakupki.gov.ru/epz/order/notice/{ntype}/view/"
                 f"documents.html?regNumber={reg_number}"
             )
 
