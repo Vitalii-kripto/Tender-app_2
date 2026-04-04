@@ -754,15 +754,8 @@ async def refresh_tender_files(
     notice = build_notice_from_payload(payload)
 
     result = await run_in_threadpool(eis_service.redownload_tender_documents, notice)
-
-    if not result or not result.get("ok"):
-        detail = {
-            "message": "Не удалось скачать документы тендера",
-            "reason": (result or {}).get("reason", "unknown"),
-            "meta": (result or {}).get("meta", {}),
-        }
-        logger.error("Refresh tender files failed for %s | detail=%s", tender_id, detail)
-        raise HTTPException(status_code=502, detail=detail)
+    meta = (result or {}).get("meta", {}) or {}
+    reason = (result or {}).get("reason", "unknown")
 
     files = []
     if os.path.exists(tender_dir):
@@ -775,17 +768,40 @@ async def refresh_tender_files(
                     "path": f_path
                 })
 
-    if not files:
-        detail = {
-            "message": "Документы формально перекачаны, но папка тендера пуста",
-            "reason": "empty_directory_after_refresh",
-            "meta": result.get("meta", {}),
+    if result and result.get("ok") and files:
+        logger.info("Refresh tender files completed for %s | files=%s", tender_id, len(files))
+        return {
+            "status": "success",
+            "tender_id": tender_id,
+            "files": files,
+            "count": len(files),
+            "errors": meta.get("failed_downloads", []),
         }
-        logger.error("Refresh tender files produced empty directory for %s", tender_id)
-        raise HTTPException(status_code=502, detail=detail)
 
-    logger.info("Refresh tender files completed for %s | files=%s", tender_id, len(files))
-    return {"status": "success", "files": files}
+    errors = meta.get("failed_downloads", [])
+    if not errors:
+        errors = [{
+            "reason": reason,
+            "message": meta.get("reason", reason),
+            "docs_url": meta.get("docs_url", ""),
+        }]
+
+    logger.warning(
+        "Refresh tender files partial result for %s | reason=%s | errors=%s",
+        tender_id,
+        reason,
+        len(errors),
+    )
+
+    return {
+        "status": "partial",
+        "tender_id": tender_id,
+        "files": files,
+        "count": len(files),
+        "reason": reason,
+        "errors": errors,
+        "meta": meta,
+    }
 
 @app.post("/api/ai/analyze-tenders-batch")
 async def api_analyze_tenders_batch(background_tasks: BackgroundTasks, data: dict = Body(...), _ = Depends(check_legal_service)):

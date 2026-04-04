@@ -8,6 +8,7 @@ import traceback
 import asyncio
 import sys
 import html
+import zipfile
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -42,6 +43,12 @@ STATE_PATH = os.path.join(DATA_DIR, "pw_state.json")
 
 USE_PROXY = os.getenv("USE_PROXY", "true").lower() == "true"
 LOCAL_SOCKS_PORT = 1080
+
+DIRECT_CONNECT_TIMEOUT = int(os.getenv("EIS_DIRECT_CONNECT_TIMEOUT", "15"))
+DIRECT_READ_TIMEOUT = int(os.getenv("EIS_DIRECT_READ_TIMEOUT", "60"))
+PROXY_CONNECT_TIMEOUT = int(os.getenv("EIS_PROXY_CONNECT_TIMEOUT", "25"))
+PROXY_READ_TIMEOUT = int(os.getenv("EIS_PROXY_READ_TIMEOUT", "120"))
+DOCS_HTTP_TIMEOUT = int(os.getenv("EIS_DOCS_HTTP_TIMEOUT", "30"))
 
 def ensure_dir(p: str):
     if p:
@@ -385,6 +392,12 @@ def get_http_client(force_direct: bool = False):
     return RF_CLIENT_PROXY
 
 
+def _request_timeout(force_direct: bool):
+    if force_direct:
+        return (DIRECT_CONNECT_TIMEOUT, DIRECT_READ_TIMEOUT)
+    return (PROXY_CONNECT_TIMEOUT, PROXY_READ_TIMEOUT)
+
+
 def _looks_like_html_bytes(blob: bytes) -> bool:
     if not blob:
         return False
@@ -447,7 +460,11 @@ def _validate_download_prefix(prefix: bytes, filename: str, content_type: str) -
         raise ValueError("Файл заявлен как DOCX/XLSX/ZIP, но ZIP-сигнатура отсутствует")
 
     if family in {"ole_doc", "ole_xls"} and not _looks_like_ole_bytes(prefix):
-        raise ValueError("Файл заявлен как DOC/XLS, но OLE-сигнатура отсутствует")
+        logger.warning(
+            "Файл %s не имеет OLE-сигнатуры. Возможен XML/RTF/нестандартный контейнер от ЕИС. Сохраняем файл без блокировки.",
+            filename,
+        )
+        return
 
 
 def _validate_saved_file(path: str, filename: str, content_type: str) -> None:
@@ -472,7 +489,11 @@ def download_file_with_real_name(file_url: str, reg_dir: str, suggested_title: s
 
         try:
             client = get_http_client(force_direct=force_direct)
-            response = client.get(file_url, timeout=120, stream=True)
+            response = client.get(
+                file_url,
+                timeout=_request_timeout(force_direct),
+                stream=True,
+            )
             response.raise_for_status()
 
             cd = response.headers.get("Content-Disposition", "")
@@ -527,7 +548,12 @@ def download_file_with_real_name(file_url: str, reg_dir: str, suggested_title: s
             _validate_saved_file(temp_path, filename, ct)
             os.replace(temp_path, out_path)
 
-            logger.info("Downloaded file successfully | mode=%s | url=%s | path=%s", mode, file_url, out_path)
+            logger.info(
+                "Downloaded file successfully | mode=%s | url=%s | path=%s",
+                mode,
+                file_url,
+                out_path,
+            )
             return out_path
 
         except Exception as e:
@@ -536,6 +562,7 @@ def download_file_with_real_name(file_url: str, reg_dir: str, suggested_title: s
                     os.remove(temp_path)
                 except Exception:
                     pass
+
             error_text = f"{mode}: {e}"
             last_errors.append(error_text)
             logger.warning("Download attempt failed | %s | url=%s", error_text, file_url)
@@ -791,10 +818,10 @@ class EisService:
 
     def _download_files_fresh(self, reg_number: str, use_proxy_override: Optional[bool] = None) -> list:
         """
-        Повторная попытка найти ссылки на документы с чистым браузерным контекстом.
-        Возвращает список словарей формата _parse_docs_html_universal().
+        HTTP-fallback без запуска нового sync_playwright().
+        Нужен только для повторной попытки получить HTML страницы документов и вытащить ссылки.
         """
-        logger.info("[FRESH_RETRY] Starting fresh browser for %s", reg_number)
+        logger.info("[FRESH_RETRY_HTTP] Starting HTTP fallback for %s", reg_number)
 
         proxy_enabled = USE_PROXY if use_proxy_override is None else use_proxy_override
         is_fz223 = reg_number.startswith("223-")
@@ -819,36 +846,48 @@ class EisService:
                 f"documents.html?regNumber={reg_number}"
             )
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=self.HEADLESS,
-                slow_mo=self.SLOWMO_MS,
-                proxy={"server": f"socks5://127.0.0.1:{LOCAL_SOCKS_PORT}"} if proxy_enabled else None,
-            )
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent=self.REQ_HEADERS["User-Agent"],
-            )
-            page = context.new_page()
+        attempts = [False, True] if proxy_enabled else [True]
+        urls_to_try = [docs_url, common_url]
 
-            try:
-                self.goto_with_human_delays(page, common_url, wait="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(1500)
+        for force_direct in attempts:
+            mode = "direct" if force_direct else "proxy"
 
-                self.goto_with_human_delays(page, docs_url, wait="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(1500)
+            for url in urls_to_try:
+                try:
+                    client = get_http_client(force_direct=force_direct)
+                    response = client.get(url, timeout=_request_timeout(force_direct))
+                    response.raise_for_status()
 
-                files = self._wait_and_extract_docs_files(page, docs_url, reg_number)
-                logger.info("[FRESH_RETRY] Found %s files for %s", len(files), reg_number)
-                return files
+                    html_text = response.text or ""
+                    files = self._parse_docs_html_universal(html_text, url)
+                    if files:
+                        logger.info(
+                            "[FRESH_RETRY_HTTP] Found %s files for %s | mode=%s | url=%s",
+                            len(files),
+                            reg_number,
+                            mode,
+                            url,
+                        )
+                        return files
 
-            except Exception as e:
-                logger.error("[FRESH_RETRY] Exception for %s: %s", reg_number, e, exc_info=True)
-                return []
+                    logger.info(
+                        "[FRESH_RETRY_HTTP] No files found for %s | mode=%s | url=%s",
+                        reg_number,
+                        mode,
+                        url,
+                    )
 
-            finally:
-                browser.close()
-                logger.info("[FRESH_RETRY] Browser closed for %s", reg_number)
+                except Exception as e:
+                    logger.warning(
+                        "[FRESH_RETRY_HTTP] Failed for %s | mode=%s | url=%s | error=%s",
+                        reg_number,
+                        mode,
+                        url,
+                        e,
+                    )
+
+        logger.warning("[FRESH_RETRY_HTTP] No files found for %s after all attempts", reg_number)
+        return []
 
     def redownload_tender_documents(self, notice: Notice, clear_dir: bool = True) -> Dict[str, Any]:
         tender_dir = os.path.join(DOCUMENTS_ROOT, notice.reg)
