@@ -720,6 +720,123 @@ class EisService:
 
         return ""
 
+    def parse_fz44_docs_page(self, html: str, reg_number: str) -> list:
+        """
+        Парсит HTML страницы документов тендера ФЗ-44 (ea20 / zk20).
+
+        Структура страницы (из анализа реальной страницы zakupki.gov.ru):
+          <div class="attachment row">
+            <span class="section__value">
+              <a href="https://zakupki.gov.ru/44fz/filestore/public/1.0/download/priz/file.html?uid=XXXXX"
+                 title="filename.xlsx">filename.xlsx</a>
+            </span>
+          </div>
+
+        Возвращает список словарей:
+          [{"url": "https://...uid=XXX", "title": "filename.xlsx", "uid": "XXX"}, ...]
+        """
+        if not html:
+            logger.warning(f"[PARSE_FZ44] Empty HTML for {reg_number}")
+            return []
+
+        soup = BeautifulSoup(html, "html.parser")
+        files = []
+        seen_uids = set()
+
+        # Ищем все блоки с прикреплёнными файлами
+        attachment_rows = soup.find_all("div", class_=lambda c: c and "attachment" in c and "row" in c)
+
+        if not attachment_rows:
+            # Запасной вариант: ищем напрямую по паттерну URL
+            logger.info(
+                f"[PARSE_FZ44] No 'attachment row' divs found for {reg_number}. "
+                f"Trying direct href search."
+            )
+            # Ищем все ссылки с /44fz/filestore/ в href
+            for a_tag in soup.find_all("a", href=re.compile(r"/44fz/filestore/.*?uid=")):
+                href = a_tag.get("href", "")
+                uid_match = re.search(r"uid=([A-F0-9a-f]+)", href)
+                if not uid_match:
+                    continue
+                uid = uid_match.group(1)
+                if uid in seen_uids:
+                    continue
+                seen_uids.add(uid)
+                title = (
+                    a_tag.get("title")
+                    or a_tag.get_text(strip=True)
+                    or f"document_{uid[:8]}.bin"
+                )
+                download_url = href if href.startswith("http") else f"https://zakupki.gov.ru{href}"
+                files.append({"url": download_url, "title": title, "uid": uid})
+                logger.info(
+                    f"[PARSE_FZ44] Found file (direct): '{title}' | uid={uid[:16]}..."
+                )
+            return files
+
+        # Обрабатываем каждый attachment row
+        for row in attachment_rows:
+            # Ищем ссылку для скачивания (содержит /44fz/filestore/)
+            download_a = row.find(
+                "a",
+                href=re.compile(r"/44fz/filestore/.*?uid=|/44fz/.*?download")
+            )
+            if not download_a:
+                # Также пробуем ссылки с /epz/ для старого формата
+                download_a = row.find(
+                    "a",
+                    href=re.compile(r"download|priz/file")
+                )
+            if not download_a:
+                continue
+
+            href = download_a.get("href", "")
+            if not href:
+                continue
+
+            # Извлекаем UID
+            uid_match = re.search(r"uid=([A-F0-9a-f]+)", href, re.IGNORECASE)
+            uid = uid_match.group(1) if uid_match else ""
+
+            # Дедупликация по UID
+            if uid and uid in seen_uids:
+                continue
+            if uid:
+                seen_uids.add(uid)
+
+            # Получаем имя файла из title, затем из текста ссылки
+            title = (
+                download_a.get("title", "").strip()
+                or download_a.get_text(strip=True)
+            )
+            if not title:
+                # Пробуем получить имя из alt картинки рядом
+                img = row.find("img", alt=True)
+                ext_map = {
+                    "xlsx": ".xlsx", "xls": ".xls",
+                    "docx": ".docx", "doc": ".doc",
+                    "pdf": ".pdf", "zip": ".zip",
+                    "rar": ".rar", "txt": ".txt",
+                }
+                img_alt = (img.get("src", "") if img else "").lower()
+                ext = next((v for k, v in ext_map.items() if k in img_alt), ".bin")
+                title = f"document_{uid[:8] if uid else len(files)}{ext}"
+
+            # Нормализуем URL
+            download_url = href if href.startswith("http") else f"https://zakupki.gov.ru{href}"
+
+            files.append({"url": download_url, "title": title, "uid": uid})
+            logger.info(
+                f"[PARSE_FZ44] Found file: '{title}' "
+                f"| uid={uid[:16] if uid else 'n/a'}... "
+                f"| url={download_url[:80]}"
+            )
+
+        logger.info(
+            f"[PARSE_FZ44] Total files found for {reg_number}: {len(files)}"
+        )
+        return files
+
     def _parse_docs_html_universal(self, html_text: str, base_url: str) -> list[dict]:
         soup = BeautifulSoup(html_text or "", "html.parser")
 
@@ -849,114 +966,121 @@ class EisService:
 
         return self._parse_docs_html_universal(last_html, docs_url)
 
-    def _download_files_fresh(self, reg_number: str, use_proxy_override: Optional[bool] = None) -> list:
+    async def _fresh_retry_playwright(self, reg_number: str, ntype: str) -> list:
         """
-        HTTP-fallback без запуска нового sync_playwright().
-        Нужен только для повторной попытки получить HTML страницы документов и вытащить ссылки.
+        Повторная попытка получить список файлов тендера ФЗ-44
+        через Playwright с чистым браузерным контекстом.
+
+        Использует новый парсер parse_fz44_docs_page() который умеет
+        читать реальную структуру страницы zakupki.gov.ru для ФЗ-44.
+
+        Параметры:
+          reg_number : регистрационный номер тендера (например 0853500000326001897)
+          ntype      : тип закупки из БД (ea20, zk20 и т.д.)
         """
-        logger.info("[FRESH_RETRY_HTTP] Starting HTTP fallback for %s", reg_number)
+        logger.info(
+            f"[FRESH_RETRY_PW] Starting fresh Playwright retry "
+            f"for {reg_number} | ntype={ntype}"
+        )
 
-        proxy_enabled = USE_PROXY if use_proxy_override is None else use_proxy_override
-        # Определяем тип тендера по ntype из БД или по формату ID
-        # zk20 = конкурентная закупка малого объёма ФЗ-44
-        # ea20 = электронный аукцион ФЗ-44
-        # notice223 = ФЗ-223
-        is_fz223 = reg_number.startswith("223-")
+        # Формируем URL документов на основе реального ntype из БД
+        docs_url = (
+            f"https://zakupki.gov.ru/epz/order/notice/{ntype}/view/"
+            f"documents.html?regNumber={reg_number}"
+        )
+        common_url = (
+            f"https://zakupki.gov.ru/epz/order/notice/{ntype}/view/"
+            f"common-info.html?regNumber={reg_number}"
+        )
 
-        # Получаем ntype из БД если возможно, иначе определяем по редиректу
-        ntype = getattr(self, '_last_ntype', None)
-        if ntype is None:
-            # Пробуем определить ntype через HEAD-запрос (следим за редиректом)
+        logger.info(f"[FRESH_RETRY_PW] docs_url={docs_url}")
+
+        from playwright.async_api import async_playwright
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+            )
+            page = await context.new_page()
+
             try:
-                probe_url = f"https://zakupki.gov.ru/epz/order/notice/ea20/view/documents.html?regNumber={reg_number}"
-                probe_resp = self.session.get(
-                    probe_url,
-                    allow_redirects=True,
-                    timeout=15,
-                    stream=True
-                )
-                probe_resp.close()
-                final_url = probe_resp.url
-                if "zk20" in final_url:
-                    ntype = "zk20"
-                elif "ea20" in final_url:
-                    ntype = "ea20"
-                else:
-                    ntype = "ea20"
+                # Шаг 1: Заходим на common-info (создаём реферер)
                 logger.info(
-                    f"[FRESH_RETRY_HTTP] Detected ntype={ntype} "
-                    f"for {reg_number} via redirect probe"
+                    f"[FRESH_RETRY_PW] Step 1/2: GOTO common-info: {common_url}"
                 )
-            except Exception as probe_err:
-                ntype = "ea20"
-                logger.warning(
-                    f"[FRESH_RETRY_HTTP] ntype probe failed for {reg_number}: "
-                    f"{probe_err}. Defaulting to ea20."
-                )
-
-        if is_fz223:
-            notice_id  = reg_number.replace("223-", "")
-            common_url = (
-                f"https://zakupki.gov.ru/epz/order/notice/notice223/"
-                f"common-info.html?noticeInfoId={notice_id}"
-            )
-            docs_url   = (
-                f"https://zakupki.gov.ru/epz/order/notice/notice223/"
-                f"documents.html?noticeInfoId={notice_id}"
-            )
-        else:
-            # Используем реальный ntype, а не жёстко ea20
-            common_url = (
-                f"https://zakupki.gov.ru/epz/order/notice/{ntype}/view/"
-                f"common-info.html?regNumber={reg_number}"
-            )
-            docs_url   = (
-                f"https://zakupki.gov.ru/epz/order/notice/{ntype}/view/"
-                f"documents.html?regNumber={reg_number}"
-            )
-
-        attempts = [False, True] if proxy_enabled else [True]
-        urls_to_try = [docs_url, common_url]
-
-        for force_direct in attempts:
-            mode = "direct" if force_direct else "proxy"
-
-            for url in urls_to_try:
                 try:
-                    client = get_http_client(force_direct=force_direct)
-                    response = client.get(url, timeout=_request_timeout(force_direct))
-                    response.raise_for_status()
-
-                    html_text = response.text or ""
-                    files = self._parse_docs_html_universal(html_text, url)
-                    if files:
-                        logger.info(
-                            "[FRESH_RETRY_HTTP] Found %s files for %s | mode=%s | url=%s",
-                            len(files),
-                            reg_number,
-                            mode,
-                            url,
-                        )
-                        return files
-
-                    logger.info(
-                        "[FRESH_RETRY_HTTP] No files found for %s | mode=%s | url=%s",
-                        reg_number,
-                        mode,
-                        url,
+                    await page.goto(
+                        common_url,
+                        wait_until="domcontentloaded",
+                        timeout=30_000
                     )
-
+                    await page.wait_for_timeout(1_500)
                 except Exception as e:
                     logger.warning(
-                        "[FRESH_RETRY_HTTP] Failed for %s | mode=%s | url=%s | error=%s",
-                        reg_number,
-                        mode,
-                        url,
-                        e,
+                        f"[FRESH_RETRY_PW] common-info load warning: {e}"
                     )
 
-        logger.warning("[FRESH_RETRY_HTTP] No files found for %s after all attempts", reg_number)
-        return []
+                # Шаг 2: Переходим на страницу документов
+                logger.info(
+                    f"[FRESH_RETRY_PW] Step 2/2: GOTO documents: {docs_url}"
+                )
+                await page.goto(
+                    docs_url,
+                    wait_until="domcontentloaded",
+                    timeout=35_000
+                )
+
+                # Ждём появления блока с файлами (до 15 сек)
+                try:
+                    await page.wait_for_selector(
+                        "div.attachment.row, div[class*='attachment'][class*='row'], "
+                        "a[href*='44fz/filestore'], a[href*='priz/file']",
+                        timeout=15_000
+                    )
+                    logger.info(
+                        f"[FRESH_RETRY_PW] Attachment block found for {reg_number}"
+                    )
+                except Exception:
+                    logger.warning(
+                        f"[FRESH_RETRY_PW] Attachment selector not found in 15s. "
+                        f"Parsing whatever is loaded."
+                    )
+
+                # Получаем HTML и парсим новым парсером
+                html_content = await page.content()
+                files = self.parse_fz44_docs_page(html_content, reg_number)
+
+                if files:
+                    logger.info(
+                        f"[FRESH_RETRY_PW] SUCCESS: {len(files)} files "
+                        f"found for {reg_number}"
+                    )
+                else:
+                    # Дополнительная диагностика
+                    page_title = await page.title()
+                    current_url = page.url
+                    logger.warning(
+                        f"[FRESH_RETRY_PW] No files found after Playwright retry. "
+                        f"page_title='{page_title}' | current_url={current_url}"
+                    )
+
+                return files
+
+            except Exception as e:
+                logger.error(
+                    f"[FRESH_RETRY_PW] Exception for {reg_number}: {e}"
+                )
+                return []
+            finally:
+                await browser.close()
+                logger.info(
+                    f"[FRESH_RETRY_PW] Browser closed for {reg_number}"
+                )
 
     def redownload_tender_documents(self, notice: Notice, clear_dir: bool = True) -> Dict[str, Any]:
         tender_dir = os.path.join(DOCUMENTS_ROOT, notice.reg)
@@ -1044,11 +1168,29 @@ class EisService:
 
                             raw_items = self._wait_and_extract_docs_files(page, d_url, n.reg)
                             if not raw_items:
-                                logger.warning(
-                                    "No files found on primary docs page for %s. Trying fresh browser retry.",
-                                    n.reg,
+                                # Пробуем распарсить страницу новым парсером ФЗ-44
+                                logger.info(
+                                    f"[PROCESS] Primary selector found nothing. "
+                                    f"Trying FZ44 parser for {n.reg}..."
                                 )
-                                raw_items = self._download_files_fresh(n.reg, use_proxy_override=proxy_enabled)
+                                try:
+                                    html_content = page.content()
+                                    raw_items = self.parse_fz44_docs_page(html_content, n.reg)
+                                except Exception as parse_err:
+                                    logger.warning(
+                                        f"[PROCESS] FZ44 parser failed for {n.reg}: {parse_err}"
+                                    )
+                                    raw_items = []
+
+                            if not raw_items:
+                                # Если и новый парсер не нашёл — делаем Playwright retry
+                                ntype_val = getattr(n, 'ntype', None) or 'ea20'
+                                logger.warning(
+                                    f"[PROCESS] No files found on primary docs page for "
+                                    f"{n.reg} | ntype={ntype_val}. "
+                                    f"Starting Playwright fresh retry..."
+                                )
+                                raw_items = asyncio.run(self._fresh_retry_playwright(n.reg, ntype_val))
 
                             if not raw_items:
                                 html_text = page.content()
