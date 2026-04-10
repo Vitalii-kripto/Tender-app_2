@@ -35,12 +35,13 @@ export interface Tender {
   region: string;
   law_type?: '44-ФЗ' | '223-ФЗ' | 'Коммерч.';
   url?: string;
-  responsible_id?: string; // ID сотрудника
+  responsible_id?: string;
   docs_url?: string;
   search_url?: string;
   keyword?: string;
   seen?: boolean;
   ntype?: string;
+  selected_for_matching?: boolean;
 }
 
 export interface LegalRisk {
@@ -80,6 +81,34 @@ export interface AnalysisResult {
   recommended_product_id?: string;
   reasoning: string;
   critical_mismatches: string[];
+}
+
+export type MatchingSearchMode = 'catalog' | 'internet' | 'both';
+
+export interface TenderRequirementItem {
+  id: string;
+  tender_id?: string;
+  tender_title?: string;
+  source: 'manual' | 'crm';
+  source_label?: string;
+  position_name: string;
+  quantity?: string;
+  unit?: string;
+  characteristics: string[];
+  notes?: string;
+  search_query: string;
+}
+
+export interface RequirementExtractionWarning {
+  tender_id?: string;
+  filename?: string;
+  status?: string;
+  message: string;
+}
+
+export interface RequirementExtractionResponse {
+  items: TenderRequirementItem[];
+  warnings: RequirementExtractionWarning[];
 }
 
 export interface ComplianceFileStatus {

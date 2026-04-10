@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
+import { logger } from "../services/loggerService";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -267,7 +268,7 @@ export default function AnalysisPage() {
           setSelectedTenderId((prev) => prev ?? list[0].id);
         }
       } catch (error) {
-        console.error("Failed to load tenders:", error);
+        logger.error("Failed to load tenders:", error);
       }
     };
 
@@ -286,7 +287,7 @@ export default function AnalysisPage() {
         const files = Array.isArray(data) ? data : data.files || [];
         setTenderFiles((prev) => ({ ...prev, [selectedTenderId]: files }));
       } catch (error) {
-        console.error("Failed to load files:", error);
+        logger.error("Failed to load files:", error);
         setTenderFiles((prev) => ({ ...prev, [selectedTenderId]: [] }));
       } finally {
         setLoadingFilesId(null);
@@ -321,7 +322,7 @@ export default function AnalysisPage() {
         window.setTimeout(poll, 2000);
       } catch (error) {
         if (isCancelled) return;
-        console.error("Polling error:", error);
+        logger.error("Polling error:", error);
         setPollError(String(error));
         window.setTimeout(poll, 3000);
       }
@@ -432,7 +433,7 @@ export default function AnalysisPage() {
         return { ...prev, [tenderId]: next };
       });
     } catch (error) {
-      console.error("Refresh failed:", error);
+      logger.error("Refresh failed:", error);
       setRefreshErrors((prev) => ({
         ...prev,
         [tenderId]: [{ message: String(error) }],
@@ -511,7 +512,7 @@ export default function AnalysisPage() {
       const data = await response.json();
       setCurrentJobId(data.job_id);
     } catch (error) {
-      console.error("Analyze error:", error);
+      logger.error("Analyze error:", error);
       alert(`Ошибка запуска анализа: ${String(error)}`);
     } finally {
       setLaunchingAnalysis(false);
@@ -556,7 +557,7 @@ export default function AnalysisPage() {
       link.remove();
       window.URL.revokeObjectURL(blobUrl);
     } catch (error) {
-      console.error("Export error:", error);
+      logger.error("Export error:", error);
       alert(`Ошибка экспорта отчёта: ${String(error)}`);
     } finally {
       setExportingReport(false);

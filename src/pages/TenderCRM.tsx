@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { logger } from "../services/loggerService";
 import { Calendar, DollarSign, AlertCircle, ArrowRight, ArrowLeft, Trash2, Plus, Info, Link, FileUp, X, Check, Loader2, UserPlus, User, Server, HardDrive, Globe, FileText, Sparkles } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Tender, TenderStatus, Employee } from '../types';
@@ -51,7 +52,7 @@ const TenderCRM = () => {
         setTenders(data);
         setEmployees(emps);
     } catch (e) {
-        console.error("Failed to load CRM data", e);
+        logger.error("Failed to load CRM data", e);
     } finally {
         setLoading(false);
     }
@@ -95,7 +96,7 @@ const TenderCRM = () => {
               alert('Закупка не найдена в поиске. Попробуйте ввести данные вручную.');
           }
       } catch (e) {
-          console.error(e);
+          logger.error(e);
           alert('Ошибка при обращении к серверу.');
       } finally {
           setIsAnalyzing(false);
@@ -132,7 +133,7 @@ const TenderCRM = () => {
           });
 
       } catch (err) {
-          console.error(err);
+          logger.error(err as string);
           alert('Ошибка обработки файла. Попробуйте другой формат или введите вручную.');
       } finally {
           setIsAnalyzing(false);
@@ -189,6 +190,16 @@ const TenderCRM = () => {
       await addOrUpdateTender(updated);
   };
 
+  const toggleMatchingSelection = async (tender: Tender) => {
+      const updated = {
+          ...tender,
+          selected_for_matching: !tender.selected_for_matching
+      };
+
+      setTenders(prev => prev.map(t => t.id === tender.id ? updated : t));
+      await addOrUpdateTender(updated);
+  };
+
   const deleteTender = async (id: string) => {
     if (confirm('Удалить тендер из CRM навсегда?')) {
         setTenders(prev => prev.filter(t => t.id !== id));
@@ -224,15 +235,22 @@ const TenderCRM = () => {
                 onClick={() => setShowAddModal(true)}
                 className="px-4 py-2 bg-white text-blue-600 border border-blue-200 rounded-lg text-sm font-medium hover:bg-blue-50 flex items-center gap-2"
             >
-            <Plus size={18} />
-            Добавить тендер
+                <Plus size={18} />
+                Добавить тендер
             </button>
             <button 
                 onClick={() => navigate('/tenders')}
                 className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 flex items-center gap-2"
             >
-            <Plus size={18} />
-            Из Поиска
+                <Plus size={18} />
+                Из Поиска
+            </button>
+            <button
+                onClick={() => navigate('/matching')}
+                className="px-4 py-2 bg-emerald-600 text-white rounded-lg text-sm font-medium hover:bg-emerald-700 flex items-center gap-2"
+            >
+                <Sparkles size={18} />
+                Подбор аналогов
             </button>
         </div>
       </div>
@@ -279,35 +297,50 @@ const TenderCRM = () => {
 
                         {/* Responsible Person Selector */}
                         <div className="flex items-center justify-between pt-2 border-t border-slate-50 mt-2">
-                            <div className="relative group/assign">
-                                <div className={`flex items-center gap-1.5 px-2 py-1 rounded cursor-pointer ${tender.responsible_id ? 'bg-blue-50 text-blue-700' : 'bg-slate-100 text-slate-400 hover:bg-slate-200'}`}>
-                                    <User size={12} />
-                                    <span className="text-[10px] font-bold max-w-[80px] truncate">
-                                        {getResponsibleName(tender.responsible_id) || 'Назначить'}
-                                    </span>
-                                </div>
-                                
-                                {/* Dropdown on Hover */}
-                                <div className="hidden group-hover/assign:block absolute bottom-full left-0 mb-1 w-40 bg-white border border-slate-200 shadow-xl rounded-lg py-1 z-20">
-                                    <div className="text-[10px] text-slate-400 px-2 py-1 font-bold uppercase">Назначить:</div>
-                                    {employees.map(emp => (
-                                        <button 
-                                            key={emp.id}
-                                            onClick={() => assignEmployee(tender.id, emp.id)}
-                                            className="w-full text-left px-2 py-1.5 text-xs hover:bg-blue-50 text-slate-700 flex items-center gap-2"
+                            <div className="flex items-center gap-2">
+                                <label className={`flex items-center gap-2 px-2 py-1 rounded cursor-pointer border text-[10px] font-bold ${
+                                    tender.selected_for_matching
+                                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                        : 'bg-slate-50 text-slate-500 border-slate-200 hover:bg-slate-100'
+                                }`}>
+                                    <input
+                                        type="checkbox"
+                                        checked={!!tender.selected_for_matching}
+                                        onChange={() => toggleMatchingSelection(tender)}
+                                        className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                    />
+                                    В подбор аналогов
+                                </label>
+
+                                <div className="relative group/assign">
+                                    <div className={`flex items-center gap-1.5 px-2 py-1 rounded cursor-pointer ${tender.responsible_id ? 'bg-blue-50 text-blue-700' : 'bg-slate-100 text-slate-400 hover:bg-slate-200'}`}>
+                                        <User size={12} />
+                                        <span className="text-[10px] font-bold max-w-[80px] truncate">
+                                            {getResponsibleName(tender.responsible_id) || 'Назначить'}
+                                        </span>
+                                    </div>
+
+                                    <div className="hidden group-hover/assign:block absolute bottom-full left-0 mb-1 w-40 bg-white border border-slate-200 shadow-xl rounded-lg py-1 z-20">
+                                        <div className="text-[10px] text-slate-400 px-2 py-1 font-bold uppercase">Назначить:</div>
+                                        {employees.map(emp => (
+                                            <button
+                                                key={emp.id}
+                                                onClick={() => assignEmployee(tender.id, emp.id)}
+                                                className="w-full text-left px-2 py-1.5 text-xs hover:bg-blue-50 text-slate-700 flex items-center gap-2"
+                                            >
+                                                <div className="w-4 h-4 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center text-[8px] font-bold">
+                                                    {emp.name.substring(0,1)}
+                                                </div>
+                                                {emp.name}
+                                            </button>
+                                        ))}
+                                        <button
+                                            onClick={() => assignEmployee(tender.id, '')}
+                                            className="w-full text-left px-2 py-1.5 text-xs hover:bg-red-50 text-red-600 border-t border-slate-100"
                                         >
-                                            <div className="w-4 h-4 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center text-[8px] font-bold">
-                                                {emp.name.substring(0,1)}
-                                            </div>
-                                            {emp.name}
+                                            Снять задачу
                                         </button>
-                                    ))}
-                                    <button 
-                                        onClick={() => assignEmployee(tender.id, '')}
-                                        className="w-full text-left px-2 py-1.5 text-xs hover:bg-red-50 text-red-600 border-t border-slate-100"
-                                    >
-                                        Снять задачу
-                                    </button>
+                                    </div>
                                 </div>
                             </div>
 

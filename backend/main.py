@@ -204,6 +204,7 @@ def tender_model_to_payload(tender: TenderModel) -> Dict[str, Any]:
         "search_url": tender.search_url or "",
         "keyword": tender.keyword or "",
         "ntype": tender.ntype or "",
+        "selected_for_matching": bool(tender.selected_for_matching),
     }
 
 
@@ -249,6 +250,7 @@ def save_or_update_tender_record(
         explicit=tender_payload.get("law_type"),
     )
     parsed_price = parse_price_to_float(tender_payload.get("initial_price", 0))
+    selected_for_matching = bool(tender_payload.get("selected_for_matching", False))
 
     existing = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
 
@@ -268,6 +270,7 @@ def save_or_update_tender_record(
         existing.search_url = str(tender_payload.get("search_url") or "")
         existing.keyword = str(tender_payload.get("keyword") or "")
         existing.ntype = str(tender_payload.get("ntype") or "")
+        existing.selected_for_matching = selected_for_matching
 
         db.flush()
 
@@ -295,6 +298,7 @@ def save_or_update_tender_record(
             search_url=str(tender_payload.get("search_url") or ""),
             keyword=str(tender_payload.get("keyword") or ""),
             ntype=str(tender_payload.get("ntype") or ""),
+            selected_for_matching=selected_for_matching,
         )
         db.add(model)
         db.flush()
@@ -339,6 +343,7 @@ def migrate_db():
         ("ntype", "tenders", "TEXT"),
         ("local_file_path", "tenders", "TEXT"),
         ("extracted_text", "tenders", "TEXT"),
+        ("selected_for_matching", "tenders", "BOOLEAN DEFAULT 0"),
         ("created_at", "tenders", "DATETIME"),
         ("description", "products", "TEXT"),
         ("updated_at", "products", "DATETIME"),
@@ -379,6 +384,7 @@ parser_service = None
 doc_service = None
 ai_service = None
 legal_analysis_service = None
+analog_service = None
 
 logger.info("Initializing Services...")
 
@@ -389,20 +395,6 @@ except Exception as e:
     logger.error(f"[FAILED] EisService initialization error: {e}")
 
 try:
-    parser_service = GidroizolParser()
-    logger.info("[OK] GidroizolParser initialized.")
-    
-    # Инициализация сервиса подбора аналогов
-    from backend.services.analog_service import AnalogService
-    analog_service = AnalogService(
-        ai_service=ai_service,
-        db_session_factory=lambda: next(get_db())
-    )
-    logger.info("[OK] AnalogService initialized.")
-except Exception as e:
-    logger.error(f"[FAILED] GidroizolParser initialization error: {e}")
-
-try:
     doc_service = DocumentService()
     logger.info("[OK] DocumentService initialized.")
 except Exception as e:
@@ -410,21 +402,36 @@ except Exception as e:
 
 try:
     ai_service = AiService()
-    # Выполняем тестовый запрос к ИИ при старте
     active_model = ai_service.test_model_availability()
     if not active_model:
         logger.critical("[WARNING] AI Service is UNAVAILABLE. Backend will start in degraded mode.")
     else:
         logger.info(f"[OK] AI Service is READY. Working model: {active_model}")
-        
+
     try:
         legal_analysis_service = LegalAnalysisService(ai_service)
         logger.info("[OK] LegalAnalysisService initialized.")
     except Exception as e:
         logger.error(f"[FAILED] LegalAnalysisService initialization error: {e}")
-        
+
 except Exception as e:
     logger.error(f"[FAILED] AiService initialization error: {e}")
+
+try:
+    parser_service = GidroizolParser()
+    logger.info("[OK] GidroizolParser initialized.")
+except Exception as e:
+    logger.error(f"[FAILED] GidroizolParser initialization error: {e}")
+
+try:
+    from backend.services.analog_service import AnalogService
+    analog_service = AnalogService(
+        ai_service=ai_service,
+        db_session_factory=lambda: next(get_db())
+    )
+    logger.info("[OK] AnalogService initialized.")
+except Exception as e:
+    logger.error(f"[FAILED] AnalogService initialization error: {e}")
 
 logger.info("Service initialization phase completed.")
 
@@ -462,6 +469,10 @@ def check_ai_service():
 def check_legal_service():
     if not legal_analysis_service:
         raise HTTPException(status_code=503, detail="Legal Analysis Service is not initialized.")
+
+def check_analog_service():
+    if not analog_service:
+        raise HTTPException(status_code=503, detail="Analog Service is not initialized.")
 
 # --- ENDPOINTS ---
 
@@ -719,6 +730,65 @@ async def parse_catalog_endpoint(db: Session = Depends(get_db), _ = Depends(chec
         })
     return result
 
+def collect_tender_text_for_matching(tender: TenderModel) -> Dict[str, Any]:
+    """
+    Собирает текст ТЗ для подбора аналогов.
+    Приоритет:
+    1. extracted_text из БД
+    2. тексты файлов из папки тендера
+    3. description из CRM, если документов нет
+    """
+    chunks: List[str] = []
+    warnings: List[Dict[str, Any]] = []
+    files_used: List[str] = []
+
+    if tender.extracted_text and tender.extracted_text.strip():
+        chunks.append(f"[EXTRACTED_TEXT_FROM_DB]\\n{tender.extracted_text.strip()}")
+
+    tender_dir = os.path.join(DOCUMENTS_ROOT, tender.id)
+    if os.path.isdir(tender_dir) and doc_service:
+        for filename in sorted(os.listdir(tender_dir)):
+            file_path = os.path.join(tender_dir, filename)
+            if not os.path.isfile(file_path):
+                continue
+
+            try:
+                data = doc_service.extract_document_data(file_path)
+            except Exception as e:
+                warnings.append({
+                    "filename": filename,
+                    "status": "extract_error",
+                    "message": str(e),
+                })
+                continue
+
+            status = data.get("status", "")
+            extracted_text = (data.get("extracted_text") or "").strip()
+
+            if status == "success" and extracted_text:
+                chunks.append(f"[FILE: {filename}]\\n{extracted_text[:50000]}")
+                files_used.append(filename)
+            else:
+                warnings.append({
+                    "filename": filename,
+                    "status": status,
+                    "message": data.get("error_message") or "Текст не извлечен",
+                })
+
+    if not chunks and (tender.description or "").strip():
+        chunks.append(f"[CRM_DESCRIPTION]\\n{tender.description.strip()}")
+        warnings.append({
+            "filename": "CRM_DESCRIPTION",
+            "status": "warning",
+            "message": "Документы тендера не найдены или не прочитаны. Использовано описание из CRM.",
+        })
+
+    return {
+        "text": "\\n\\n".join(chunks),
+        "warnings": warnings,
+        "files_used": files_used,
+    }
+
 # --- AI & DOCS ENDPOINTS ---
 
 @app.get("/api/tenders/{tender_id}/files")
@@ -846,6 +916,95 @@ async def api_extract_products(data: dict = Body(...), _ = Depends(check_ai_serv
     logger.info("AI Extract Products request.")
     text = data.get('text', '')
     return ai_service.extract_products_from_text(text)
+
+@app.post("/api/ai/extract-tender-requirements")
+async def api_extract_tender_requirements(
+    data: dict = Body(...),
+    db: Session = Depends(get_db),
+    _ = Depends(check_ai_service)
+):
+    """
+    Извлечение позиций ТЗ:
+    - либо из ручного текста,
+    - либо из выбранных тендеров CRM.
+    """
+    manual_text = (data.get("manual_text") or "").strip()
+    tender_ids = data.get("tender_ids") or []
+
+    items: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+
+    if manual_text:
+        extracted = ai_service.extract_tender_requirement_positions(manual_text)
+        for index, item in enumerate(extracted, start=1):
+            position_name = str(item.get("position_name") or "").strip()
+            if not position_name:
+                continue
+
+            items.append({
+                "id": f"manual-{index}",
+                "source": "manual",
+                "source_label": "Ручной ввод",
+                "position_name": position_name,
+                "quantity": str(item.get("quantity") or "").strip(),
+                "unit": str(item.get("unit") or "").strip(),
+                "characteristics": item.get("characteristics") or [],
+                "notes": str(item.get("notes") or "").strip(),
+                "search_query": str(item.get("search_query") or position_name).strip(),
+            })
+
+    for tender_id in tender_ids:
+        tender = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
+        if not tender:
+            warnings.append({
+                "tender_id": tender_id,
+                "status": "not_found",
+                "message": "Тендер не найден в CRM",
+            })
+            continue
+
+        source_data = collect_tender_text_for_matching(tender)
+        source_text = (source_data.get("text") or "").strip()
+
+        if not source_text:
+            warnings.append({
+                "tender_id": tender.id,
+                "status": "empty_source",
+                "message": "Для тендера нет текста ТЗ и нет пригодного описания",
+            })
+            continue
+
+        extracted = ai_service.extract_tender_requirement_positions(source_text)
+
+        for index, item in enumerate(extracted, start=1):
+            position_name = str(item.get("position_name") or "").strip()
+            if not position_name:
+                continue
+
+            items.append({
+                "id": f"{tender.id}-{index}",
+                "tender_id": tender.id,
+                "tender_title": tender.title or "",
+                "source": "crm",
+                "source_label": f"{tender.id} — {tender.title or ''}".strip(),
+                "position_name": position_name,
+                "quantity": str(item.get("quantity") or "").strip(),
+                "unit": str(item.get("unit") or "").strip(),
+                "characteristics": item.get("characteristics") or [],
+                "notes": str(item.get("notes") or "").strip(),
+                "search_query": str(item.get("search_query") or position_name).strip(),
+            })
+
+        for warning in source_data.get("warnings") or []:
+            warnings.append({
+                "tender_id": tender.id,
+                **warning,
+            })
+
+    return {
+        "items": items,
+        "warnings": warnings,
+    }
 
 @app.post("/api/ai/enrich-specs")
 async def api_enrich_specs(data: dict = Body(...), _ = Depends(check_ai_service)):
@@ -1055,75 +1214,62 @@ async def api_export_risks_word(data: dict = Body(...)):
 # ENDPOINTS: ПОДБОР АНАЛОГОВ
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/products")
-async def get_all_products(
-    limit: int = 50,
-    category: str = None,
-    db: Session = Depends(get_db)
-):
-    """Возвращает список всех товаров из локальной БД."""
-    from sqlalchemy import text
-    import json as json_lib
-    try:
-        params = {"lim": limit}
-        where = ""
-        if category:
-            where = "WHERE LOWER(category) = :cat"
-            params["cat"] = category.lower()
-        rows = db.execute(
-            text(f"SELECT * FROM products {where} ORDER BY id DESC LIMIT :lim"),
-            params
-        ).fetchall()
-        result = []
-        for row in rows:
-            specs = {}
-            if row.specs:
-                try:
-                    specs = json_lib.loads(row.specs) if isinstance(row.specs, str) else row.specs
-                except Exception:
-                    specs = {}
-            result.append({
-                "id": row.id,
-                "title": row.title,
-                "category": row.category,
-                "material_type": row.material_type,
-                "price": row.price,
-                "specs": specs,
-                "url": row.url,
-                "description": row.description,
-            })
-        return {"products": result, "total": len(result)}
-    except Exception as e:
-        logger.error(f"get_all_products error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/api/products/search")
 async def search_products_local(
     request: dict,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _ = Depends(check_analog_service)
 ):
-    """Поиск аналогов в локальной БД."""
-    query = request.get("query", "")
+    """
+    Поиск аналогов только в локальной БД.
+    """
+    query = (request.get("query") or "").strip()
     category = request.get("category")
-    limit = request.get("limit", 10)
+    limit = int(request.get("limit", 10))
+
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
 
     results = analog_service.search_local_db(query, category=category, limit=limit)
-    return {"query": query, "results": results, "total": len(results)}
-
+    return {
+        "query": query,
+        "results": results,
+        "total": len(results),
+    }
 
 @app.post("/api/products/search-ai")
-async def search_products_ai(request: dict):
-    """Поиск аналогов через Gemini AI с Google Search."""
-    query = request.get("query", "")
+async def search_products_ai(
+    request: dict,
+    _ = Depends(check_analog_service)
+):
+    """
+    Поиск аналогов:
+    - mode='internet'  -> только интернет
+    - mode='both'      -> локальная БД + интернет
+    """
+    query = (request.get("query") or "").strip()
     requirements = request.get("requirements")
-    max_results = request.get("max_results", 5)
+    max_results = int(request.get("max_results", 5))
+    mode = (request.get("mode") or "both").strip().lower()
+
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
 
-    logger.info(f"AI analog search: '{query}'")
+    logger.info(f"AI analog search: '{query}' | mode={mode}")
+
+    if mode == "internet":
+        ai_results = await analog_service.search_ai(
+            query=query,
+            requirements=requirements,
+            max_results=max_results
+        )
+        return {
+            "query": query,
+            "local_results": [],
+            "ai_results": ai_results,
+            "total": len(ai_results),
+        }
+
     result = await analog_service.search_analogs(
         query=query,
         requirements=requirements,
@@ -1131,7 +1277,6 @@ async def search_products_ai(request: dict):
         limit=max_results
     )
     return result
-
 
 @app.post("/api/products/refresh-catalog")
 async def refresh_catalog(background_tasks: BackgroundTasks):

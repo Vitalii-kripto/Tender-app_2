@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { logger } from "../services/loggerService";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import { TrendingUp, AlertTriangle, FileCheck, DollarSign, RefreshCw, ServerOff, Wifi } from 'lucide-react';
 import { fetchDashboardStats } from '../services/geminiService';
@@ -32,7 +33,7 @@ const Dashboard = () => {
         const data = await fetchDashboardStats();
         setStats(data);
     } catch (e) {
-        console.error(e);
+        logger.error(e);
     } finally {
         setLoading(false);
     }

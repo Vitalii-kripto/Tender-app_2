@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { logger } from "../services/loggerService";
 import { Calendar as CalendarIcon, Clock, AlertCircle, CheckCircle, ChevronLeft, ChevronRight, Bell } from 'lucide-react';
 import { Tender } from '../types';
 import { getTendersFromBackend } from '../services/geminiService';
@@ -14,7 +15,7 @@ const Calendar = () => {
         const data = await getTendersFromBackend();
         setTenders(data);
       } catch (error) {
-        console.error("Failed to load tenders for calendar", error);
+        logger.error("Failed to load tenders for calendar", error);
       } finally {
         setLoading(false);
       }

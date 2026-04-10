@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { logger } from "../services/loggerService";
 import { Package, MapPin, Tag, Download, Play, Loader2, ServerOff, Globe, Layers, ChevronDown, ChevronRight, FileText } from 'lucide-react';
 import { Product } from '../types';
 import { getProductsFromBackend, runBackendParser } from '../services/geminiService';
@@ -44,7 +45,7 @@ const ProductCatalog = () => {
         updateGlobalMock(data);
         setStatusMsg(`Всего товаров: ${data.length}`);
     } catch (e) {
-        console.error(e);
+        logger.error(e);
         setStatusMsg("Ошибка загрузки");
     }
   };
@@ -64,7 +65,7 @@ const ProductCatalog = () => {
         updateGlobalMock(data);
         setStatusMsg(`Парсинг завершен. Найдено: ${data.length} шт.`);
     } catch (err) {
-        console.error(err);
+        logger.error(err);
         setStatusMsg("Ошибка парсинга");
     } finally {
         setIsParsing(false);

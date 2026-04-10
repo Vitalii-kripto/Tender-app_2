@@ -74,6 +74,7 @@ def _configure_root_logger() -> None:
         "LegalAI",
         "Frontend",
         "EIS_Service",
+        "GidroizolParser",
         "uvicorn",
         "uvicorn.error",
         "uvicorn.access",

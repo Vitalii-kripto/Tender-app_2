@@ -1,4 +1,17 @@
-import { Product, AnalysisResult, Tender, DashboardStats, ComplianceResult, Employee, CompanyProfile, LegalAnalysisResult } from "../types";
+import {
+  Product,
+  AnalysisResult,
+  Tender,
+  DashboardStats,
+  ComplianceResult,
+  Employee,
+  CompanyProfile,
+  LegalAnalysisResult,
+  TenderRequirementItem,
+  RequirementExtractionResponse,
+  MatchingSearchMode
+} from "../types";
+import { logger } from "./loggerService";
 
 // =========================================================================================
 // КОНФИГУРАЦИЯ
@@ -35,7 +48,7 @@ export const getEmployees = (): Employee[] => {
         const stored = localStorage.getItem(LOCAL_STORAGE_KEY_EMPLOYEES);
         if (stored) return JSON.parse(stored);
     } catch (e) {
-        console.error("Error reading employees", e);
+        logger.error("Error reading employees", e);
     }
     const defaults: Employee[] = [
         { id: 'emp_1', name: 'Алексей Иванов', role: 'admin', email: 'alex@company.ru' },
@@ -64,7 +77,7 @@ export const getCompanyProfile = (): CompanyProfile => {
     try {
         const stored = localStorage.getItem(LOCAL_STORAGE_KEY_COMPANY);
         if (stored) return JSON.parse(stored);
-    } catch (e) { console.error(e); }
+    } catch (e) { logger.error(e); }
     
     const defaults: CompanyProfile = {
         name: 'ООО "ГидроСтройКомплект"',
@@ -90,7 +103,7 @@ const getLocalProducts = (): Product[] => {
         const stored = localStorage.getItem(LOCAL_STORAGE_KEY_PRODUCTS);
         if (stored) return JSON.parse(stored);
     } catch (e) {
-        console.error("Error reading local products", e);
+        logger.error("Error reading local products", e);
     }
     return [
         {
@@ -116,7 +129,7 @@ const getLocalTenders = (): Tender[] => {
         const stored = localStorage.getItem(LOCAL_STORAGE_KEY_CRM);
         if (stored) return JSON.parse(stored);
     } catch (e) {
-        console.error("Error reading local storage", e);
+        logger.error("Error reading local storage", e);
     }
     
     const defaults: Tender[] = [
@@ -240,6 +253,120 @@ export const getProductsFromBackend = async (): Promise<Product[]> => {
     }
 };
 
+export const getSelectedTendersForMatching = async (): Promise<Tender[]> => {
+    const tenders = await getTendersFromBackend();
+    return tenders.filter(t => !!t.selected_for_matching);
+};
+
+export const extractTenderRequirementsFromText = async (
+    text: string
+): Promise<RequirementExtractionResponse> => {
+    if (!text.trim()) {
+        return { items: [], warnings: [] };
+    }
+
+    const response = await fetch(`${API_BASE_URL}/api/ai/extract-tender-requirements`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ manual_text: text })
+    });
+
+    const data = await response.json().catch(() => ({ items: [], warnings: [] }));
+
+    if (!response.ok) {
+        throw new Error(data.detail || 'Не удалось обработать ручное ТЗ');
+    }
+
+    return {
+        items: data.items || [],
+        warnings: data.warnings || []
+    };
+};
+
+export const extractTenderRequirementsFromCrm = async (
+    tenderIds: string[]
+): Promise<RequirementExtractionResponse> => {
+    if (!tenderIds.length) {
+        return { items: [], warnings: [] };
+    }
+
+    const response = await fetch(`${API_BASE_URL}/api/ai/extract-tender-requirements`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tender_ids: tenderIds })
+    });
+
+    const data = await response.json().catch(() => ({ items: [], warnings: [] }));
+
+    if (!response.ok) {
+        throw new Error(data.detail || 'Не удалось извлечь ТЗ из CRM');
+    }
+
+    return {
+        items: data.items || [],
+        warnings: data.warnings || []
+    };
+};
+
+export const searchRequirementAnalogs = async (
+    query: string,
+    requirements: string,
+    mode: MatchingSearchMode
+): Promise<{
+    query: string;
+    local_results: Product[];
+    ai_results: Product[];
+    total: number;
+}> => {
+    if (mode === 'catalog') {
+        const response = await fetch(`${API_BASE_URL}/api/products/search`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                query,
+                limit: 10
+            })
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            throw new Error(data.detail || 'Ошибка поиска в каталоге');
+        }
+
+        return {
+            query,
+            local_results: data.results || [],
+            ai_results: [],
+            total: data.total || 0
+        };
+    }
+
+    const response = await fetch(`${API_BASE_URL}/api/products/search-ai`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            query,
+            requirements,
+            max_results: 5,
+            mode
+        })
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+        throw new Error(data.detail || 'Ошибка AI-поиска аналогов');
+    }
+
+    return {
+        query: data.query || query,
+        local_results: data.local_results || [],
+        ai_results: data.ai_results || [],
+        total: data.total || 0
+    };
+};
+
 export const runBackendParser = async (): Promise<Product[]> => {
     const demoData: Product[] = [
         {
@@ -299,7 +426,7 @@ export const cancelSearch = async (): Promise<void> => {
     try {
         await fetch(`${API_BASE_URL}/api/search-tenders/cancel`, { method: 'POST' });
     } catch (error) {
-        console.error("Failed to cancel search", error);
+        logger.error("Failed to cancel search", error);
     }
 };
 
@@ -327,7 +454,7 @@ export const processSelectedTenders = async (
 
         return data;
     } catch (error: any) {
-        console.error('processSelectedTenders failed:', error);
+        logger.error('processSelectedTenders failed:', error);
         throw error;
     }
 };
@@ -351,7 +478,7 @@ export const requeueTenderDocs = async (tenderId: string): Promise<{ status: str
 
         return data;
     } catch (error: any) {
-        console.error('requeueTenderDocs failed:', error);
+        logger.error('requeueTenderDocs failed:', error);
         throw error;
     }
 };
@@ -420,7 +547,7 @@ export const searchTenders = async (
             console.log('Search aborted');
             return [];
         }
-        console.error('Search error:', error);
+        logger.error('Search error:', error);
         throw error;
     }
 };
@@ -434,7 +561,7 @@ export const skipTender = async (tender: Tender): Promise<void> => {
             body: JSON.stringify(tender)
         });
     } catch (error) {
-        console.error("Error skipping tender", error);
+        logger.error("Error skipping tender", error);
     }
 };
 
@@ -450,7 +577,7 @@ export const refreshTenderFiles = async (tenderId: string): Promise<{ status: st
         if (!response.ok) throw new Error("Backend error");
         return await response.json();
     } catch (e) {
-        console.error("Error refreshing tender files:", e);
+        logger.error("Error refreshing tender files:", e);
         throw e;
     }
 };
@@ -486,7 +613,7 @@ export const startBatchAnalysisJob = async (tenderIds: string[], selectedFiles?:
         const data = await response.json();
         return data.job_id;
     } catch (e) {
-        console.error("Error starting batch analysis job:", e);
+        logger.error("Error starting batch analysis job:", e);
         throw e;
     }
 };
@@ -497,7 +624,7 @@ export const getJobStatus = async (jobId: string): Promise<any> => {
         if(!response.ok) throw new Error("Backend error");
         return await response.json();
     } catch (e) {
-        console.error("Error getting job status:", e);
+        logger.error("Error getting job status:", e);
         throw e;
     }
 };
@@ -527,7 +654,7 @@ export const analyzeTendersBatch = async (tenderIds: string[], selectedFiles?: R
             }, 3000);
         });
     } catch (e) {
-        console.error("Error analyzing tenders batch:", e);
+        logger.error("Error analyzing tenders batch:", e);
         return tenderIds.map(id => ({
             id,
             status: "error",
@@ -792,7 +919,7 @@ export const uploadTenderFile = async (file: File): Promise<{text: string, path:
         if(!res.ok) throw new Error("Upload failed");
         return await res.json();
     } catch(e) {
-        console.error(e);
+        logger.error(e as string);
         return { text: "Ошибка загрузки или распознавания файла. Введите данные вручную.", path: "" };
     }
 };
@@ -817,8 +944,8 @@ export const extractDetailsFromText = async (text: string): Promise<any> => {
         if(!res.ok) throw new Error("AI Extraction failed");
         return await res.json();
     } catch(e) {
-        console.error(e);
-        return {};
+        logger.error(e as string);
+        return { text: "Ошибка загрузки или распознавания файла. Введите данные вручную.", path: "" };
     }
 };
 
@@ -850,7 +977,7 @@ export const addOrUpdateTender = async (tender: Tender) => {
                 body: JSON.stringify(tender)
             });
         } catch(e) {
-            console.warn("Backend sync failed");
+            logger.warn("Backend sync failed");
         }
     }
 };
@@ -863,7 +990,7 @@ export const deleteTenderFromBackend = async (id: string) => {
                 method: 'DELETE'
             });
         } catch(e) {
-            console.warn("Backend sync failed");
+            logger.warn("Backend sync failed");
         }
     }
 };

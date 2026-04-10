@@ -1,10 +1,21 @@
 import { useState, useEffect, useCallback } from "react";
+import { logger } from "../services/loggerService";
 import {
   Search, Sparkles, Database, RefreshCw, Plus, Trash2,
   ExternalLink, ChevronDown, ChevronUp, CheckCircle,
   AlertCircle, Loader2, Package, X, Filter, Star,
-  ArrowRight, BookOpen, Globe
+  ArrowRight, BookOpen, Globe, FileText, ListChecks, Briefcase
 } from "lucide-react";
+import {
+  TenderRequirementItem,
+  RequirementExtractionWarning,
+  Tender
+} from "../types";
+import {
+  getSelectedTendersForMatching,
+  extractTenderRequirementsFromText,
+  extractTenderRequirementsFromCrm
+} from "../services/geminiService";
 
 // ── Типы ─────────────────────────────────────────────────────────────────────
 interface ProductSpec {
@@ -306,8 +317,15 @@ export default function ProductMatching() {
   const [isLoadingAll, setIsLoadingAll]       = useState(false);
   const [isRefreshing, setIsRefreshing]       = useState(false);
   const [showAddForm, setShowAddForm]         = useState(false);
-  const [activeTab, setActiveTab]             = useState<"search"|"catalog"|"selected">("search");
+  const [activeTab, setActiveTab]             = useState<"search"|"extraction"|"catalog"|"selected">("search");
   const [error, setError]                     = useState<string | null>(null);
+
+  // Состояние для извлечения ТЗ
+  const [manualText, setManualText] = useState("");
+  const [extractedItems, setExtractedItems] = useState<TenderRequirementItem[]>([]);
+  const [extractionWarnings, setExtractionWarnings] = useState<RequirementExtractionWarning[]>([]);
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [selectedTendersForExtraction, setSelectedTendersForExtraction] = useState<Tender[]>([]);
 
   // Загрузка всего каталога
   const loadAllProducts = useCallback(async () => {
@@ -428,6 +446,66 @@ export default function ProductMatching() {
     (searchResult?.local_results?.length || 0) +
     (searchResult?.ai_results?.length || 0);
 
+  // Загрузка тендеров для извлечения
+  const loadTendersForExtraction = useCallback(async () => {
+    try {
+      const tenders = await getSelectedTendersForMatching();
+      setSelectedTendersForExtraction(tenders);
+    } catch (err) {
+      logger.error("Failed to load tenders for matching", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === "extraction") {
+      loadTendersForExtraction();
+    }
+  }, [activeTab, loadTendersForExtraction]);
+
+  const handleExtractFromText = async () => {
+    if (!manualText.trim()) return;
+    setIsExtracting(true);
+    setError(null);
+    try {
+      const res = await extractTenderRequirementsFromText(manualText);
+      setExtractedItems(prev => [...prev, ...res.items]);
+      if (res.warnings.length > 0) {
+        setExtractionWarnings(prev => [...prev, ...res.warnings]);
+      }
+      setManualText("");
+    } catch (err: any) {
+      setError(err.message || "Ошибка извлечения");
+    } finally {
+      setIsExtracting(false);
+    }
+  };
+
+  const handleExtractFromCrm = async () => {
+    if (selectedTendersForExtraction.length === 0) return;
+    setIsExtracting(true);
+    setError(null);
+    try {
+      const ids = selectedTendersForExtraction.map(t => t.id);
+      const res = await extractTenderRequirementsFromCrm(ids);
+      setExtractedItems(prev => [...prev, ...res.items]);
+      if (res.warnings.length > 0) {
+        setExtractionWarnings(prev => [...prev, ...res.warnings]);
+      }
+    } catch (err: any) {
+      setError(err.message || "Ошибка извлечения из CRM");
+    } finally {
+      setIsExtracting(false);
+    }
+  };
+
+  const handleSearchForItem = (item: TenderRequirementItem) => {
+    setSearchQuery(item.search_query);
+    setRequirements(item.characteristics.join("\n") + (item.notes ? `\nДоп: ${item.notes}` : ""));
+    setShowRequirements(true);
+    setActiveTab("search");
+    // setTimeout(() => handleSearch(), 100); // Auto-search? Let user review first.
+  };
+
   return (
     <div className="flex flex-col h-full bg-gray-50">
 
@@ -496,6 +574,7 @@ export default function ProductMatching() {
         <div className="flex px-6">
           {([
             { key: "search",   label: "Поиск аналогов",  icon: Search },
+            { key: "extraction", label: "Извлечение ТЗ", icon: FileText },
             { key: "catalog",  label: `Каталог (${allProducts.length})`, icon: BookOpen },
             { key: "selected", label: `КП (${selectedProducts.length})`, icon: CheckCircle },
           ] as const).map(tab => (
@@ -696,6 +775,133 @@ export default function ProductMatching() {
                 <p className="text-sm mt-1 text-center max-w-sm">
                   Система найдёт аналоги в каталоге gidroizol.ru и в интернете через ИИ
                 </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── ВКЛАДКА ИЗВЛЕЧЕНИЕ ТЗ ────────────────────────────────────── */}
+        {activeTab === "extraction" && (
+          <div className="max-w-5xl mx-auto space-y-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              
+              {/* Извлечение из CRM */}
+              <div className="bg-white rounded-xl border border-gray-200 p-5">
+                <h3 className="text-sm font-semibold text-gray-800 mb-2 flex items-center gap-2">
+                  <Briefcase className="w-4 h-4 text-blue-600" />
+                  Извлечение из тендеров CRM
+                </h3>
+                <p className="text-xs text-gray-500 mb-4">
+                  Выберите тендеры в CRM (поставив галочку "В подбор аналогов"), чтобы извлечь из них требования.
+                </p>
+                
+                <div className="space-y-2 mb-4 max-h-40 overflow-y-auto">
+                  {selectedTendersForExtraction.length === 0 ? (
+                    <div className="text-xs text-gray-400 italic">Нет выбранных тендеров</div>
+                  ) : (
+                    selectedTendersForExtraction.map(t => (
+                      <div key={t.id} className="text-xs p-2 bg-gray-50 rounded border border-gray-100 flex items-center gap-2">
+                        <CheckCircle className="w-3 h-3 text-emerald-500" />
+                        <span className="truncate">{t.eis_number} - {t.title}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                <button
+                  onClick={handleExtractFromCrm}
+                  disabled={isExtracting || selectedTendersForExtraction.length === 0}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {isExtracting ? <Loader2 className="w-4 h-4 animate-spin" /> : <ListChecks className="w-4 h-4" />}
+                  Извлечь из CRM
+                </button>
+              </div>
+
+              {/* Извлечение из текста */}
+              <div className="bg-white rounded-xl border border-gray-200 p-5">
+                <h3 className="text-sm font-semibold text-gray-800 mb-2 flex items-center gap-2">
+                  <FileText className="w-4 h-4 text-purple-600" />
+                  Извлечение из текста
+                </h3>
+                <p className="text-xs text-gray-500 mb-4">
+                  Вставьте текст технического задания, сметы или спецификации.
+                </p>
+                
+                <textarea
+                  value={manualText}
+                  onChange={e => setManualText(e.target.value)}
+                  placeholder="Вставьте текст сюда..."
+                  rows={5}
+                  className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none mb-4"
+                />
+
+                <button
+                  onClick={handleExtractFromText}
+                  disabled={isExtracting || !manualText.trim()}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-purple-600 text-white text-sm font-medium rounded-lg hover:bg-purple-700 disabled:opacity-50"
+                >
+                  {isExtracting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                  Извлечь из текста
+                </button>
+              </div>
+            </div>
+
+            {/* Результаты извлечения */}
+            {extractedItems.length > 0 && (
+              <div className="bg-white rounded-xl border border-gray-200 p-5">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-sm font-semibold text-gray-800">
+                    Извлеченные позиции ({extractedItems.length})
+                  </h3>
+                  <button 
+                    onClick={() => setExtractedItems([])}
+                    className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1"
+                  >
+                    <Trash2 className="w-3 h-3" /> Очистить
+                  </button>
+                </div>
+
+                {extractionWarnings.length > 0 && (
+                  <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded-lg space-y-1">
+                    <h4 className="text-xs font-semibold text-yellow-800 flex items-center gap-1">
+                      <AlertCircle className="w-3 h-3" /> Предупреждения:
+                    </h4>
+                    {extractionWarnings.map((w, i) => (
+                      <div key={i} className="text-xs text-yellow-700 ml-4">
+                        • {w.tender_id ? `[${w.tender_id}] ` : ""}{w.message}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="space-y-3">
+                  {extractedItems.map((item, idx) => (
+                    <div key={idx} className="p-3 border border-gray-100 bg-gray-50 rounded-lg flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="font-medium text-sm text-gray-900">{item.position_name}</span>
+                          <span className="text-[10px] px-1.5 py-0.5 bg-gray-200 text-gray-600 rounded">
+                            {item.source_label || item.source}
+                          </span>
+                        </div>
+                        <div className="text-xs text-gray-500 space-y-0.5">
+                          {item.quantity && <div>Количество: {item.quantity} {item.unit}</div>}
+                          {item.characteristics.length > 0 && (
+                            <div>Характеристики: {item.characteristics.join("; ")}</div>
+                          )}
+                          {item.notes && <div>Примечание: {item.notes}</div>}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => handleSearchForItem(item)}
+                        className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 bg-white border border-blue-200 text-blue-600 text-xs font-medium rounded hover:bg-blue-50"
+                      >
+                        <Search className="w-3.5 h-3.5" /> Искать аналоги
+                      </button>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </div>

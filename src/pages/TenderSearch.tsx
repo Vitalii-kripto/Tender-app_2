@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { logger } from "../services/loggerService";
 import { Search, Filter, Play, CheckCircle, ExternalLink, AlertCircle, Loader2, WifiOff, Briefcase, XCircle, CheckSquare, Square } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { MOCK_CATALOG } from './ProductCatalog';
@@ -26,7 +27,7 @@ const TenderSearch = () => {
   const abortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    refreshCrmTenders().catch(console.error);
+    refreshCrmTenders().catch(logger.error);
   }, []);
 
   const refreshCrmTenders = async () => {
@@ -84,7 +85,7 @@ const TenderSearch = () => {
         prev.filter(t => !snapshot.some(s => s.id === t.id))
       );
     } catch (error) {
-      console.error(error);
+      logger.error(error);
     } finally {
       setProcessing(false);
     }
@@ -123,7 +124,7 @@ const TenderSearch = () => {
       );
       setResults(tenders);
     } catch (err: any) {
-      console.error(err);
+      logger.error(err);
       setError(err.message || 'Произошла ошибка при поиске');
     } finally {
       setLoading(false);

@@ -344,6 +344,68 @@ class AiService:
             logger.error(f"Extraction Error: {e}", exc_info=True)
             return []
 
+    def extract_tender_requirement_positions(self, text: str):
+        """
+        Извлекает из ТЗ только поставляемые материальные позиции и их характеристики.
+        Используется для вкладки «Подбор аналогов».
+        """
+        if not self.client:
+            return []
+
+        logger.info(f"Extracting tender requirement positions. Length: {len(text)}")
+
+        prompt = f"""
+        Роль: старший инженер-сметчик и эксперт по строительным материалам.
+
+        Задача:
+        1. Извлечь из текста ТЗ только материальные позиции, которые нужно поставить.
+        2. Игнорировать работы, услуги, организационные требования, этапы выполнения работ, условия договора и общие фразы.
+        3. Если одна и та же позиция упоминается несколько раз, объединить ее в одну запись.
+        4. Для каждой позиции выделить только явно указанные характеристики.
+        5. Нельзя додумывать характеристики, которых нет в тексте.
+
+        Для каждой позиции вернуть:
+        - position_name: нормализованное название требуемого материала/товара;
+        - quantity: количество строкой, если найдено;
+        - unit: единица измерения, если найдена;
+        - characteristics: массив строк с характеристиками и ограничениями;
+        - notes: краткая заметка, если есть важная оговорка;
+        - search_query: короткий нормализованный запрос для поиска аналога.
+
+        Примеры характеристик:
+        - Основа: полиэфир
+        - Толщина: не менее 4,0 мм
+        - Гибкость на брусе: не выше -25 °C
+        - Тип: рулонный наплавляемый
+        - Цвет: серый
+        - ГОСТ/ТУ: ...
+        - Фасовка: 20 кг
+
+        Верни СТРОГО JSON-массив, без markdown и без пояснений.
+
+        ТЕКСТ ТЗ:
+        {text[:25000]}
+        """
+
+        try:
+            response = self._call_ai_with_retry(
+                self.client.models.generate_content,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
+            data = self._parse_json_response(response.text)
+            if isinstance(data, list):
+                return data
+            return []
+        except Exception as e:
+            from fastapi import HTTPException
+            if isinstance(e, HTTPException):
+                raise e
+            logger.error(f"Requirement extraction error: {e}", exc_info=True)
+            return []
+
     def compare_requirements_vs_proposal(self, requirements_text: str, proposal_json_str: str):
         """
         ТРОЙНАЯ ПРОВЕРКА:

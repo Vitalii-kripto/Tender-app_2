@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { logger } from "./services/loggerService";
 import { Bell, Search, User, Menu, Settings, LogOut, Check, X, Briefcase, ShoppingCart, Loader2, FileText, ChevronRight } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
 import { getEmployees, getTendersFromBackend, getProductsFromBackend } from './services/geminiService';
@@ -82,7 +83,7 @@ const Header = () => {
               setSearchResults({ tenders: foundTenders, products: foundProducts });
               setShowSearchResults(true);
           } catch (error) {
-              console.error(error);
+              logger.error(error);
           } finally {
               setIsSearching(false);
           }

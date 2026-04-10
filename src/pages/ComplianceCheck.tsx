@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { logger } from "../services/loggerService";
 import { FileCheck, Upload, AlertCircle, CheckCircle, XCircle, FileText, Loader2, Info, FileInput } from 'lucide-react';
 import { Tender, ComplianceResult } from '../types';
 import { checkTenderCompliance, getTendersFromBackend } from '../services/geminiService';
@@ -19,7 +20,7 @@ const ComplianceCheck = () => {
             setAvailableTenders(tenders);
             if (tenders.length > 0) setSelectedTenderId(tenders[0].id);
         } catch (e) {
-            console.error(e);
+            logger.error(e);
         }
     };
     loadData();
@@ -48,7 +49,7 @@ const ComplianceCheck = () => {
         const res = await checkTenderCompliance(tender.title, tender.description, fileNames);
         setResult(res);
     } catch (e) {
-        console.error(e);
+        logger.error(e);
         alert("Ошибка при проверке. Проверьте консоль.");
     } finally {
         setLoading(false);
