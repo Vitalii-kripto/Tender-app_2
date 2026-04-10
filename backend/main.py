@@ -391,6 +391,14 @@ except Exception as e:
 try:
     parser_service = GidroizolParser()
     logger.info("[OK] GidroizolParser initialized.")
+    
+    # Инициализация сервиса подбора аналогов
+    from backend.services.analog_service import AnalogService
+    analog_service = AnalogService(
+        ai_service=ai_service,
+        db_session_factory=lambda: next(get_db())
+    )
+    logger.info("[OK] AnalogService initialized.")
 except Exception as e:
     logger.error(f"[FAILED] GidroizolParser initialization error: {e}")
 
@@ -1042,6 +1050,169 @@ async def api_export_risks_word(data: dict = Body(...)):
     except Exception as e:
         logger.error(f"Word Export Error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINTS: ПОДБОР АНАЛОГОВ
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/products")
+async def get_all_products(
+    limit: int = 50,
+    category: str = None,
+    db: Session = Depends(get_db)
+):
+    """Возвращает список всех товаров из локальной БД."""
+    from sqlalchemy import text
+    import json as json_lib
+    try:
+        params = {"lim": limit}
+        where = ""
+        if category:
+            where = "WHERE LOWER(category) = :cat"
+            params["cat"] = category.lower()
+        rows = db.execute(
+            text(f"SELECT * FROM products {where} ORDER BY id DESC LIMIT :lim"),
+            params
+        ).fetchall()
+        result = []
+        for row in rows:
+            specs = {}
+            if row.specs:
+                try:
+                    specs = json_lib.loads(row.specs) if isinstance(row.specs, str) else row.specs
+                except Exception:
+                    specs = {}
+            result.append({
+                "id": row.id,
+                "title": row.title,
+                "category": row.category,
+                "material_type": row.material_type,
+                "price": row.price,
+                "specs": specs,
+                "url": row.url,
+                "description": row.description,
+            })
+        return {"products": result, "total": len(result)}
+    except Exception as e:
+        logger.error(f"get_all_products error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/products/search")
+async def search_products_local(
+    request: dict,
+    db: Session = Depends(get_db)
+):
+    """Поиск аналогов в локальной БД."""
+    query = request.get("query", "")
+    category = request.get("category")
+    limit = request.get("limit", 10)
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    results = analog_service.search_local_db(query, category=category, limit=limit)
+    return {"query": query, "results": results, "total": len(results)}
+
+
+@app.post("/api/products/search-ai")
+async def search_products_ai(request: dict):
+    """Поиск аналогов через Gemini AI с Google Search."""
+    query = request.get("query", "")
+    requirements = request.get("requirements")
+    max_results = request.get("max_results", 5)
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    logger.info(f"AI analog search: '{query}'")
+    result = await analog_service.search_analogs(
+        query=query,
+        requirements=requirements,
+        use_ai=True,
+        limit=max_results
+    )
+    return result
+
+
+@app.post("/api/products/refresh-catalog")
+async def refresh_catalog(background_tasks: BackgroundTasks):
+    """Запускает фоновое обновление каталога с gidroizol.ru."""
+    async def _do_refresh():
+        logger.info("[CATALOG] Starting catalog refresh from gidroizol.ru...")
+        try:
+            products = parser_service.parse_full_catalog(max_categories=5)
+            from sqlalchemy import text
+            import json as json_lib
+            with next(get_db()) as db:
+                saved = 0
+                for p in products:
+                    try:
+                        db.execute(
+                            text(
+                                "INSERT OR REPLACE INTO products "
+                                "(title, category, material_type, price, specs, url, description) "
+                                "VALUES (:title, :cat, :mat, :price, :specs, :url, :desc)"
+                            ),
+                            {
+                                "title": p.get("title", ""),
+                                "cat": p.get("category", ""),
+                                "mat": p.get("material_type", ""),
+                                "price": p.get("price"),
+                                "specs": json_lib.dumps(p.get("specs", {}), ensure_ascii=False),
+                                "url": p.get("url", ""),
+                                "desc": p.get("description", ""),
+                            }
+                        )
+                        saved += 1
+                    except Exception as e:
+                        logger.debug(f"[CATALOG] Skip product: {e}")
+                db.commit()
+            logger.info(f"[CATALOG] Refresh complete. Saved {saved} products.")
+        except Exception as e:
+            logger.error(f"[CATALOG] Refresh failed: {e}")
+
+    background_tasks.add_task(_do_refresh)
+    return {"status": "started", "message": "Обновление каталога запущено в фоне"}
+
+
+@app.post("/api/products")
+async def create_product(request: dict, db: Session = Depends(get_db)):
+    """Добавить товар в локальную БД вручную."""
+    from sqlalchemy import text
+    import json as json_lib
+    try:
+        specs_json = json_lib.dumps(request.get("specs", {}), ensure_ascii=False)
+        result = db.execute(
+            text(
+                "INSERT INTO products (title, category, material_type, price, specs, url, description) "
+                "VALUES (:title, :cat, :mat, :price, :specs, :url, :desc)"
+            ),
+            {
+                "title": request.get("title", ""),
+                "cat": request.get("category", ""),
+                "mat": request.get("material_type", ""),
+                "price": request.get("price"),
+                "specs": specs_json,
+                "url": request.get("url", ""),
+                "desc": request.get("description", ""),
+            }
+        )
+        db.commit()
+        return {"id": result.lastrowid, "status": "created"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/products/{product_id}")
+async def delete_product(product_id: int, db: Session = Depends(get_db)):
+    """Удалить товар из БД."""
+    from sqlalchemy import text
+    db.execute(text("DELETE FROM products WHERE id = :id"), {"id": product_id})
+    db.commit()
+    return {"status": "deleted", "id": product_id}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# КОНЕЦ НОВЫХ ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)
