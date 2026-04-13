@@ -1269,9 +1269,21 @@ async def search_products_ai(request: dict):
     result = await analog_service.search_analogs(
         query=query,
         requirements=requirements,
-        mode=mode,
+        use_ai=(mode in ["ai", "both"]),
         limit=max_results
     )
+    
+    if mode == "ai":
+        result["local_results"] = []
+    elif mode == "local":
+        result["ai_results"] = []
+        
+    result["total"] = len(result["local_results"]) + len(result["ai_results"])
+    
+    # Add mode and ai_error to match frontend expectations
+    result["mode"] = mode
+    result["ai_error"] = analog_service.last_ai_error or getattr(analog_service.ai_service, "last_error_message", "")
+    
     return result
 
 @app.post("/api/products/refresh-catalog")

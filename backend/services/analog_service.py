@@ -193,44 +193,180 @@ class AnalogService:
     # ПОИСК В ЛОКАЛЬНОЙ БД
     # ─────────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _clean_search_query(raw_query: str) -> str:
+        """
+        Очищает поисковый запрос от мусора из парсинга документов.
+
+        Форматы которые приходят с фронтенда:
+          "Предмет закупки | Поставка гидроизола и мастики битумной | doc.docx, стр.1 |"
+          "гидроизол ТПП"
+          "Мастика битумная ГОСТ 2678-94, 10 кг"
+
+        После очистки возвращает:
+          "гидроизол, мастика битумная"
+          "гидроизол ТПП"
+          "Мастика битумная"
+        """
+        import re
+
+        if not raw_query:
+            return ""
+
+        query = raw_query.strip()
+
+        # Формат с пайпами: "Ключ | Значение | Источник | стр.N |"
+        if "|" in query:
+            parts = [p.strip() for p in query.split("|")]
+            # Берём только части которые не являются:
+            # - названиями полей ("Предмет закупки", "Наименование", etc.)
+            # - именами файлов (.docx, .pdf, .xls)
+            # - номерами страниц ("стр.", "стр N")
+            # - пустыми строками
+            FIELD_NAMES = {
+                "предмет закупки", "наименование", "описание",
+                "объект закупки", "товар", "номенклатура",
+                "позиция", "материал", "продукт", "изделие",
+            }
+            FILE_PATTERN = re.compile(
+                r"\.(docx|pdf|xlsx?|doc)\b|стр\.?\s*\d+|страница\s*\d+",
+                re.IGNORECASE
+            )
+            good_parts = []
+            for part in parts:
+                if not part:
+                    continue
+                if part.lower() in FIELD_NAMES:
+                    continue
+                if FILE_PATTERN.search(part):
+                    continue
+                if len(part) < 3:
+                    continue
+                good_parts.append(part)
+
+            if good_parts:
+                # Берём самую длинную осмысленную часть
+                query = max(good_parts, key=len)
+
+        # Убираем технические суффиксы типа "ГОСТ ...", "(10 кг)", etc.
+        # но оставляем марку материала (ТПП, ТКП, ХПП, ЭПП и т.д.)
+        query = re.sub(r"\s*ГОСТ\s+[\d\-]+", "", query, flags=re.IGNORECASE)
+        query = re.sub(r"\s*ТУ\s+[\d\.\-]+", "", query, flags=re.IGNORECASE)
+        query = re.sub(r"\s*\(\s*\d+\s*(кг|м2|м|шт|л|рул)\s*\)", "", query, flags=re.IGNORECASE)
+        query = re.sub(r"\s{2,}", " ", query)
+        query = query.strip().strip(",").strip()
+
+        logger.info(
+            f"[AnalogService] Query cleaned: '{raw_query[:80]}' -> '{query}'"
+        )
+        return query
+
     def search_local_db(
         self,
         query: str,
-        category: Optional[str] = None,
-        requirements: Optional[str] = None,
+        category: str = None,
         limit: int = 10
     ) -> list:
         """
-        Улучшенный подбор по локальной БД.
-        Не просто LIKE по словам, а ранжирование по названию, марке и характеристикам.
+        Поиск аналогов в локальной БД с предварительной очисткой запроса.
+        Поддерживает поиск по нескольким ключевым словам одновременно.
+        Исключает нерелевантные категории (вентиляция, тепловое оборудование).
         """
+        import re
         from sqlalchemy import text
+        import json as json_lib
 
-        logger.info(f"[AnalogService] Local DB search: '{query}' | category={category}")
-
-        if not query.strip():
+        # Шаг 1: Очищаем запрос
+        clean_query = self._clean_search_query(query)
+        if not clean_query:
+            logger.warning(f"[AnalogService] Empty query after cleaning: '{query}'")
             return []
+
+        logger.info(
+            f"[AnalogService] Local DB search: "
+            f"raw='{query[:60]}' -> clean='{clean_query}' | category={category}"
+        )
+
+        # Шаг 2: Разбиваем на ключевые слова
+        # Для "гидроизол, мастика битумная" → ["гидроизол", "мастика", "битумная"]
+        raw_keywords = re.split(r"[\s,;/]+", clean_query)
+        keywords = [
+            kw.strip().lower()
+            for kw in raw_keywords
+            if len(kw.strip()) > 2
+        ][:6]  # максимум 6 слов
+
+        if not keywords:
+            return []
+
+        # Шаг 3: Категории которые исключаем из поиска
+        EXCLUDED_CATEGORIES = [
+            "воздушные завесы", "тепловентиляционное", "дестратификатор",
+            "аэратор", "водяные завесы", "завесы без нагрева",
+        ]
 
         results = []
         try:
             with self.db_session_factory() as session:
-                rows = session.execute(
-                    text(
-                        "SELECT id, title, category, material_type, price, specs, url, description "
-                        "FROM products"
+                # Строим OR-условие: товар содержит ХОТЯ БЫ ОДНО из ключевых слов
+                conditions = []
+                params = {}
+                for i, kw in enumerate(keywords):
+                    pname = f"kw{i}"
+                    like = f"%{kw}%"
+                    conditions.append(
+                        f"(LOWER(title) LIKE :{pname} "
+                        f"OR LOWER(description) LIKE :{pname} "
+                        f"OR LOWER(category) LIKE :{pname})"
                     )
-                ).fetchall()
+                    params[pname] = like
 
-                candidates = []
+                where = " OR ".join(conditions)
+
+                # Исключаем нерелевантные категории
+                excl_conds = []
+                for j, excl in enumerate(EXCLUDED_CATEGORIES):
+                    ename = f"excl{j}"
+                    excl_conds.append(f"LOWER(category) NOT LIKE :{ename}")
+                    params[ename] = f"%{excl}%"
+                if excl_conds:
+                    where = f"({where}) AND {' AND '.join(excl_conds)}"
+
+                # Фильтр по категории если задан
+                if category:
+                    where += " AND LOWER(category) LIKE :user_cat"
+                    params["user_cat"] = f"%{category.lower()}%"
+
+                params["lim"] = limit * 3  # берём с запасом для сортировки
+
+                sql = text(
+                    f"SELECT id, title, category, material_type, price, "
+                    f"specs, url, description "
+                    f"FROM products WHERE {where} LIMIT :lim"
+                )
+                rows = session.execute(sql, params).fetchall()
+
+                # Шаг 4: Вычисляем score релевантности для сортировки
                 for row in rows:
                     specs = {}
                     if row.specs:
                         try:
-                            specs = json.loads(row.specs) if isinstance(row.specs, str) else row.specs
+                            specs = (
+                                json_lib.loads(row.specs)
+                                if isinstance(row.specs, str)
+                                else row.specs
+                            )
                         except Exception:
                             specs = {}
 
-                    product = {
+                    title_lower = (row.title or "").lower()
+                    desc_lower = (row.description or "").lower()
+
+                    # Считаем сколько ключевых слов встречается в названии
+                    score = sum(1 for kw in keywords if kw in title_lower) * 3
+                    score += sum(1 for kw in keywords if kw in desc_lower)
+
+                    results.append({
                         "id": row.id,
                         "title": row.title,
                         "category": row.category,
@@ -240,46 +376,24 @@ class AnalogService:
                         "url": row.url,
                         "description": row.description,
                         "source": "local_db",
-                    }
+                        "_score": score,
+                    })
 
-                    if category and str(product.get("category") or "").lower() != str(category).lower():
-                        continue
-
-                    score, reasons = self._score_product(product, query, requirements or "")
-                    if score <= 0:
-                        continue
-
-                    product["match_score"] = min(score, 100)
-                    product["description"] = (
-                        f"Подбор по базе. Причины: {', '.join(reasons[:4])}"
-                        if reasons else
-                        "Подбор по базе по совпадению названия и характеристик."
-                    )
-                    candidates.append(product)
-
-                candidates.sort(
-                    key=lambda item: (
-                        item.get("match_score", 0),
-                        1 if item.get("title", "").lower() == query.lower() else 0,
-                        float(item.get("price") or 0)
-                    ),
-                    reverse=True
-                )
-
-                seen = set()
-                for item in candidates:
-                    key = self._normalize_title_for_dedup(item.get("title", ""))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    results.append(item)
-                    if len(results) >= limit:
-                        break
+                # Сортируем по релевантности
+                results.sort(key=lambda x: x.get("_score", 0), reverse=True)
+                # Убираем служебное поле
+                for r in results:
+                    r.pop("_score", None)
+                # Обрезаем до лимита
+                results = results[:limit]
 
         except Exception as e:
-            logger.error(f"[AnalogService] Local DB search error: {e}", exc_info=True)
+            logger.error(f"[AnalogService] Local DB search error: {e}")
 
-        logger.info(f"[AnalogService] Local DB: found {len(results)} results for '{query}'")
+        logger.info(
+            f"[AnalogService] Local DB: found {len(results)} results "
+            f"for '{clean_query}'"
+        )
         return results
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -289,8 +403,9 @@ class AnalogService:
     async def search_ai(
         self,
         query: str,
-        requirements: Optional[str] = None,
-        max_results: int = 5
+        requirements: str = None,
+        max_results: int = 5,
+        local_db_products: list = None
     ) -> list:
         logger.info(f"[AnalogService] AI search: '{query}' | requirements={bool(requirements)}")
         self.last_ai_error = ""
@@ -300,33 +415,63 @@ class AnalogService:
             logger.error(f"[AnalogService] {self.last_ai_error}")
             return []
 
-        prompt = f"""Ты эксперт по гидроизоляционным и кровельным материалам.
+        # Очищаем запрос перед отправкой в AI
+        clean_q = self._clean_search_query(query)
 
-Задача: найти аналоги материала "{query}", которые реально продаются в РФ и могут быть предложены как аналог.
+        # Формируем список товаров из локальной БД для AI
+        local_items_text = ""
+        if local_db_products:
+            lines = []
+            for p in local_db_products[:10]:
+                specs_str = ", ".join(
+                    f"{k}: {v}"
+                    for k, v in (p.get("specs") or {}).items()
+                    if k and v
+                )[:200]
+                lines.append(
+                    f"- {p['title']} | {p.get('category','')} | "
+                    f"Цена: {p.get('price','н/д')} руб | {specs_str}"
+                )
+            local_items_text = "\n".join(lines)
 
-{"Требования из ТЗ тендера:\n" + requirements if requirements else ""}
+        prompt = f"""Ты эксперт по строительным гидроизоляционным материалам для тендерных закупок.
 
-Найди до {max_results} лучших аналогов.
-Используй поиск в интернете для нахождения актуальных характеристик и цен.
+ЗАДАЧА: Подобрать аналоги для материала: "{clean_q}"
 
-Верни ответ строго в JSON и только в JSON:
+{"ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ ИЗ ТЗ ТЕНДЕРА:" + chr(10) + requirements[:800] if requirements else ""}
+
+{"УЖЕ ЕСТЬ В НАШЕМ КАТАЛОГЕ (gidroizol.ru):" + chr(10) + local_items_text if local_items_text else ""}
+
+ИНСТРУКЦИЯ:
+1. Если в нашем каталоге уже есть подходящий аналог — укажи его первым со score >= 85
+2. Найди ещё {max_results} аналогов от других производителей (ТехноНИКОЛЬ, Технопласт, Изофлекс и др.)
+3. Для каждого аналога укажи конкретные технические характеристики
+4. Проверяй соответствие требованиям ТЗ если они указаны
+5. В поле match_reason объясни конкретно почему это аналог
+
+ВАЖНО: Верни ТОЛЬКО JSON без пояснений и markdown-блоков.
+
+Формат ответа:
 {{
   "analogs": [
     {{
-      "title": "Полное название",
-      "manufacturer": "Производитель",
-      "material_type": "Тип материала",
+      "title": "Гидроизол ХПП-3,0 (gidroizol.ru)",
+      "manufacturer": "ЗАО Оргкровля",
+      "material_type": "Рулонная гидроизоляция",
       "specs": {{
-        "Основа": "значение",
-        "Толщина": "значение",
-        "Масса": "значение",
-        "Гибкость": "значение"
+        "Основа": "Стеклохолст",
+        "Толщина, мм": "2.3",
+        "Масса 1м², кг": "3.0",
+        "Класс": "стандарт",
+        "Срок службы": "8 лет",
+        "ГОСТ/ТУ": "ГОСТ 32805-2014"
       }},
-      "price": 0,
-      "price_unit": "руб/рулон",
-      "url": "https://...",
-      "match_reason": "Почему подходит",
-      "match_score": 0
+      "price": 108,
+      "price_unit": "руб/м²",
+      "url": "https://gidroizol.ru/214?city=1",
+      "match_reason": "Аналог по основе (стеклохолст), типу (рулонный наплавляемый), назначению (нижний слой кровли/гидроизоляция фундамента)",
+      "match_score": 90,
+      "in_local_db": true
     }}
   ]
 }}"""
@@ -386,61 +531,71 @@ class AnalogService:
     async def search_analogs(
         self,
         query: str,
-        requirements: Optional[str] = None,
-        mode: str = "both",
+        requirements: str = None,
+        use_ai: bool = True,
         limit: int = 10
     ) -> dict:
-        normalized_mode = (mode or "both").strip().lower()
-        if normalized_mode not in {"local", "ai", "both"}:
-            normalized_mode = "both"
+        """
+        Главный метод: комбинированный поиск аналогов.
 
+        Алгоритм:
+          1. Очищаем запрос
+          2. Ищем в локальной БД
+          3. Если AI включён — передаём контекст из БД в AI промпт
+          4. AI ищет дополнительные аналоги с учётом того что уже есть в БД
+          5. Объединяем результаты, убираем дубли
+
+        Возвращает:
+          {
+            "query": "очищенный запрос",
+            "original_query": "исходный запрос",
+            "local_results": [...],
+            "ai_results": [...],
+            "total": N
+          }
+        """
+        # Очищаем запрос
+        clean_query = self._clean_search_query(query)
         logger.info(
-            f"[AnalogService] Combined search: query='{query}' | mode={normalized_mode} | limit={limit}"
+            f"[AnalogService] Combined search: "
+            f"raw='{query[:60]}' → clean='{clean_query}' | "
+            f"mode={'ai+db' if use_ai else 'db_only'} | limit={limit}"
         )
 
-        self.last_ai_error = ""
-        local_results = []
+        # Поиск в локальной БД
+        local_results = self.search_local_db(clean_query, limit=limit)
+
+        # AI поиск с передачей контекста из БД
         ai_results = []
-
-        if normalized_mode in {"local", "both"}:
-            local_results = self.search_local_db(
-                query=query,
-                requirements=requirements,
-                limit=limit
-            )
-
-        if normalized_mode in {"ai", "both"}:
+        if use_ai:
+            # Передаём в AI что уже есть в БД — чтобы он не дублировал
             ai_results = await self.search_ai(
-                query=query,
+                query=clean_query,
                 requirements=requirements,
-                max_results=min(limit, 10)
+                max_results=5,
+                local_db_products=local_results,
             )
 
-        if normalized_mode == "both" and local_results and ai_results:
-            local_titles = {
-                self._normalize_title_for_dedup(item.get("title", ""))
-                for item in local_results
-            }
-            filtered_ai_results = []
-            for item in ai_results:
-                norm_title = self._normalize_title_for_dedup(item.get("title", ""))
-                if norm_title and norm_title not in local_titles:
-                    filtered_ai_results.append(item)
-            ai_results = filtered_ai_results
-
-        if normalized_mode == "local":
-            ai_results = []
-
-        if normalized_mode == "ai":
-            local_results = []
+        # Убираем дубли между local и ai результатами
+        seen_titles = {r["title"].lower() for r in local_results}
+        ai_unique = []
+        for r in ai_results:
+            t = r.get("title", "").lower()
+            # Проверяем нет ли похожего в local (по первым 15 символам)
+            is_dup = any(
+                t[:15] in existing or existing[:15] in t
+                for existing in seen_titles
+            )
+            if not is_dup:
+                ai_unique.append(r)
+                seen_titles.add(t)
 
         return {
-            "query": query,
-            "mode": normalized_mode,
+            "query": clean_query,
+            "original_query": query,
             "local_results": local_results,
-            "ai_results": ai_results,
-            "total": len(local_results) + len(ai_results),
-            "ai_error": self.last_ai_error or getattr(self.ai_service, "last_error_message", ""),
+            "ai_results": ai_unique,
+            "total": len(local_results) + len(ai_unique),
         }
 
     # ─────────────────────────────────────────────────────────────────────────

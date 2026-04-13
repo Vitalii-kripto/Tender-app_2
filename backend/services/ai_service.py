@@ -41,6 +41,13 @@ class AiService:
                 logger.error(f"Failed to initialize Gemini Client: {e}")
                 self.client = None
 
+        # Rate limiter: минимальный интервал между запросами = 5 сек
+        self._last_ai_call_time = 0.0
+        self._ai_call_min_interval = 5.0  # секунд между запросами
+        # Простой in-memory кэш результатов (ключ → (timestamp, result))
+        self._search_cache: dict = {}
+        self._cache_ttl = 3600  # кэш живёт 1 час
+
     def test_model_availability(self) -> str:
         """
         Тестовый запрос к моделям при старте для выбора рабочей модели.
@@ -161,10 +168,19 @@ class AiService:
                     logger.warning(f"Attempt {attempt} failed. Switching to fallback model for remaining retries: {self.fallback_model_name}")
                     kwargs['model'] = self.fallback_model_name
 
-                # Пауза с экспоненциальным бэк-оффом
-                wait_time = (2 ** attempt) + 1
-                logger.info(f"Waiting {wait_time}s before next retry...")
-                time.sleep(wait_time)
+                # При ошибке 429 ждём значительно дольше
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    wait_time = 60  # 60 секунд при исчерпании квоты
+                    logger.warning(
+                        f"[AIService] Rate limit 429 hit. "
+                        f"Waiting {wait_time}s before retry {attempt + 1}..."
+                    )
+                    time.sleep(wait_time)
+                else:
+                    # Стандартный backoff: 3, 5, 9 секунд
+                    wait_time = [3, 5, 9][min(attempt, 2)]
+                    logger.info(f"Waiting {wait_time}s before next retry...")
+                    time.sleep(wait_time)
 
         return None
 
@@ -405,6 +421,32 @@ class AiService:
         self._clear_last_error()
         logger.info("generate_with_search started.")
 
+        import time
+        import hashlib
+
+        # Проверяем кэш
+        cache_key = hashlib.md5(prompt.encode("utf-8", errors="replace")).hexdigest()
+        now = time.time()
+        if cache_key in self._search_cache:
+            cached_time, cached_result = self._search_cache[cache_key]
+            if now - cached_time < self._cache_ttl:
+                logger.info(
+                    f"[AIService] Cache HIT for query hash {cache_key[:8]}. "
+                    f"Age: {int(now - cached_time)}s"
+                )
+                return cached_result
+            else:
+                del self._search_cache[cache_key]
+
+        # Rate limiting: ждём если последний запрос был недавно
+        elapsed = now - self._last_ai_call_time
+        if elapsed < self._ai_call_min_interval:
+            wait = self._ai_call_min_interval - elapsed
+            logger.info(f"[AIService] Rate limit: waiting {wait:.1f}s before API call")
+            time.sleep(wait)
+
+        self._last_ai_call_time = time.time()
+
         try:
             response = self._call_ai_with_retry(
                 self.client.models.generate_content,
@@ -426,6 +468,14 @@ class AiService:
                 return ""
 
             self._clear_last_error()
+
+            # Сохраняем в кэш
+            self._search_cache[cache_key] = (time.time(), text)
+            # Ограничиваем размер кэша
+            if len(self._search_cache) > 50:
+                oldest_key = min(self._search_cache, key=lambda k: self._search_cache[k][0])
+                del self._search_cache[oldest_key]
+
             return text
 
         except Exception as e:
