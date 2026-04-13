@@ -24,7 +24,7 @@ from starlette.concurrency import run_in_threadpool
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from .database import engine, Base, get_db
+from .database import engine, Base, get_db, SessionLocal
 from .models import TenderModel, ProductModel
 from .services.eis_service import EisService, Notice, mark_seen
 from backend.config import DOCUMENTS_ROOT
@@ -386,6 +386,9 @@ ai_service = None
 legal_analysis_service = None
 analog_service = None
 
+def db_session_factory():
+    return SessionLocal()
+
 logger.info("Initializing Services...")
 
 try:
@@ -425,9 +428,13 @@ except Exception as e:
 
 try:
     from backend.services.analog_service import AnalogService
+
+    if not ai_service:
+        raise RuntimeError("AiService is not initialized, AnalogService cannot be created.")
+
     analog_service = AnalogService(
         ai_service=ai_service,
-        db_session_factory=lambda: next(get_db())
+        db_session_factory=db_session_factory
     )
     logger.info("[OK] AnalogService initialized.")
 except Exception as e:
@@ -1238,42 +1245,25 @@ async def search_products_local(
     }
 
 @app.post("/api/products/search-ai")
-async def search_products_ai(
-    request: dict,
-    _ = Depends(check_analog_service)
-):
-    """
-    Поиск аналогов:
-    - mode='internet'  -> только интернет
-    - mode='both'      -> локальная БД + интернет
-    """
-    query = (request.get("query") or "").strip()
+async def search_products_ai(request: dict):
+    """Поиск аналогов через Gemini AI с Google Search или в комбинированном режиме."""
+    query = str(request.get("query", "")).strip()
     requirements = request.get("requirements")
-    max_results = int(request.get("max_results", 5))
-    mode = (request.get("mode") or "both").strip().lower()
+    max_results = int(request.get("max_results", 5) or 5)
+    mode = str(request.get("mode", "both")).strip().lower()
 
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
 
-    logger.info(f"AI analog search: '{query}' | mode={mode}")
+    if analog_service is None:
+        raise HTTPException(status_code=503, detail="AnalogService is not initialized")
 
-    if mode == "internet":
-        ai_results = await analog_service.search_ai(
-            query=query,
-            requirements=requirements,
-            max_results=max_results
-        )
-        return {
-            "query": query,
-            "local_results": [],
-            "ai_results": ai_results,
-            "total": len(ai_results),
-        }
+    logger.info(f"AI analog search: '{query}' | mode={mode}")
 
     result = await analog_service.search_analogs(
         query=query,
         requirements=requirements,
-        use_ai=True,
+        mode=mode,
         limit=max_results
     )
     return result

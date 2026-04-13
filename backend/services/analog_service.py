@@ -23,6 +23,11 @@ class AnalogService:
         self.db_session_factory = db_session_factory
         logger.info("[AnalogService] Initialized.")
 
+    def _normalize_title_for_dedup(self, title: str) -> str:
+        if not title:
+            return ""
+        return re.sub(r"\s+", " ", re.sub(r"[^a-zA-Zа-яА-Я0-9]+", " ", title.lower())).strip()
+
     # ─────────────────────────────────────────────────────────────────────────
     # ПОИСК В ЛОКАЛЬНОЙ БД
     # ─────────────────────────────────────────────────────────────────────────
@@ -121,33 +126,37 @@ class AnalogService:
     ) -> list:
         """
         Поиск аналогов через Gemini AI с Google Search Grounding.
-
-        Параметры:
-          query        : название искомого материала
-          requirements : технические требования из ТЗ тендера (опционально)
-          max_results  : максимальное количество аналогов
-
-        Возвращает список словарей с найденными аналогами.
+        Возвращает список нормализованных карточек аналогов.
         """
         logger.info(f"[AnalogService] AI search: '{query}' | requirements={bool(requirements)}")
 
+        if not self.ai_service:
+            logger.error("[AnalogService] AI service is not initialized.")
+            return []
+
+        if not hasattr(self.ai_service, "generate_with_search"):
+            logger.error("[AnalogService] AI service has no method generate_with_search.")
+            return []
+
         prompt = f"""Ты эксперт по гидроизоляционным и кровельным материалам.
 
-Задача: найти аналоги материала "{query}" которые можно поставить в тендере.
+Задача: найти аналоги материала "{query}", которые можно поставить в тендере.
 
-{"Требования из ТЗ тендера:" + chr(10) + requirements if requirements else ""}
+{"Требования из ТЗ тендера:\n" + requirements if requirements else ""}
 
 Найди {max_results} лучших аналогов от российских производителей/поставщиков.
 Используй поиск в интернете для нахождения актуальных характеристик и цен.
 
 Для каждого аналога укажи:
 1. Полное название (марка, производитель)
-2. Основные технические характеристики (основа, состав, толщина, вес, ГОСТ/ТУ)
-3. Примерную цену за единицу (руб/рулон или руб/кг или руб/л)
-4. Ссылку на сайт производителя или магазина
-5. Вывод: подходит ли как аналог и почему
+2. Основные технические характеристики
+3. Примерную цену за единицу
+4. Ссылку на карточку товара / сайт производителя / сайт поставщика
+5. Краткое объяснение, почему это аналог
+6. Оценку совпадения от 0 до 100
 
-Верни ответ СТРОГО в формате JSON (и только JSON, без пояснений):
+Верни ответ строго в JSON и только в JSON:
+
 {{
   "analogs": [
     {{
@@ -157,37 +166,31 @@ class AnalogService:
       "specs": {{
         "Основа": "полиэстер",
         "Толщина": "4,0 мм",
-        "Вес рулона": "40 кг",
-        "ГОСТ": "ТУ 5774-005-00289973-2004",
-        "Длина рулона": "10 м",
-        "Ширина": "1 м"
+        "Масса": "4,0 кг/м2"
       }},
       "price": 3200,
       "price_unit": "руб/рулон",
-      "url": "https://www.tn.ru/catalogue/...",
-      "match_reason": "Аналог по основным характеристикам: полиэстеровая основа, аналогичная толщина",
+      "url": "https://example.com/product",
+      "match_reason": "Подходит по основе, толщине и назначению",
       "match_score": 95
     }}
   ]
 }}"""
 
         try:
-            # Вызов Gemini AI (с Google Search Grounding)
-            response_text = await self.ai_service.generate_with_search(prompt)
+            response_text = self.ai_service.generate_with_search(prompt)
             if not response_text:
                 logger.warning("[AnalogService] AI returned empty response")
                 return []
 
-            # Извлекаем JSON из ответа
             json_match = re.search(r'\{[\s\S]*\}', response_text)
             if not json_match:
-                logger.warning(f"[AnalogService] No JSON in AI response: {response_text[:200]}")
+                logger.warning(f"[AnalogService] No JSON found in AI response: {response_text[:500]}")
                 return []
 
             data = json.loads(json_match.group())
             analogs = data.get("analogs", [])
 
-            # Нормализуем и добавляем источник
             result = []
             for a in analogs[:max_results]:
                 result.append({
@@ -205,16 +208,14 @@ class AnalogService:
                     "source": "ai_search",
                 })
 
-            logger.info(
-                f"[AnalogService] AI found {len(result)} analogs for '{query}'"
-            )
+            logger.info(f"[AnalogService] AI found {len(result)} analogs for '{query}'")
             return result
 
         except json.JSONDecodeError as e:
-            logger.error(f"[AnalogService] JSON parse error: {e}")
+            logger.error(f"[AnalogService] JSON parse error: {e}", exc_info=True)
             return []
         except Exception as e:
-            logger.error(f"[AnalogService] AI search error: {e}")
+            logger.error(f"[AnalogService] AI search error: {e}", exc_info=True)
             return []
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -225,41 +226,59 @@ class AnalogService:
         self,
         query: str,
         requirements: Optional[str] = None,
-        use_ai: bool = True,
+        mode: str = "both",
         limit: int = 10
     ) -> dict:
         """
-        Главный метод: комбинированный поиск аналогов.
+        Главный метод поиска аналогов.
 
-        Алгоритм:
-          1. Поиск в локальной БД
-          2. Если результатов мало (< 3) — поиск через AI
-          3. Объединяем, дедуплицируем, возвращаем
-
-        Возвращает словарь:
-          {
-            "query": "...",
-            "local_results": [...],
-            "ai_results": [...],
-            "total": N
-          }
+        Режимы:
+        - local : только локальная БД
+        - ai    : только интернет / Gemini
+        - both  : локальная БД + интернет всегда
         """
-        logger.info(f"[AnalogService] Combined search: '{query}'")
+        normalized_mode = (mode or "both").strip().lower()
+        if normalized_mode not in {"local", "ai", "both"}:
+            normalized_mode = "both"
 
-        # 1. Локальный поиск
-        local_results = self.search_local_db(query, limit=limit)
+        logger.info(
+            f"[AnalogService] Combined search: query='{query}' | mode={normalized_mode} | limit={limit}"
+        )
 
-        # 2. AI поиск если нужно
+        local_results = []
         ai_results = []
-        if use_ai and len(local_results) < 3:
+
+        if normalized_mode in {"local", "both"}:
+            local_results = self.search_local_db(query, limit=limit)
+
+        if normalized_mode in {"ai", "both"}:
             ai_results = await self.search_ai(
                 query=query,
                 requirements=requirements,
-                max_results=5
+                max_results=limit if limit <= 10 else 10
             )
+
+        if normalized_mode == "both" and local_results and ai_results:
+            local_titles = {
+                self._normalize_title_for_dedup(item.get("title", ""))
+                for item in local_results
+            }
+            filtered_ai_results = []
+            for item in ai_results:
+                norm_title = self._normalize_title_for_dedup(item.get("title", ""))
+                if norm_title and norm_title not in local_titles:
+                    filtered_ai_results.append(item)
+            ai_results = filtered_ai_results
+
+        if normalized_mode == "local":
+            ai_results = []
+
+        if normalized_mode == "ai":
+            local_results = []
 
         return {
             "query": query,
+            "mode": normalized_mode,
             "local_results": local_results,
             "ai_results": ai_results,
             "total": len(local_results) + len(ai_results),

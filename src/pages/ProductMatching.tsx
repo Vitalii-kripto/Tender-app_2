@@ -374,13 +374,22 @@ export default function ProductMatching() {
             query: searchQuery,
             requirements: requirements || undefined,
             max_results: 5,
+            mode: searchMode,
           }),
         });
+
         const data = await res.json();
+
         setSearchResult({
           query: data.query || searchQuery,
-          local_results: (data.local_results || []).map((p: Product) => ({ ...p, source: "local_db" })),
-          ai_results: (data.ai_results || []).map((p: Product) => ({ ...p, source: "ai_search" })),
+          local_results: (data.local_results || []).map((p: Product) => ({
+            ...p,
+            source: "local_db",
+          })),
+          ai_results: (data.ai_results || []).map((p: Product) => ({
+            ...p,
+            source: "ai_search",
+          })),
           total: data.total || 0,
         });
       }

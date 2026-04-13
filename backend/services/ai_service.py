@@ -181,6 +181,37 @@ class AiService:
             from fastapi import HTTPException
             raise HTTPException(status_code=500, detail=f"AI returned invalid JSON: {e}. Raw response: {text}")
 
+    def generate_with_search(self, prompt: str) -> str:
+        """
+        Универсальный вызов Gemini с Google Search Grounding.
+        Возвращает сырой текст ответа модели.
+        Используется сервисом подбора аналогов, где модель обязана вернуть JSON.
+        """
+        if not self.client:
+            logger.error("generate_with_search called without initialized Gemini client.")
+            return ""
+
+        logger.info("generate_with_search started.")
+
+        try:
+            response = self._call_ai_with_retry(
+                self.client.models.generate_content,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())]
+                )
+            )
+
+            if not response:
+                logger.warning("generate_with_search returned empty response object.")
+                return ""
+
+            return (response.text or "").strip()
+
+        except Exception as e:
+            logger.error(f"generate_with_search failed: {e}", exc_info=True)
+            return ""
+
     def find_product_equivalent(self, tender_specs: str, catalog: list):
         if not self.client:
             logger.error("Find product equivalent called without API Key.")
