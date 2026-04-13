@@ -1232,12 +1232,18 @@ async def search_products_local(
     """
     query = (request.get("query") or "").strip()
     category = request.get("category")
+    requirements = request.get("requirements")
     limit = int(request.get("limit", 10))
 
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
 
-    results = analog_service.search_local_db(query, category=category, limit=limit)
+    results = analog_service.search_local_db(
+        query=query,
+        category=category,
+        requirements=requirements,
+        limit=limit
+    )
     return {
         "query": query,
         "results": results,

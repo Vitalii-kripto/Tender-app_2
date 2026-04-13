@@ -319,6 +319,7 @@ export default function ProductMatching() {
   const [showAddForm, setShowAddForm]         = useState(false);
   const [activeTab, setActiveTab]             = useState<"search"|"extraction"|"catalog"|"selected">("search");
   const [error, setError]                     = useState<string | null>(null);
+  const [aiError, setAiError]                 = useState<string | null>(null);
 
   // Состояние для извлечения ТЗ
   const [manualText, setManualText] = useState("");
@@ -350,6 +351,7 @@ export default function ProductMatching() {
     if (!searchQuery.trim()) return;
     setIsSearching(true);
     setError(null);
+    setAiError(null);
     setSearchResult(null);
 
     try {
@@ -357,7 +359,11 @@ export default function ProductMatching() {
         const res = await fetch("/api/products/search", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query: searchQuery, limit: 10 }),
+          body: JSON.stringify({ 
+            query: searchQuery, 
+            requirements: requirements || undefined,
+            limit: 10 
+          }),
         });
         const data = await res.json();
         setSearchResult({
@@ -379,6 +385,10 @@ export default function ProductMatching() {
         });
 
         const data = await res.json();
+
+        if (data.ai_error) {
+          setAiError(data.ai_error);
+        }
 
         setSearchResult({
           query: data.query || searchQuery,
@@ -612,6 +622,14 @@ export default function ProductMatching() {
             <AlertCircle className="w-4 h-4 flex-shrink-0" />
             {error}
             <button onClick={() => setError(null)} className="ml-auto"><X className="w-4 h-4" /></button>
+          </div>
+        )}
+        
+        {aiError && (
+          <div className="mb-4 flex items-center gap-2 p-3 bg-yellow-50 border border-yellow-200 rounded-lg text-yellow-800 text-sm">
+            <AlertCircle className="w-4 h-4 flex-shrink-0" />
+            <span className="font-medium">Ошибка ИИ-поиска:</span> {aiError}
+            <button onClick={() => setAiError(null)} className="ml-auto"><X className="w-4 h-4" /></button>
           </div>
         )}
 

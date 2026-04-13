@@ -1,4 +1,8 @@
 import os
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import re
 import io
 import numpy as np
@@ -23,14 +27,149 @@ class DocumentService:
 
     def __init__(self):
         os.makedirs(self.UPLOAD_DIR, exist_ok=True)
-        self.text_cache = {} # {(file_path, mtime): result_dict}
+        self.text_cache = {}
+        self.ocr_engine = None
+        self.ocr_init_error = ""
+        logger.info("DocumentService initialized in lazy OCR mode.")
+
+    def _ensure_ocr_engine(self):
+        if self.ocr_engine is not None:
+            return self.ocr_engine
+        if self.ocr_init_error:
+            raise RuntimeError(self.ocr_init_error)
         try:
-            # Инициализация PaddleOCR (модели скачиваются при первом запуске)
-            self.ocr_engine = PaddleOCR(use_angle_cls=True, lang='ru')
-            logger.info("PaddleOCR engine initialized successfully.")
+            self.ocr_engine = PaddleOCR(lang='ru')
+            logger.info("PaddleOCR engine initialized successfully (lazy).")
+            return self.ocr_engine
         except Exception as e:
-            logger.error(f"Failed to initialize PaddleOCR: {e}")
-            raise RuntimeError(f"OCR Configuration Error: Failed to initialize PaddleOCR: {e}")
+            self.ocr_init_error = f"OCR Configuration Error: {e}"
+            logger.error(self.ocr_init_error, exc_info=True)
+            raise RuntimeError(self.ocr_init_error)
+
+    def _extract_docx_text_safely(self, file_path: str):
+        import docx
+
+        doc = docx.Document(file_path)
+        text_parts = []
+        tables_data = []
+
+        for para in doc.paragraphs:
+            value = (para.text or "").strip()
+            if value:
+                text_parts.append(value)
+
+        for table in doc.tables:
+            table_rows = []
+            for row in table.rows:
+                row_data = [cell.text.strip() for cell in row.cells]
+                if any(cell for cell in row_data):
+                    joined = " | ".join(row_data)
+                    table_rows.append(joined)
+                    text_parts.append(joined)
+            if table_rows:
+                tables_data.append("\n".join(table_rows))
+
+        for section in doc.sections:
+            header = getattr(section, "header", None)
+            footer = getattr(section, "footer", None)
+
+            if header:
+                for para in header.paragraphs:
+                    value = (para.text or "").strip()
+                    if value:
+                        text_parts.append(value)
+
+            if footer:
+                for para in footer.paragraphs:
+                    value = (para.text or "").strip()
+                    if value:
+                        text_parts.append(value)
+
+        full_text = "\n".join(text_parts).strip()
+        pages = [{"page_num": 1, "text": full_text}]
+        if tables_data:
+            pages[0]["tables"] = tables_data
+
+        return full_text, pages
+
+    def _extract_pdf_text_native(self, file_path: str):
+        reader = PdfReader(file_path)
+        pages = []
+        text_pages = []
+
+        for i, page in enumerate(reader.pages):
+            try:
+                extracted = (page.extract_text() or "").strip()
+            except Exception as e:
+                logger.warning(f"Failed to extract text from PDF page {i + 1}: {e}")
+                extracted = ""
+
+            pages.append({"page_num": i + 1, "text": extracted})
+            if extracted:
+                text_pages.append(extracted)
+
+        return "\n".join(text_pages).strip(), pages
+
+    def _normalize_extracted_text(self, text: str) -> str:
+        text = (text or "").replace("\xa0", " ")
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    def _extract_text_from_ocr_result(self, raw_result) -> str:
+        page_lines = []
+
+        if raw_result is None:
+            return ""
+
+        if isinstance(raw_result, list):
+            for item in raw_result:
+                if isinstance(item, list):
+                    for row in item:
+                        if isinstance(row, list) and len(row) >= 2:
+                            maybe_text = row[1]
+                            if isinstance(maybe_text, (list, tuple)) and maybe_text:
+                                value = str(maybe_text[0]).strip()
+                                if value:
+                                    page_lines.append(value)
+                        elif isinstance(row, dict):
+                            value = str(row.get("text") or "").strip()
+                            if value:
+                                page_lines.append(value)
+                elif isinstance(item, dict):
+                    value = str(item.get("text") or "").strip()
+                    if value:
+                        page_lines.append(value)
+
+        elif isinstance(raw_result, dict):
+            rec_texts = raw_result.get("rec_texts") or raw_result.get("texts") or []
+            for value in rec_texts:
+                value = str(value).strip()
+                if value:
+                    page_lines.append(value)
+
+        return "\n".join(page_lines).strip()
+
+    def _ocr_single_image(self, img_array) -> str:
+        engine = self._ensure_ocr_engine()
+        attempts = [
+            ("ocr(img)", lambda: engine.ocr(img_array)),
+            ("ocr([img])", lambda: engine.ocr([img_array])),
+            ("predict(img)", lambda: engine.predict(img_array)),
+            ("predict(input=img)", lambda: engine.predict(input=img_array)),
+        ]
+
+        errors = []
+        for label, attempt in attempts:
+            try:
+                raw = attempt()
+                text = self._extract_text_from_ocr_result(raw)
+                if text:
+                    return text
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+
+        raise RuntimeError(" ; ".join(errors) if errors else "OCR failed with unknown error")
 
     async def save_file(self, file: UploadFile) -> str:
         """Сохраняет загруженный файл"""
@@ -193,24 +332,9 @@ class DocumentService:
 
             if ext == '.docx':
                 result["extract_method"] = "python-docx"
-                import docx
-                doc = docx.Document(file_path)
-                full_text = "\n".join([para.text for para in doc.paragraphs])
-                result["extracted_text"] = full_text
-                result["pages"] = [{"page_num": 1, "text": full_text}]
-                
-                tables_data = []
-                for table in doc.tables:
-                    table_content = []
-                    for row in table.rows:
-                        row_data = [cell.text.strip() for cell in row.cells]
-                        table_content.append(" | ".join(row_data))
-                    tables_data.append("\n".join(table_content))
-                
-                if tables_data:
-                    result["pages"][0]["tables"] = tables_data
-                    result["extracted_text"] += "\n\n--- ТАБЛИЦЫ ---\n" + "\n\n".join(tables_data)
-                
+                full_text, pages = self._extract_docx_text_safely(file_path)
+                result["extracted_text"] = self._normalize_extracted_text(full_text)
+                result["pages"] = pages
                 result["status"] = "success"
             
             elif ext == '.xlsx':
@@ -252,51 +376,56 @@ class DocumentService:
             
             elif ext == '.pdf':
                 result["extract_method"] = "pypdf"
-                reader = PdfReader(file_path)
-                text_pages = []
-                for i, page in enumerate(reader.pages):
-                    try:
-                        extracted = page.extract_text()
-                        if extracted:
-                            text_pages.append(extracted)
-                            result["pages"].append({"page_num": i + 1, "text": extracted})
-                    except Exception as e:
-                        logger.warning(f"Failed to extract text from a PDF page {i+1}: {e}")
-                
-                full_text = "\n".join(text_pages)
-                is_quality_good = self._is_text_quality_good(full_text)
-                
-                if not is_quality_good:
-                    logger.info(f"PDF text quality is POOR. Triggering OCR fallback...")
+                native_text, native_pages = self._extract_pdf_text_native(file_path)
+                native_text = self._normalize_extracted_text(native_text)
+                result["pages"] = native_pages
+
+                if native_text and self._is_text_quality_good(native_text):
+                    result["extracted_text"] = native_text
+                    result["status"] = "success"
+                else:
+                    logger.info("PDF text quality is POOR. Triggering OCR fallback...")
                     result["extract_method"] = "paddleocr"
                     try:
                         ocr_pages = self._perform_ocr(file_path)
-                        result["pages"] = ocr_pages
-                        result["extracted_text"] = "\n\n".join([f"--- Page {p['page_num']} ---\n{p['text']}" for p in ocr_pages])
-                        result["ocr_used"] = True
-                        result["status"] = "success"
+                        ocr_text = self._normalize_extracted_text(
+                            "\n\n".join([f"--- Page {p['page_num']} ---\n{p['text']}" for p in ocr_pages])
+                        )
 
-                        if not result["extracted_text"].strip() or "[OCR WARNING]" in result["extracted_text"]:
+                        if ocr_text:
+                            result["pages"] = ocr_pages
+                            result["extracted_text"] = ocr_text
+                            result["ocr_used"] = True
+                            result["status"] = "success"
+                        elif native_text:
+                            result["pages"] = native_pages
+                            result["extracted_text"] = native_text
+                            result["ocr_used"] = True
+                            result["status"] = "success"
+                            result["error_message"] = "OCR не дал результата, использован нативно извлеченный текст PDF"
+                        else:
+                            result["pages"] = native_pages
+                            result["extracted_text"] = ""
+                            result["ocr_used"] = True
                             result["status"] = "failed_ocr"
-                            result["error_message"] = "OCR отработал, но текст не найден или найден только мусор"
-                            result["extracted_text"] = full_text
-                            result["pages"] = [{"page_num": i + 1, "text": p} for i, p in enumerate(text_pages)]
+                            result["error_message"] = "OCR не дал результата, а нативный текст PDF пуст"
                     except Exception as e:
-                        logger.error(f"OCR failed: {e}")
-                        result["status"] = "failed_ocr"
-                        result["error_message"] = f"OCR failed: {str(e)}"
-                        result["extracted_text"] = full_text
-                        result["pages"] = [{"page_num": i + 1, "text": p} for i, p in enumerate(text_pages)]
+                        logger.error(f"OCR failed: {e}", exc_info=True)
                         result["ocr_used"] = True
-                else:
-                    result["extracted_text"] = full_text
-                    result["status"] = "success"
+
+                        if native_text:
+                            result["pages"] = native_pages
+                            result["extracted_text"] = native_text
+                            result["status"] = "success"
+                            result["error_message"] = f"OCR failed, использован нативный текст PDF: {str(e)}"
+                        else:
+                            result["pages"] = native_pages
+                            result["extracted_text"] = ""
+                            result["status"] = "failed_ocr"
+                            result["error_message"] = f"OCR failed: {str(e)}"
 
                 filename_lower = filename.lower()
-                if result.get("status") == "failed_ocr" and any(x in filename_lower for x in ["нмцк", "обоснование", "смет"]):
-                    result["critical_for_analysis"] = True
-                else:
-                    result["critical_for_analysis"] = False
+                result["critical_for_analysis"] = any(x in filename_lower for x in ["нмцк", "обоснование", "смет"]) and not result.get("extracted_text")
 
             else:
                 result["status"] = "skipped_unsupported_type"
@@ -387,59 +516,40 @@ class DocumentService:
         return True
 
     def _perform_ocr(self, file_path: str) -> List[Dict[str, Any]]:
-        """Вспомогательный метод для OCR распознавания через pypdfium2 и PaddleOCR"""
         import time
         start_time = time.time()
         logger.info(f"Starting OCR for {file_path} using pypdfium2 + PaddleOCR")
-        
-        # Открываем PDF через pypdfium2
+
         pdf = pdfium.PdfDocument(file_path)
-        num_pages = len(pdf)
-        # Ограничиваем количество страниц для OCR (первые 20 для баланса скорости и качества)
-        pages_to_process = min(num_pages, 20)
-        
+        pages_to_process = min(len(pdf), 30)
         ocr_pages = []
-        
-        for i in range(pages_to_process):
-            logger.info(f"Processing page {i+1}/{pages_to_process}...")
-            page = pdf[i]
-            
-            # Рендерим страницу в изображение (scale=2 для 144 DPI, scale=3 для 216 DPI)
-            # PaddleOCR хорошо работает на 144-200 DPI
-            bitmap = page.render(scale=2)
-            pil_image = bitmap.to_pil()
-            
-            # Конвертируем PIL Image в numpy array для PaddleOCR
-            img_array = np.array(pil_image)
-            
-            # Выполняем OCR
-            try:
-                result = self.ocr_engine.ocr(img_array, cls=True)
-            except Exception as e:
-                logger.warning(f"OCR with cls=True failed ({e}), retrying without cls...")
-                result = self.ocr_engine.ocr(img_array)
-            
-            page_text = []
-            if result and result[0]:
-                for line in result[0]:
-                    # line[1][0] - это текст, line[1][1] - это уверенность (confidence)
-                    text_line = line[1][0]
-                    page_text.append(text_line)
-            
-            page_content = "\n".join(page_text)
-            ocr_pages.append({"page_num": i + 1, "text": page_content})
-        
-        pdf.close()
-        
+
+        try:
+            for i in range(pages_to_process):
+                logger.info(f"Processing page {i + 1}/{pages_to_process}...")
+                page = pdf[i]
+                bitmap = page.render(scale=3)
+                pil_image = bitmap.to_pil()
+                img_array = np.array(pil_image)
+
+                page_text = self._ocr_single_image(img_array)
+                page_text = self._normalize_extracted_text(page_text)
+                ocr_pages.append({"page_num": i + 1, "text": page_text})
+        finally:
+            pdf.close()
+
+        full_ocr_text = "\n\n".join([p["text"] for p in ocr_pages]).strip()
         end_time = time.time()
-        
-        full_ocr_text = "\n\n".join([p["text"] for p in ocr_pages])
-        if full_ocr_text.strip():
-            logger.info(f"OCR successful. Extracted {len(full_ocr_text)} characters from {pages_to_process} pages in {end_time - start_time:.2f}s.")
+
+        if full_ocr_text:
+            logger.info(
+                f"OCR successful. Extracted {len(full_ocr_text)} characters from "
+                f"{pages_to_process} pages in {end_time - start_time:.2f}s."
+            )
             return ocr_pages
-        else:
-            logger.warning(f"OCR ran but found no text in {end_time - start_time:.2f}s.")
-            return [{"page_num": 1, "text": "[OCR WARNING] OCR отработал, но текст не найден."}]
+
+        logger.warning(f"OCR ran but found no text in {end_time - start_time:.2f}s.")
+        return [{"page_num": 1, "text": ""}]
 
     def _extract_text_from_doc(self, file_path: str) -> str:
         """

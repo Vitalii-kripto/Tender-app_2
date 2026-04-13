@@ -27,6 +27,8 @@ class AiService:
         self.model_name = GEMINI_MODEL
         self.fallback_model_name = GEMINI_FALLBACK_MODEL
         self.active_model = self.model_name
+        self.last_error_code = ""
+        self.last_error_message = ""
         
         if not self.api_key:
             logger.warning("API_KEY not found in environment variables. AI analysis will be unavailable.")
@@ -166,6 +168,219 @@ class AiService:
 
         return None
 
+    def _clear_last_error(self):
+        self.last_error_code = ""
+        self.last_error_message = ""
+
+    def _set_last_error(self, message: str):
+        message = str(message or "").strip()
+        self.last_error_message = message
+        lower = message.lower()
+        if "429" in lower or "resource_exhausted" in lower or "quota" in lower:
+            self.last_error_code = "QUOTA_EXHAUSTED"
+        elif "503" in lower or "service unavailable" in lower:
+            self.last_error_code = "SERVICE_UNAVAILABLE"
+        elif "timeout" in lower or "deadline exceeded" in lower:
+            self.last_error_code = "TIMEOUT"
+        else:
+            self.last_error_code = "UNKNOWN"
+
+    def _normalize_requirement_text(self, text: str) -> str:
+        text = (text or "").replace("\xa0", " ")
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    def _split_lines_for_requirements(self, text: str) -> list[str]:
+        text = self._normalize_requirement_text(text)
+        lines = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip(" \t\r\n-–—•*")
+            line = self._normalize_requirement_text(line)
+            if len(line) >= 3:
+                lines.append(line)
+        return lines
+
+    def _looks_like_material_line(self, line: str) -> bool:
+        low = line.lower()
+
+        material_keywords = [
+            "техноэласт", "унифлекс", "линокром", "биполь", "филизол",
+            "рубитэкс", "эластобит", "стеклоэласт", "стеклоизол",
+            "гидроизол", "гидростеклоизол", "изоэласт", "тэксослой",
+            "мастика", "праймер", "мембрана", "геотекстиль", "геомембрана",
+            "герметик", "лента", "пароизоляция", "пленка", "рубероид",
+            "шпонка", "битум", "полотно", "стеклоткань", "утеплитель"
+        ]
+
+        service_noise = [
+            "оказание услуг", "выполнение работ", "монтаж", "демонтаж",
+            "доставка", "разгрузка", "согласование", "проектирование",
+            "исполнитель", "заказчик", "договор", "гарантия", "оплата",
+            "этап", "срок выполнения", "штраф", "пеня"
+        ]
+
+        if any(noise in low for noise in service_noise):
+            return False
+
+        if any(keyword in low for keyword in material_keywords):
+            return True
+
+        if re.search(r"\b(тпп|ткп|хпп|хкп|эпп|экп|эмп)\b", low, flags=re.IGNORECASE):
+            return True
+
+        if re.search(r"\b\d+[.,]?\d*\s*(мм|м2|м²|кг|л|рулон|ведро|шт)\b", low):
+            return True
+
+        return False
+
+    def _rule_based_extract_requirement_positions(self, text: str) -> list[dict]:
+        lines = self._split_lines_for_requirements(text)
+        raw_items = []
+
+        quantity_pattern = re.compile(
+            r"(?P<qty>\d+(?:[.,]\d+)?)\s*(?P<unit>м2|м²|м|кг|л|шт|рулон(?:ов)?|ведр(?:о|а|а)|компл(?:ект)?|упак(?:овка)?)",
+            flags=re.IGNORECASE
+        )
+
+        for line in lines:
+            if not self._looks_like_material_line(line):
+                continue
+
+            quantity = ""
+            unit = ""
+            qty_match = quantity_pattern.search(line)
+            if qty_match:
+                quantity = qty_match.group("qty").replace(",", ".")
+                unit = qty_match.group("unit")
+
+            characteristics = []
+            for pattern in [
+                r"(основа[^,;.]*)",
+                r"(толщина[^,;.]*)",
+                r"(масса[^,;.]*)",
+                r"(гибкость[^,;.]*)",
+                r"(теплостойкость[^,;.]*)",
+                r"(цвет[^,;.]*)",
+                r"(гост[^,;.]*)",
+                r"(ту[^,;.]*)",
+                r"(не менее[^,;.]*)",
+                r"(не более[^,;.]*)",
+            ]:
+                for match in re.findall(pattern, line, flags=re.IGNORECASE):
+                    value = self._normalize_requirement_text(match)
+                    if value and value not in characteristics:
+                        characteristics.append(value)
+
+            position_name = line
+            if qty_match:
+                position_name = line[:qty_match.start()].strip(" ,;:-")
+            position_name = re.sub(r"\s{2,}", " ", position_name).strip()
+
+            if not position_name:
+                position_name = line
+
+            raw_items.append({
+                "position_name": position_name,
+                "quantity": quantity,
+                "unit": unit,
+                "characteristics": characteristics,
+                "notes": "",
+                "search_query": position_name,
+            })
+
+        return self._merge_requirement_positions(raw_items)
+
+    def _prepare_requirement_candidate_text(self, text: str) -> str:
+        lines = self._split_lines_for_requirements(text)
+        selected = []
+
+        for idx, line in enumerate(lines):
+            if self._looks_like_material_line(line):
+                start = max(0, idx - 1)
+                end = min(len(lines), idx + 2)
+                for item in lines[start:end]:
+                    if item not in selected:
+                        selected.append(item)
+
+        candidate_text = "\n".join(selected).strip()
+        if candidate_text:
+            return candidate_text[:60000]
+
+        return self._normalize_requirement_text(text)[:60000]
+
+    def _split_text_for_llm(self, text: str, chunk_size: int = 12000, overlap: int = 1200) -> list[str]:
+        text = self._normalize_requirement_text(text)
+        if len(text) <= chunk_size:
+            return [text] if text else []
+
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = min(len(text), start + chunk_size)
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            if end >= len(text):
+                break
+            start = max(0, end - overlap)
+
+        return chunks
+
+    def _merge_requirement_positions(self, items: list[dict]) -> list[dict]:
+        merged = {}
+
+        def normalize_key(value: str) -> str:
+            value = (value or "").lower()
+            value = re.sub(r"[^a-zа-я0-9]+", " ", value, flags=re.IGNORECASE)
+            value = re.sub(r"\s+", " ", value).strip()
+            return value
+
+        for item in items:
+            position_name = str(item.get("position_name") or "").strip()
+            if not position_name:
+                continue
+
+            search_query = str(item.get("search_query") or position_name).strip()
+            key = normalize_key(search_query or position_name)
+            if not key:
+                continue
+
+            characteristics = []
+            for value in item.get("characteristics") or []:
+                value = self._normalize_requirement_text(str(value))
+                if value and value not in characteristics:
+                    characteristics.append(value)
+
+            if key not in merged:
+                merged[key] = {
+                    "position_name": position_name,
+                    "quantity": str(item.get("quantity") or "").strip(),
+                    "unit": str(item.get("unit") or "").strip(),
+                    "characteristics": characteristics,
+                    "notes": str(item.get("notes") or "").strip(),
+                    "search_query": search_query or position_name,
+                }
+                continue
+
+            current = merged[key]
+
+            if not current["quantity"] and item.get("quantity"):
+                current["quantity"] = str(item.get("quantity") or "").strip()
+
+            if not current["unit"] and item.get("unit"):
+                current["unit"] = str(item.get("unit") or "").strip()
+
+            for value in characteristics:
+                if value not in current["characteristics"]:
+                    current["characteristics"].append(value)
+
+            notes = str(item.get("notes") or "").strip()
+            if notes and notes not in current["notes"]:
+                current["notes"] = (current["notes"] + " " + notes).strip()
+
+        return list(merged.values())
+
     def _parse_json_response(self, text: str):
         text = text.strip()
         if text.startswith("```json"):
@@ -182,15 +397,12 @@ class AiService:
             raise HTTPException(status_code=500, detail=f"AI returned invalid JSON: {e}. Raw response: {text}")
 
     def generate_with_search(self, prompt: str) -> str:
-        """
-        Универсальный вызов Gemini с Google Search Grounding.
-        Возвращает сырой текст ответа модели.
-        Используется сервисом подбора аналогов, где модель обязана вернуть JSON.
-        """
         if not self.client:
             logger.error("generate_with_search called without initialized Gemini client.")
+            self._set_last_error("Gemini client is not initialized")
             return ""
 
+        self._clear_last_error()
         logger.info("generate_with_search started.")
 
         try:
@@ -203,12 +415,21 @@ class AiService:
             )
 
             if not response:
+                self._set_last_error("Empty response object from Gemini")
                 logger.warning("generate_with_search returned empty response object.")
                 return ""
 
-            return (response.text or "").strip()
+            text = (response.text or "").strip()
+            if not text:
+                self._set_last_error("Empty response text from Gemini")
+                logger.warning("generate_with_search returned empty response text.")
+                return ""
+
+            self._clear_last_error()
+            return text
 
         except Exception as e:
+            self._set_last_error(str(e))
             logger.error(f"generate_with_search failed: {e}", exc_info=True)
             return ""
 
@@ -377,65 +598,72 @@ class AiService:
 
     def extract_tender_requirement_positions(self, text: str):
         """
-        Извлекает из ТЗ только поставляемые материальные позиции и их характеристики.
-        Используется для вкладки «Подбор аналогов».
+        Извлекает из ТЗ поставляемые материальные позиции.
+        Алгоритм:
+        1. Всегда строит rule-based fallback.
+        2. Если AI доступен — дополнительно прогоняет сжатый текст через модель.
+        3. Объединяет и дедуплицирует результат.
         """
-        if not self.client:
+        text = self._normalize_requirement_text(text)
+        if not text:
             return []
 
         logger.info(f"Extracting tender requirement positions. Length: {len(text)}")
 
-        prompt = f"""
-        Роль: старший инженер-сметчик и эксперт по строительным материалам.
+        fallback_items = self._rule_based_extract_requirement_positions(text)
 
-        Задача:
-        1. Извлечь из текста ТЗ только материальные позиции, которые нужно поставить.
-        2. Игнорировать работы, услуги, организационные требования, этапы выполнения работ, условия договора и общие фразы.
-        3. Если одна и та же позиция упоминается несколько раз, объединить ее в одну запись.
-        4. Для каждой позиции выделить только явно указанные характеристики.
-        5. Нельзя додумывать характеристики, которых нет в тексте.
+        if not self.client:
+            logger.warning("AI client is unavailable. Returning rule-based requirement extraction.")
+            return fallback_items
 
-        Для каждой позиции вернуть:
-        - position_name: нормализованное название требуемого материала/товара;
-        - quantity: количество строкой, если найдено;
-        - unit: единица измерения, если найдена;
-        - characteristics: массив строк с характеристиками и ограничениями;
-        - notes: краткая заметка, если есть важная оговорка;
-        - search_query: короткий нормализованный запрос для поиска аналога.
+        candidate_text = self._prepare_requirement_candidate_text(text)
+        chunks = self._split_text_for_llm(candidate_text, chunk_size=12000, overlap=1000)
 
-        Примеры характеристик:
-        - Основа: полиэфир
-        - Толщина: не менее 4,0 мм
-        - Гибкость на брусе: не выше -25 °C
-        - Тип: рулонный наплавляемый
-        - Цвет: серый
-        - ГОСТ/ТУ: ...
-        - Фасовка: 20 кг
+        ai_items = []
 
-        Верни СТРОГО JSON-массив, без markdown и без пояснений.
+        for chunk_index, chunk in enumerate(chunks[:6], start=1):
+            prompt = f"""
+            Роль: старший инженер-сметчик и эксперт по строительным материалам.
 
-        ТЕКСТ ТЗ:
-        {text[:25000]}
-        """
+            Нужно извлечь только поставляемые материальные позиции из фрагмента ТЗ.
+            Игнорируй работы, услуги, этапы, договорные условия, требования к участнику и общие формулировки.
+            Нельзя додумывать характеристики, которых нет в тексте.
+            Если одна и та же позиция встречается несколько раз, возвращай одну нормализованную запись.
 
-        try:
-            response = self._call_ai_with_retry(
-                self.client.models.generate_content,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
+            Верни СТРОГО JSON-массив.
+            Формат каждой записи:
+            {{
+              "position_name": "нормализованное название материала",
+              "quantity": "количество строкой",
+              "unit": "единица измерения",
+              "characteristics": ["список характеристик"],
+              "notes": "важная оговорка",
+              "search_query": "короткий поисковый запрос"
+            }}
+
+            ФРАГМЕНТ ТЗ:
+            {chunk}
+            """
+
+            try:
+                response = self._call_ai_with_retry(
+                    self.client.models.generate_content,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
                 )
-            )
-            data = self._parse_json_response(response.text)
-            if isinstance(data, list):
-                return data
-            return []
-        except Exception as e:
-            from fastapi import HTTPException
-            if isinstance(e, HTTPException):
-                raise e
-            logger.error(f"Requirement extraction error: {e}", exc_info=True)
-            return []
+                part = self._parse_json_response(response.text)
+                if isinstance(part, list):
+                    ai_items.extend(part)
+            except Exception as e:
+                logger.warning(
+                    f"Requirement extraction chunk {chunk_index} failed, "
+                    f"rule-based fallback will be used for this fragment: {e}"
+                )
+
+        merged = self._merge_requirement_positions(fallback_items + ai_items)
+        return merged
 
     def compare_requirements_vs_proposal(self, requirements_text: str, proposal_json_str: str):
         """
