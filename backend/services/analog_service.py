@@ -34,7 +34,10 @@ class AnalogService:
     def _tokenize(self, text: str) -> list[str]:
         stopwords = {
             "и", "или", "для", "по", "на", "с", "из", "под", "над", "в",
-            "материал", "товар", "требуется", "аналог", "серый", "черный"
+            "материал", "товар", "требуется", "аналог", "серый", "черный",
+            "поставка", "закупка", "техническое", "задание", "описание",
+            "объекта", "документация", "характеристики", "требования",
+            "кровельный", "рулонный", "битумно", "полимерное"
         }
         tokens = []
         for token in self._normalize_text(text).split():
@@ -284,18 +287,16 @@ class AnalogService:
         query: str,
         category: str = None,
         limit: int = 10,
-        requirements: str = None,   # добавлен параметр, принимается но не используется
+        requirements: str = None,
     ) -> list:
         """
         Поиск аналогов в локальной БД с предварительной очисткой запроса.
         Поддерживает поиск по нескольким ключевым словам одновременно.
-        Исключает нерелевантные категории (вентиляция, тепловое оборудование).
         """
         import re
         from sqlalchemy import text
         import json as json_lib
 
-        # Шаг 1: Очищаем запрос
         clean_query = self._clean_search_query(query)
         if not clean_query:
             logger.warning(f"[AnalogService] Empty query after cleaning: '{query}'")
@@ -306,34 +307,25 @@ class AnalogService:
             f"raw='{query[:60]}' -> clean='{clean_query}' | category={category}"
         )
 
-        # Шаг 2: Очищаем запрос и разбиваем на ключевые слова
-        clean_query = self._clean_search_query(query)
-        if not clean_query:
-            logger.warning(
-                f"[AnalogService] Empty query after cleaning: '{query}'"
-            )
-            return []
-
-        # Разбиваем на слова
-        import re
         raw_keywords = re.split(r"[\s,;/\(\)]+", clean_query)
 
-        # Список стоп-слов которые не несут смысловой нагрузки
         STOP_WORDS = {
             "не", "и", "или", "для", "на", "в", "с", "по", "из",
             "указано", "штука", "штук", "шт", "кг", "м2", "рул",
             "рулон", "упак", "литр", "единица", "ед", "марка",
             "тип", "вид", "класс", "материал", "товар", "продукт",
+            "поставка", "закупка", "техническое", "задание", "описание",
+            "объекта", "документация", "характеристики", "требования"
         }
 
         keywords = [
             kw.strip().lower()
             for kw in raw_keywords
-            if len(kw.strip()) > 2           # минимум 3 символа
+            if len(kw.strip()) > 2
             and kw.strip().lower() not in STOP_WORDS
-            and not kw.strip().isdigit()      # не чисто цифровое
+            and not kw.strip().isdigit()
             and kw.strip() not in ("*", "/", "|", "(", ")", "-")
-        ][:5]  # максимум 5 значимых слов
+        ][:5]
 
         if not keywords:
             logger.warning(
@@ -347,16 +339,9 @@ class AnalogService:
             f"(from clean query: '{clean_query}')"
         )
 
-        # Шаг 3: Категории которые исключаем из поиска
-        EXCLUDED_CATEGORIES = [
-            "воздушные завесы", "тепловентиляционное", "дестратификатор",
-            "аэратор", "водяные завесы", "завесы без нагрева",
-        ]
-
         results = []
         try:
             with self.db_session_factory() as session:
-                # Строим OR-условие: товар содержит ХОТЯ БЫ ОДНО из ключевых слов
                 conditions = []
                 params = {}
                 for i, kw in enumerate(keywords):
@@ -371,21 +356,11 @@ class AnalogService:
 
                 where = " OR ".join(conditions)
 
-                # Исключаем нерелевантные категории
-                excl_conds = []
-                for j, excl in enumerate(EXCLUDED_CATEGORIES):
-                    ename = f"excl{j}"
-                    excl_conds.append(f"LOWER(category) NOT LIKE :{ename}")
-                    params[ename] = f"%{excl}%"
-                if excl_conds:
-                    where = f"({where}) AND {' AND '.join(excl_conds)}"
-
-                # Фильтр по категории если задан
                 if category:
-                    where += " AND LOWER(category) LIKE :user_cat"
+                    where = f"({where}) AND LOWER(category) LIKE :user_cat"
                     params["user_cat"] = f"%{category.lower()}%"
 
-                params["lim"] = limit * 3  # берём с запасом для сортировки
+                params["lim"] = limit * 3
 
                 sql = text(
                     f"SELECT id, title, category, material_type, price, "
@@ -394,7 +369,6 @@ class AnalogService:
                 )
                 rows = session.execute(sql, params).fetchall()
 
-                # Шаг 4: Вычисляем score релевантности для сортировки
                 for row in rows:
                     specs = {}
                     if row.specs:
@@ -410,7 +384,6 @@ class AnalogService:
                     title_lower = (row.title or "").lower()
                     desc_lower = (row.description or "").lower()
 
-                    # Считаем сколько ключевых слов встречается в названии
                     score = sum(1 for kw in keywords if kw in title_lower) * 3
                     score += sum(1 for kw in keywords if kw in desc_lower)
 
@@ -427,12 +400,9 @@ class AnalogService:
                         "_score": score,
                     })
 
-                # Сортируем по релевантности
                 results.sort(key=lambda x: x.get("_score", 0), reverse=True)
-                # Убираем служебное поле
                 for r in results:
                     r.pop("_score", None)
-                # Обрезаем до лимита
                 results = results[:limit]
 
         except Exception as e:

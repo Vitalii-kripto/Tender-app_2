@@ -456,6 +456,191 @@ def build_notice_from_tender_model(tender: TenderModel) -> Notice:
         application_deadline=tender.deadline or "",
     )
 
+def _matching_norm(value: str) -> str:
+    value = (value or "").lower().replace("\xa0", " ")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _text_has_product_signals(text: str) -> bool:
+    low = _matching_norm(text)
+    if not low:
+        return False
+
+    score = 0
+
+    material_terms = [
+        "гидроизол", "техноэласт", "унифлекс", "линокром", "биполь", "филизол",
+        "рубитэкс", "эластобит", "стеклоэласт", "стеклоизол", "гидростеклоизол",
+        "изоэласт", "мостослой", "тэксослой", "мастика", "праймер", "мембрана",
+        "герметик", "лента", "геотекстиль", "геомембрана", "шпонка", "пароизоляция"
+    ]
+    tech_terms = [
+        "характерист", "основа", "толщин", "масса", "гибкост", "теплостойк",
+        "маркировк", "рулон", "кг", "мм", "м2", "м²", "ед. изм", "количество"
+    ]
+
+    if any(term in low for term in material_terms):
+        score += 3
+    if any(term in low for term in tech_terms):
+        score += 2
+    if re.search(r"\b(тпп|ткп|хпп|хкп|эпп|экп|эмп)\b", low, flags=re.IGNORECASE):
+        score += 4
+    if re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон)\b", low, flags=re.IGNORECASE):
+        score += 2
+
+    return score >= 4
+
+
+def classify_document_for_matching(filename: str, extracted_text: str) -> str:
+    name = _matching_norm(filename)
+    text = _matching_norm((extracted_text or "")[:12000])
+    joined = f"{name} {text}".strip()
+
+    if not joined:
+        return "other"
+
+    if any(term in joined for term in ["нмцд", "нмцк", "обоснован", "расчет нмц", "смет"]):
+        return "price_calc"
+
+    if any(term in joined for term in [
+        "нац режим", "национальн", "страна происх", "реестр российск",
+        "ограничени", "запрет", "преференц"
+    ]):
+        return "national_regime"
+
+    if any(term in joined for term in [
+        "инструкц", "заявк", "образц", "форма ", "требовани к содержанию",
+        "критерии оценки", "участник закупки"
+    ]):
+        return "application_docs"
+
+    if any(term in joined for term in [
+        "техническое задание", "техзадание", "тз", "описание объекта закупки",
+        "спецификац", "ведомость материалов", "перечень материалов",
+        "товарная номенклатура", "технические характеристики"
+    ]):
+        return "tender_spec"
+
+    if any(term in joined for term in ["договор", "контракт", "проект договора", "проект контракта"]):
+        if _text_has_product_signals(text):
+            return "contract_mixed"
+        return "contract_legal"
+
+    if any(term in joined for term in ["извещение", "notice", "информационная карта"]):
+        return "notice"
+
+    if _text_has_product_signals(joined):
+        return "mixed"
+
+    return "other"
+
+
+def fragment_relevance_for_matching(fragment: str, role: str) -> int:
+    low = _matching_norm(fragment)
+    if not low:
+        return 0
+
+    score = 0
+
+    positive_terms = [
+        "техническое задание", "описание объекта закупки", "спецификац",
+        "наименование товара", "характерист", "материал", "товар", "поставка",
+        "основа", "толщин", "масса", "гибкост", "теплостойк"
+    ]
+    negative_terms = [
+        "оплата", "штраф", "пеня", "неустойк", "расторжен", "ответственность",
+        "реквизит", "участник закупки", "инструкция", "критерии оценки",
+        "нмцд", "нмцк", "обоснован", "нац режим", "реестр", "банковская гарантия",
+        "обеспечение исполнения", "срок оплаты", "порядок расчетов"
+    ]
+
+    if role in {"tender_spec", "contract_mixed", "mixed"}:
+        score += 3
+
+    if any(term in low for term in positive_terms):
+        score += 4
+
+    if re.search(r"\b(тпп|ткп|хпп|хкп|эпп|экп|эмп)\b", low, flags=re.IGNORECASE):
+        score += 4
+
+    if re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон)\b", low, flags=re.IGNORECASE):
+        score += 2
+
+    if _text_has_product_signals(low):
+        score += 3
+
+    negative_hits = sum(1 for term in negative_terms if term in low)
+    score -= negative_hits * 2
+
+    if re.search(r"\.(docx?|pdf|xlsx?|xls)\b", low, flags=re.IGNORECASE):
+        score -= 3
+    if re.search(r"\bстр\.?\s*\d+\b", low, flags=re.IGNORECASE):
+        score -= 2
+
+    if len(low) < 25:
+        score -= 2
+
+    return score
+
+
+def extract_requirement_fragments_from_document_data(
+    doc_data: Dict[str, Any],
+    role: str,
+    max_chars_per_file: int = 24000
+) -> List[str]:
+    filename = doc_data.get("filename", "Unknown")
+    pages = doc_data.get("pages", []) or []
+    fragments_with_score: List[tuple[int, str]] = []
+
+    def _push_fragment(page_num: Any, raw_text: str):
+        if not raw_text:
+            return
+
+        raw_text = str(raw_text).replace("\xa0", " ")
+        raw_text = re.sub(r"\n{3,}", "\n\n", raw_text).strip()
+        if not raw_text:
+            return
+
+        for block in re.split(r"\n\s*\n+", raw_text):
+            block = block.strip()
+            if not block:
+                continue
+
+            score = fragment_relevance_for_matching(block, role)
+            threshold = 4 if role in {"tender_spec", "contract_mixed", "mixed"} else 7
+            if score < threshold:
+                continue
+
+            cleaned = block[:3500].strip()
+            if not cleaned:
+                continue
+
+            header = f"[FILE: {filename} | PAGE: {page_num} | ROLE: {role} | SCORE: {score}]"
+            fragments_with_score.append((score, header + "\n" + cleaned))
+
+    for page in pages:
+        page_num = page.get("page_num", "")
+        page_text = page.get("text", "") or ""
+        tables = page.get("tables", []) or []
+
+        _push_fragment(page_num, page_text)
+
+        for table_text in tables:
+            _push_fragment(page_num, table_text)
+
+    fragments_with_score.sort(key=lambda item: item[0], reverse=True)
+
+    selected: List[str] = []
+    total_chars = 0
+    for _, fragment in fragments_with_score:
+        if total_chars + len(fragment) > max_chars_per_file:
+            break
+        selected.append(fragment)
+        total_chars += len(fragment)
+
+    return selected
+
 # --- DEGRADED MODE CHECKS ---
 def check_eis_service():
     if not eis_service:
@@ -739,25 +924,24 @@ async def parse_catalog_endpoint(db: Session = Depends(get_db), _ = Depends(chec
 
 def collect_tender_text_for_matching(tender: TenderModel) -> Dict[str, Any]:
     """
-    Собирает текст ТЗ для подбора аналогов.
-    Приоритет:
-    1. extracted_text из БД
-    2. тексты файлов из папки тендера
-    3. description из CRM, если документов нет
+    Собирает источник для подбора аналогов не из целых документов,
+    а только из релевантных товарно-технических фрагментов.
     """
-    chunks: List[str] = []
+    fragments: List[str] = []
     warnings: List[Dict[str, Any]] = []
     files_used: List[str] = []
-
-    if tender.extracted_text and tender.extracted_text.strip():
-        chunks.append(f"[EXTRACTED_TEXT_FROM_DB]\\n{tender.extracted_text.strip()}")
+    fragments_meta: List[Dict[str, Any]] = []
 
     tender_dir = os.path.join(DOCUMENTS_ROOT, tender.id)
+    files_found = 0
+
     if os.path.isdir(tender_dir) and doc_service:
         for filename in sorted(os.listdir(tender_dir)):
             file_path = os.path.join(tender_dir, filename)
             if not os.path.isfile(file_path):
                 continue
+
+            files_found += 1
 
             try:
                 data = doc_service.extract_document_data(file_path)
@@ -772,28 +956,48 @@ def collect_tender_text_for_matching(tender: TenderModel) -> Dict[str, Any]:
             status = data.get("status", "")
             extracted_text = (data.get("extracted_text") or "").strip()
 
-            if status == "success" and extracted_text:
-                chunks.append(f"[FILE: {filename}]\\n{extracted_text[:50000]}")
-                files_used.append(filename)
-            else:
+            if status != "success" or not extracted_text:
                 warnings.append({
                     "filename": filename,
-                    "status": status,
+                    "status": status or "empty",
                     "message": data.get("error_message") or "Текст не извлечен",
                 })
+                continue
 
-    if not chunks and (tender.description or "").strip():
-        chunks.append(f"[CRM_DESCRIPTION]\\n{tender.description.strip()}")
+            role = classify_document_for_matching(filename, extracted_text)
+            relevant_fragments = extract_requirement_fragments_from_document_data(data, role)
+
+            if not relevant_fragments:
+                warnings.append({
+                    "filename": filename,
+                    "status": "no_relevant_fragments",
+                    "message": f"Документ прочитан, но релевантные товарно-технические фрагменты не найдены (role={role})",
+                })
+                continue
+
+            fragments.extend(relevant_fragments)
+            files_used.append(filename)
+            fragments_meta.append({
+                "filename": filename,
+                "role": role,
+                "fragments_count": len(relevant_fragments),
+            })
+
+    # CRM description использовать только как крайний fallback,
+    # если у тендера нет локальных документов вообще.
+    if not fragments and files_found == 0 and (tender.description or "").strip():
+        fragments.append(f"[CRM_DESCRIPTION_FALLBACK]\\n{tender.description.strip()}")
         warnings.append({
             "filename": "CRM_DESCRIPTION",
             "status": "warning",
-            "message": "Документы тендера не найдены или не прочитаны. Использовано описание из CRM.",
+            "message": "Документы тендера отсутствуют. Использовано только описание из CRM как аварийный fallback.",
         })
 
     return {
-        "text": "\\n\\n".join(chunks),
+        "text": "\\n\\n".join(fragments).strip(),
         "warnings": warnings,
         "files_used": files_used,
+        "fragments_meta": fragments_meta,
     }
 
 # --- AI & DOCS ENDPOINTS ---

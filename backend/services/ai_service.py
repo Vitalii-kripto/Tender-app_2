@@ -111,78 +111,96 @@ class AiService:
     def _call_ai_with_retry(self, method, **kwargs):
         """
         Унифицированный вызов ИИ с логированием, повторами и переключением на fallback.
+        ВАЖНО:
+        - при 429 на primary выполняется немедленный переход на fallback без ожидания;
+        - если 429 уже на fallback, вызов завершается с ошибкой;
+        - при успешном ответе с fallback она становится active_model для следующих вызовов.
         """
         if not self.client:
             raise Exception("Gemini Client not initialized")
-        
+
         if not self.active_model:
             raise Exception("Внешний AI-сервис временно недоступен, анализ не завершен")
 
         max_retries = 4
-        # Используем текущую активную модель как стартовую для этого вызова
-        current_attempt_model = self.active_model
-        start_overall = time.time()
-        
-        # Если модель не передана в kwargs, используем активную
-        if 'model' not in kwargs:
-            kwargs['model'] = current_attempt_model
+        kwargs["model"] = kwargs.get("model") or self.active_model
+        quota_switched = False
 
         for attempt in range(1, max_retries + 1):
             attempt_start = time.time()
+
             try:
-                # Логируем попытку
                 logger.info(f"AI Call Attempt {attempt}/{max_retries} | Model: {kwargs['model']}")
-                
                 response = method(**kwargs)
-                
+
                 duration = time.time() - attempt_start
                 logger.info(f"AI Call Success | Attempt: {attempt} | Duration: {duration:.2f}s")
-                
-                # Если вызов был успешен с моделью, отличной от текущей активной (fallback),
-                # обновляем активную модель для всего сервиса
-                if kwargs['model'] != self.active_model:
-                    logger.warning(f"Dynamic model switch: {self.active_model} -> {kwargs['model']} (Success after retry)")
-                    self.active_model = kwargs['model']
-                
+
+                if kwargs["model"] != self.active_model:
+                    logger.warning(
+                        f"Dynamic model switch: {self.active_model} -> {kwargs['model']} (Success after retry)"
+                    )
+                    self.active_model = kwargs["model"]
+
                 return response
 
             except Exception as e:
                 duration = time.time() - attempt_start
+                error_text = str(e)
+                lower_error = error_text.lower()
+
                 is_transient = self._is_transient_error(e)
-                
-                # Логируем ошибку
+                is_quota = (
+                    "429" in error_text
+                    or "resource_exhausted" in lower_error
+                    or "quota" in lower_error
+                )
+
                 error_type = "TRANSIENT" if is_transient else "FATAL"
                 logger.warning(
                     f"AI Call Failed ({error_type}) | Attempt: {attempt} | "
                     f"Model: {kwargs['model']} | Duration: {duration:.2f}s | Error: {e}"
                 )
 
+                if is_quota:
+                    if (
+                        kwargs["model"] != self.fallback_model_name
+                        and self.fallback_model_name
+                    ):
+                        logger.warning(
+                            f"[AIService] Quota exhausted on primary model {kwargs['model']}. "
+                            f"Immediate switch to fallback model: {self.fallback_model_name}"
+                        )
+                        kwargs["model"] = self.fallback_model_name
+                        quota_switched = True
+                        continue
+
+                    logger.error(
+                        f"[AIService] Quota exhausted on model {kwargs['model']}. "
+                        f"Fallback already used or unavailable. Stopping AI call."
+                    )
+                    raise
+
                 if not is_transient or attempt == max_retries:
-                    # Если ошибка не временная или попытки исчерпаны
                     if is_transient:
                         logger.error(f"AI Call: All {max_retries} attempts exhausted for transient errors.")
                     raise Exception("Внешний AI-сервис временно недоступен, анализ не завершен") from e
 
-                # Переключение на fallback после половины попыток, если мы еще на основной модели
-                if attempt == max_retries // 2 and kwargs['model'] == self.model_name and self.fallback_model_name:
-                    logger.warning(f"Attempt {attempt} failed. Switching to fallback model for remaining retries: {self.fallback_model_name}")
-                    kwargs['model'] = self.fallback_model_name
-
-                # При 429 RESOURCE_EXHAUSTED — это дневной лимит,
-                # повторные попытки с паузой БЕССМЫСЛЕННЫ.
-                # Прерываем немедленно без ожидания.
-                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                if (
+                    attempt == max_retries // 2
+                    and kwargs["model"] == self.model_name
+                    and self.fallback_model_name
+                    and not quota_switched
+                ):
                     logger.warning(
-                        f"[AIService] 429 RESOURCE_EXHAUSTED on attempt {attempt}. "
-                        f"Daily quota likely exhausted. Stopping immediately "
-                        f"(no retry — waiting would not help)."
+                        f"Attempt {attempt} failed. Switching to fallback model for remaining retries: "
+                        f"{self.fallback_model_name}"
                     )
-                    raise  # сразу пробрасываем исключение, не ждём
-                else:
-                    # Стандартный backoff: 3, 5, 9 секунд
-                    wait_time = [3, 5, 9][min(attempt, 2)]
-                    logger.info(f"Waiting {wait_time}s before next retry...")
-                    time.sleep(wait_time)
+                    kwargs["model"] = self.fallback_model_name
+
+                wait_time = [3, 5, 9][min(attempt, 2)]
+                logger.info(f"Waiting {wait_time}s before next retry...")
+                time.sleep(wait_time)
 
         return None
 
@@ -209,47 +227,247 @@ class AiService:
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
-    def _split_lines_for_requirements(self, text: str) -> list[str]:
+    def _remove_source_artifacts(self, text: str) -> str:
         text = self._normalize_requirement_text(text)
-        lines = []
+        if not text:
+            return ""
+
+        # Убираем служебные метки файлов/страниц, если они попали в текст.
+        text = re.sub(r"\[FILE:[^\]]+\]", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\[CRM_DESCRIPTION_FALLBACK\]", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"===\s*ФАЙЛ:[^\n]+", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"---\s*СТРАНИЦА/ЛИСТ:[^\n]+", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\.(docx?|pdf|xlsx?|xls)\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bстр\.?\s*\d+\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+\|\s+", " | ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+    def _is_noise_line_for_requirements(self, line: str) -> bool:
+        low = (line or "").lower().strip()
+        if not low:
+            return True
+
+        product_like = (
+            any(term in low for term in [
+                "гидроизол", "техноэласт", "унифлекс", "линокром", "биполь",
+                "филизол", "рубитэкс", "эластобит", "стеклоэласт", "стеклоизол",
+                "гидростеклоизол", "изоэласт", "мостослой", "тэксослой", "мастика",
+                "праймер", "мембрана", "герметик", "лента", "геотекстиль",
+                "геомембрана", "шпонка", "пароизоляция"
+            ])
+            or bool(re.search(r"\b(тпп|ткп|хпп|хкп|эпп|экп|эмп)\b", low, flags=re.IGNORECASE))
+        )
+
+        if product_like and re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон)\b", low):
+            return False
+
+        noise_terms = [
+            "оплата", "штраф", "пеня", "неустойк", "расторжен", "ответственность",
+            "реквизит", "участник закупки", "инструкция", "образцы форм", "критерии оценки",
+            "нмцд", "нмцк", "обоснован", "нац режим", "реестр", "банковская гарантия",
+            "обеспечение исполнения", "порядок расчетов", "срок оплаты", "извещение",
+            "подача заявок", "комиссия", "жалоб", "протокол", "контактн"
+        ]
+
+        if any(term in low for term in noise_terms) and not product_like:
+            return True
+
+        if re.search(r"\.(docx?|pdf|xlsx?|xls)\b", low, flags=re.IGNORECASE):
+            return True
+        if re.search(r"\bстр\.?\s*\d+\b", low, flags=re.IGNORECASE):
+            return True
+
+        return False
+
+
+    def _split_text_into_semantic_blocks(self, text: str) -> list[str]:
+        text = self._remove_source_artifacts(text)
+        if not text:
+            return []
+
+        raw_blocks = re.split(r"\n\s*\n+", text)
+        blocks: list[str] = []
+
+        for raw in raw_blocks:
+            raw = raw.strip()
+            if not raw:
+                continue
+
+            # Сохраняем таблицы и пайп-строки как отдельные блоки.
+            if "|" in raw and raw.count("|") >= 2:
+                blocks.append(raw)
+                continue
+
+            if len(raw) <= 5000:
+                blocks.append(raw)
+                continue
+
+            # Если блок слишком большой, дробим по строкам.
+            lines = [line.strip() for line in raw.splitlines() if line.strip()]
+            chunk: list[str] = []
+            current_len = 0
+
+            for line in lines:
+                if current_len + len(line) > 2500 and chunk:
+                    blocks.append("\n".join(chunk).strip())
+                    chunk = []
+                    current_len = 0
+
+                chunk.append(line)
+                current_len += len(line) + 1
+
+            if chunk:
+                blocks.append("\n".join(chunk).strip())
+
+        return blocks
+
+
+    def _score_requirement_block(self, block: str) -> int:
+        low = (block or "").lower().strip()
+        if not low:
+            return 0
+
+        score = 0
+
+        positive_terms = [
+            "техническое задание", "описание объекта закупки", "спецификац",
+            "ведомость материалов", "наименование товара", "характерист",
+            "материал", "товар", "поставка", "основа", "толщин",
+            "масса", "гибкост", "теплостойк"
+        ]
+        negative_terms = [
+            "оплата", "штраф", "пеня", "неустойк", "расторжен", "ответственность",
+            "реквизит", "участник закупки", "инструкция", "заявка", "критерии оценки",
+            "нмцд", "нмцк", "обоснован", "нац режим", "реестр", "банковская гарантия",
+            "обеспечение исполнения", "порядок расчетов", "срок оплаты"
+        ]
+
+        if any(term in low for term in positive_terms):
+            score += 4
+        if re.search(r"\b(тпп|ткп|хпп|хкп|эпп|экп|эмп)\b", low, flags=re.IGNORECASE):
+            score += 4
+        if re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон)\b", low, flags=re.IGNORECASE):
+            score += 2
+        if any(term in low for term in [
+            "гидроизол", "техноэласт", "унифлекс", "линокром", "биполь", "филизол",
+            "рубитэкс", "эластобит", "стеклоэласт", "стеклоизол", "гидростеклоизол",
+            "изоэласт", "мастика", "праймер", "мембрана", "герметик", "лента"
+        ]):
+            score += 3
+
+        score -= sum(1 for term in negative_terms if term in low) * 2
+
+        if "|" in low and re.search(r"\.(docx?|pdf|xlsx?|xls)\b", low, flags=re.IGNORECASE):
+            score -= 4
+
+        if len(low) < 20:
+            score -= 2
+
+        return score
+
+
+    def _select_requirement_relevant_blocks(self, text: str, max_chars: int = 55000) -> str:
+        blocks = self._split_text_into_semantic_blocks(text)
+        if not blocks:
+            return self._remove_source_artifacts(text)[:max_chars]
+
+        scored_blocks: list[tuple[int, str]] = []
+        for block in blocks:
+            score = self._score_requirement_block(block)
+            if score >= 3:
+                scored_blocks.append((score, block))
+
+        if not scored_blocks:
+            # Если автоматический фильтр не нашел хороших блоков,
+            # возвращаем нормализованный текст, но без source-artifacts.
+            return self._remove_source_artifacts(text)[:max_chars]
+
+        scored_blocks.sort(key=lambda item: item[0], reverse=True)
+
+        selected: list[str] = []
+        total_len = 0
+        for _, block in scored_blocks:
+            if total_len + len(block) > max_chars:
+                break
+            selected.append(block)
+            total_len += len(block)
+
+        return "\n\n".join(selected).strip()
+
+
+    def _split_lines_for_requirements(self, text: str) -> list[str]:
+        text = self._remove_source_artifacts(text)
+        lines: list[str] = []
+
         for raw_line in text.splitlines():
             line = raw_line.strip(" \t\r\n-–—•*")
             line = self._normalize_requirement_text(line)
-            if len(line) >= 3:
+
+            if not line:
+                continue
+
+            # Если строка табличная/pipe-строка, берем наиболее осмысленную ячейку,
+            # а не всю строку целиком.
+            if "|" in line:
+                cells = [cell.strip(" \t\r\n-–—•*") for cell in line.split("|")]
+                good_cells = []
+                for cell in cells:
+                    cell = self._normalize_requirement_text(cell)
+                    if not cell:
+                        continue
+                    if self._is_noise_line_for_requirements(cell):
+                        continue
+                    if re.search(r"\.(docx?|pdf|xlsx?|xls)\b", cell, flags=re.IGNORECASE):
+                        continue
+                    if re.search(r"\bстр\.?\s*\d+\b", cell, flags=re.IGNORECASE):
+                        continue
+                    good_cells.append(cell)
+
+                if good_cells:
+                    line = max(good_cells, key=len)
+                else:
+                    continue
+
+            if self._is_noise_line_for_requirements(line):
+                continue
+
+            if 3 <= len(line) <= 350:
                 lines.append(line)
+
         return lines
 
-    def _is_specification_line(self, line: str) -> bool:
-        low = line.lower()
 
-        # 1. Исключаем явный юридический/процедурный мусор
-        service_noise = [
-            "оказание услуг", "выполнение работ", "монтаж", "демонтаж",
-            "доставка", "разгрузка", "согласование", "проектирование",
-            "исполнитель", "заказчик", "договор", "гарантия", "оплата",
-            "срок выполнения", "штраф", "пеня", "неустойка",
-            "требования к участникам", "обеспечение заявки", "порядок оценки",
-            "инструкция по заполнению", "котировочная заявка"
-        ]
-        if any(noise in low for noise in service_noise):
+    def _looks_like_material_line(self, line: str) -> bool:
+        low = (line or "").lower().strip()
+        if not low:
             return False
 
-        # 2. Универсальный признак: Число + Единица измерения
-        # Покрывает любые товары: 5 шт (компьютеры), 10 кг (картошка), 100 м (кабель)
-        if re.search(r"\b\d+[.,]?\d*\s*(шт|штук|кг|г|т|тонн|м|метр|м2|м²|кв\.м|м3|куб|л|литр|компл|упак|набор|усл\.?\s*ед|пачк|рулон|ведр|ампул|флакон|доз)\b", low):
-            return True
+        if self._is_noise_line_for_requirements(low):
+            return False
 
-        # 3. Универсальный признак: Стандарты качества
-        if re.search(r"\b(гост|ту|iso|din|снип|санпин|марка|модель|артикул)\b", low):
-            return True
+        material_keywords = [
+            "техноэласт", "унифлекс", "линокром", "биполь", "филизол",
+            "рубитэкс", "эластобит", "стеклоэласт", "стеклоизол",
+            "гидроизол", "гидростеклоизол", "изоэласт", "мостослой",
+            "тэксослой", "мастика", "праймер", "мембрана", "геотекстиль",
+            "геомембрана", "герметик", "лента", "пароизоляция", "шпонка"
+        ]
 
-        # 4. Заголовки таблиц спецификаций
-        table_headers = ["наименование", "количество", "ед. изм", "единица изм", "характеристика", "показатель", "требование", "значение"]
-        if sum(1 for h in table_headers if h in low) >= 2:
-            return True
+        has_material = any(keyword in low for keyword in material_keywords)
+        has_mark = bool(re.search(r"\b(тпп|ткп|хпп|хкп|эпп|экп|эмп)\b", low, flags=re.IGNORECASE))
+        has_qty = bool(re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон)\b", low, flags=re.IGNORECASE))
+        has_tech = any(term in low for term in ["основа", "толщин", "масса", "гибкост", "теплостойк", "характерист"])
 
-        # 5. Специфичные маркеры (оставляем для надежности, но они больше не главные)
-        if re.search(r"\b(тпп|ткп|хпп|хкп|эпп|экп|эмп)\b", low, flags=re.IGNORECASE):
+        # Строка считается товарной, если:
+        # - есть материал/марка;
+        # - или есть материал + тех.характеристика;
+        # - или есть марка + количество/единица;
+        # - или это строка спецификации с материалом и количеством.
+        if has_material and (has_tech or has_qty or len(low) <= 220):
+            return True
+        if has_mark and (has_qty or has_tech):
             return True
 
         return False
@@ -312,47 +530,23 @@ class AiService:
         return self._merge_requirement_positions(raw_items)
 
     def _prepare_requirement_candidate_text(self, text: str) -> str:
-        lines = self._split_lines_for_requirements(text)
-        selected = []
+        selected_text = self._select_requirement_relevant_blocks(text, max_chars=55000)
+        lines = self._split_lines_for_requirements(selected_text)
 
-        tz_headers = [
-            "техническое задание", "спецификация", "описание объекта закупки",
-            "требования к товарам", "требования к материалам", "перечень товаров",
-            "ведомость объемов", "приложение №", "приложение n"
-        ]
-
-        in_tz_block = False
-        lines_since_tz_header = 0
-
+        selected: list[str] = []
         for idx, line in enumerate(lines):
-            low_line = line.lower()
-            
-            # Если встретили заголовок ТЗ, берем следующие 300 строк безусловно
-            if any(h in low_line for h in tz_headers) and len(line) < 100:
-                in_tz_block = True
-                lines_since_tz_header = 0
-                
-            if in_tz_block:
-                if line not in selected:
-                    selected.append(line)
-                lines_since_tz_header += 1
-                if lines_since_tz_header > 300:
-                    in_tz_block = False
-                continue
-
-            # Если мы не в блоке ТЗ, используем эвристику по строкам
-            if self._is_specification_line(line):
-                start = max(0, idx - 15)
-                end = min(len(lines), idx + 16)
-                for item in lines[start:end]:
-                    if item not in selected:
-                        selected.append(item)
+            if self._looks_like_material_line(line):
+                start = max(0, idx - 1)
+                end = min(len(lines), idx + 2)
+                for candidate in lines[start:end]:
+                    if candidate not in selected:
+                        selected.append(candidate)
 
         candidate_text = "\n".join(selected).strip()
         if candidate_text:
-            return candidate_text[:150000]
+            return candidate_text[:60000]
 
-        return self._normalize_requirement_text(text)[:150000]
+        return selected_text[:60000]
 
     def _split_text_for_llm(self, text: str, chunk_size: int = 12000, overlap: int = 1200) -> list[str]:
         text = self._normalize_requirement_text(text)
@@ -677,51 +871,52 @@ class AiService:
 
     def extract_tender_requirement_positions(self, text: str):
         """
-        Извлекает из ТЗ поставляемые материальные позиции.
-        Алгоритм:
-        1. Всегда строит rule-based fallback.
-        2. Если AI доступен — дополнительно прогоняет сжатый текст через модель.
-        3. Объединяет и дедуплицирует результат.
+        Извлекает из ТЗ только поставляемые материальные позиции.
+        Перед extraction сначала выделяет релевантные блоки и убирает шум.
         """
         text = self._normalize_requirement_text(text)
         if not text:
             return []
 
-        logger.info(f"Extracting tender requirement positions. Length: {len(text)}")
+        candidate_text = self._prepare_requirement_candidate_text(text)
+        if not candidate_text:
+            return []
 
-        fallback_items = self._rule_based_extract_requirement_positions(text)
+        logger.info(f"Extracting tender requirement positions. Length: {len(candidate_text)}")
+
+        fallback_items = self._rule_based_extract_requirement_positions(candidate_text)
 
         if not self.client:
             logger.warning("AI client is unavailable. Returning rule-based requirement extraction.")
             return fallback_items
 
-        candidate_text = self._prepare_requirement_candidate_text(text)
-        chunks = self._split_text_for_llm(candidate_text, chunk_size=30000, overlap=2000)
-
+        chunks = self._split_text_for_llm(candidate_text, chunk_size=12000, overlap=1000)
         ai_items = []
 
-        for chunk_index, chunk in enumerate(chunks[:8], start=1):
+        for chunk_index, chunk in enumerate(chunks[:6], start=1):
             prompt = f"""
-            Роль: старший инженер-сметчик и эксперт по закупкам.
+            Роль: старший инженер-сметчик и эксперт по строительным материалам.
 
-            Нужно извлечь только поставляемые ТОВАРЫ и МАТЕРИАЛЫ из фрагмента тендерной документации.
-            Тендер может быть на любую тему (стройка, медицина, IT, продукты питания, мебель, транспорт и т.д.).
-            Игнорируй работы, услуги, этапы, договорные условия, требования к участнику и общие формулировки.
+            Нужно извлечь только поставляемые материальные позиции из фрагмента ТЗ.
+            Игнорируй работы, услуги, этапы, договорные условия, требования к участнику,
+            НМЦД, расчеты, национальный режим, извещение и общие процедурные формулировки.
             Нельзя додумывать характеристики, которых нет в тексте.
             Если одна и та же позиция встречается несколько раз, возвращай одну нормализованную запись.
+            Если строка содержит служебные ссылки на файл/страницу/источник — игнорируй такие хвосты
+            и извлекай только чистое название товара и характеристики.
 
             Верни СТРОГО JSON-массив.
             Формат каждой записи:
             {{
-              "position_name": "нормализованное название товара/материала",
-              "quantity": "количество строкой (только число)",
+              "position_name": "нормализованное название материала",
+              "quantity": "количество строкой",
               "unit": "единица измерения",
-              "characteristics": ["список ключевых характеристик, ГОСТ, артикул"],
+              "characteristics": ["список характеристик"],
               "notes": "важная оговорка",
-              "search_query": "короткий поисковый запрос (2-4 слова)"
+              "search_query": "короткий поисковый запрос"
             }}
 
-            ФРАГМЕНТ ДОКУМЕНТАЦИИ:
+            ФРАГМЕНТ ТЗ:
             {chunk}
             """
 
