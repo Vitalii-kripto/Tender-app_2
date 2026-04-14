@@ -22,6 +22,7 @@ class AnalogService:
         self.ai_service = ai_service
         self.db_session_factory = db_session_factory
         self.last_ai_error = ""
+        self._ai_blocked_until: float = 0.0  # timestamp до которого AI заблокирован
         logger.info("[AnalogService] Initialized.")
 
     def _normalize_text(self, text: str) -> str:
@@ -198,15 +199,12 @@ class AnalogService:
         """
         Очищает поисковый запрос от мусора из парсинга документов.
 
-        Форматы которые приходят с фронтенда:
-          "Предмет закупки | Поставка гидроизола и мастики битумной | doc.docx, стр.1 |"
-          "гидроизол ТПП"
-          "Мастика битумная ГОСТ 2678-94, 10 кг"
-
-        После очистки возвращает:
-          "гидроизол, мастика битумная"
-          "гидроизол ТПП"
-          "Мастика битумная"
+        Удаляет:
+          - единицы измерения в скобках: (штука), (м2), (кг), (рул)
+          - метки отсутствия данных: (не указано)*, / (не указано)*
+          - служебные символы парсера: *, /
+          - пайп-формат: "Ключ | Значение | источник.docx, стр.N |"
+          - технические суффиксы: ГОСТ XXXXX, ТУ XXXXX
         """
         import re
 
@@ -215,57 +213,78 @@ class AnalogService:
 
         query = raw_query.strip()
 
-        # Формат с пайпами: "Ключ | Значение | Источник | стр.N |"
+        # ШАБЛОН 1: Пайп-формат "Поле | Значение | файл.docx, стр.N |"
         if "|" in query:
             parts = [p.strip() for p in query.split("|")]
-            # Берём только части которые не являются:
-            # - названиями полей ("Предмет закупки", "Наименование", etc.)
-            # - именами файлов (.docx, .pdf, .xls)
-            # - номерами страниц ("стр.", "стр N")
-            # - пустыми строками
             FIELD_NAMES = {
                 "предмет закупки", "наименование", "описание",
                 "объект закупки", "товар", "номенклатура",
                 "позиция", "материал", "продукт", "изделие",
             }
             FILE_PATTERN = re.compile(
-                r"\.(docx|pdf|xlsx?|doc)\b|стр\.?\s*\d+|страница\s*\d+",
+                r"\.(docx|pdf|xlsx?|doc)\b|стр\.?\s*\d+",
                 re.IGNORECASE
             )
-            good_parts = []
-            for part in parts:
-                if not part:
-                    continue
-                if part.lower() in FIELD_NAMES:
-                    continue
-                if FILE_PATTERN.search(part):
-                    continue
-                if len(part) < 3:
-                    continue
-                good_parts.append(part)
-
+            good_parts = [
+                p for p in parts
+                if p
+                and p.lower() not in FIELD_NAMES
+                and not FILE_PATTERN.search(p)
+                and len(p) > 3
+            ]
             if good_parts:
-                # Берём самую длинную осмысленную часть
                 query = max(good_parts, key=len)
 
-        # Убираем технические суффиксы типа "ГОСТ ...", "(10 кг)", etc.
-        # но оставляем марку материала (ТПП, ТКП, ХПП, ЭПП и т.д.)
-        query = re.sub(r"\s*ГОСТ\s+[\d\-]+", "", query, flags=re.IGNORECASE)
-        query = re.sub(r"\s*ТУ\s+[\d\.\-]+", "", query, flags=re.IGNORECASE)
-        query = re.sub(r"\s*\(\s*\d+\s*(кг|м2|м|шт|л|рул)\s*\)", "", query, flags=re.IGNORECASE)
-        query = re.sub(r"\s{2,}", " ", query)
-        query = query.strip().strip(",").strip()
+        # ШАБЛОН 2: Единицы измерения в скобках — (штука), (м2), (кг) и т.д.
+        query = re.sub(
+            r"\(\s*(штука|штук|шт|м2|м\.кв|кв\.м|м|рулон|рул|кг|г|л|литр|"
+            r"упак|уп|комплект|компл|набор|пара|п\.м|пм|погонный метр)\s*\)",
+            "",
+            query,
+            flags=re.IGNORECASE
+        )
 
+        # ШАБЛОН 3: Метки отсутствия данных
+        query = re.sub(
+            r"/?\s*\(\s*не\s+указано\s*\)\s*\*?",
+            "",
+            query,
+            flags=re.IGNORECASE
+        )
+        query = re.sub(r"\(\s*не\s+указано\s*\)", "", query, flags=re.IGNORECASE)
+        query = re.sub(r"\*", "", query)
+
+        # ШАБЛОН 4: Слэш в конце или начале
+        query = query.strip("/").strip()
+
+        # ШАБЛОН 5: ГОСТ и ТУ с номерами
+        query = re.sub(r"\s+ГОСТ\s+[\d\-]+", "", query, flags=re.IGNORECASE)
+        query = re.sub(r"\s+ТУ\s+[\d\.\-]+", "", query, flags=re.IGNORECASE)
+
+        # ШАБЛОН 6: Количество + единица в скобках "10 кг" "(20 л)"
+        query = re.sub(
+            r"\s*\(\s*\d+[\.,]?\d*\s*(кг|г|л|м2|м|шт|рул)\s*\)",
+            "",
+            query,
+            flags=re.IGNORECASE
+        )
+
+        # Финальная очистка пробелов
+        query = re.sub(r"\s{2,}", " ", query).strip().strip(",").strip("/").strip()
+
+        import logging
+        logger = logging.getLogger("LegalAI")
         logger.info(
             f"[AnalogService] Query cleaned: '{raw_query[:80]}' -> '{query}'"
         )
-        return query
+        return query if query else raw_query.strip()
 
     def search_local_db(
         self,
         query: str,
         category: str = None,
-        limit: int = 10
+        limit: int = 10,
+        requirements: str = None,   # добавлен параметр, принимается но не используется
     ) -> list:
         """
         Поиск аналогов в локальной БД с предварительной очисткой запроса.
@@ -287,17 +306,46 @@ class AnalogService:
             f"raw='{query[:60]}' -> clean='{clean_query}' | category={category}"
         )
 
-        # Шаг 2: Разбиваем на ключевые слова
-        # Для "гидроизол, мастика битумная" → ["гидроизол", "мастика", "битумная"]
-        raw_keywords = re.split(r"[\s,;/]+", clean_query)
+        # Шаг 2: Очищаем запрос и разбиваем на ключевые слова
+        clean_query = self._clean_search_query(query)
+        if not clean_query:
+            logger.warning(
+                f"[AnalogService] Empty query after cleaning: '{query}'"
+            )
+            return []
+
+        # Разбиваем на слова
+        import re
+        raw_keywords = re.split(r"[\s,;/\(\)]+", clean_query)
+
+        # Список стоп-слов которые не несут смысловой нагрузки
+        STOP_WORDS = {
+            "не", "и", "или", "для", "на", "в", "с", "по", "из",
+            "указано", "штука", "штук", "шт", "кг", "м2", "рул",
+            "рулон", "упак", "литр", "единица", "ед", "марка",
+            "тип", "вид", "класс", "материал", "товар", "продукт",
+        }
+
         keywords = [
             kw.strip().lower()
             for kw in raw_keywords
-            if len(kw.strip()) > 2
-        ][:6]  # максимум 6 слов
+            if len(kw.strip()) > 2           # минимум 3 символа
+            and kw.strip().lower() not in STOP_WORDS
+            and not kw.strip().isdigit()      # не чисто цифровое
+            and kw.strip() not in ("*", "/", "|", "(", ")", "-")
+        ][:5]  # максимум 5 значимых слов
 
         if not keywords:
+            logger.warning(
+                f"[AnalogService] No valid keywords after filtering: "
+                f"raw='{query}' clean='{clean_query}'"
+            )
             return []
+
+        logger.info(
+            f"[AnalogService] Search keywords: {keywords} "
+            f"(from clean query: '{clean_query}')"
+        )
 
         # Шаг 3: Категории которые исключаем из поиска
         EXCLUDED_CATEGORIES = [
@@ -407,6 +455,17 @@ class AnalogService:
         max_results: int = 5,
         local_db_products: list = None
     ) -> list:
+        import time
+        # Проверяем флаг блокировки AI (устанавливается при 429)
+        blocked_until = getattr(self, '_ai_blocked_until', 0)
+        if time.time() < blocked_until:
+            remaining = int(blocked_until - time.time()) // 60
+            logger.info(
+                f"[AnalogService] AI is blocked for {remaining} more min "
+                f"(quota exhausted). Skipping AI search."
+            )
+            return []
+
         logger.info(f"[AnalogService] AI search: '{query}' | requirements={bool(requirements)}")
         self.last_ai_error = ""
 
@@ -478,13 +537,33 @@ class AnalogService:
 
         try:
             response_text = self.ai_service.generate_with_search(prompt)
-
             if not response_text:
-                provider_error = getattr(self.ai_service, "last_error_message", "") or "Пустой ответ от AI"
-                self.last_ai_error = provider_error
-                logger.warning(f"[AnalogService] AI returned empty response. Reason: {provider_error}")
+                logger.warning(
+                    f"[AnalogService] AI returned empty response."
+                )
                 return []
+        except Exception as e:
+            error_str = str(e)
+            is_quota = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+            is_unavailable = "недоступен" in error_str or "временно" in error_str
 
+            if is_quota or is_unavailable:
+                logger.warning(
+                    f"[AnalogService] AI quota/unavailable: {error_str[:100]}. "
+                    f"AI search skipped — returning local DB results only."
+                )
+                # Устанавливаем флаг блокировки AI на 1 час
+                import time
+                self._ai_blocked_until = time.time() + 3600
+                logger.warning(
+                    f"[AnalogService] AI blocked for 1 hour "
+                    f"(until {time.strftime('%H:%M', time.localtime(self._ai_blocked_until))})"
+                )
+            else:
+                logger.error(f"[AnalogService] AI search error: {e}")
+            return []
+
+        try:
             json_match = re.search(r'\{[\s\S]*\}', response_text)
             if not json_match:
                 self.last_ai_error = "AI не вернул JSON"

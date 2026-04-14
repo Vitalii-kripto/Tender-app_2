@@ -168,14 +168,16 @@ class AiService:
                     logger.warning(f"Attempt {attempt} failed. Switching to fallback model for remaining retries: {self.fallback_model_name}")
                     kwargs['model'] = self.fallback_model_name
 
-                # При ошибке 429 ждём значительно дольше
+                # При 429 RESOURCE_EXHAUSTED — это дневной лимит,
+                # повторные попытки с паузой БЕССМЫСЛЕННЫ.
+                # Прерываем немедленно без ожидания.
                 if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                    wait_time = 60  # 60 секунд при исчерпании квоты
                     logger.warning(
-                        f"[AIService] Rate limit 429 hit. "
-                        f"Waiting {wait_time}s before retry {attempt + 1}..."
+                        f"[AIService] 429 RESOURCE_EXHAUSTED on attempt {attempt}. "
+                        f"Daily quota likely exhausted. Stopping immediately "
+                        f"(no retry — waiting would not help)."
                     )
-                    time.sleep(wait_time)
+                    raise  # сразу пробрасываем исключение, не ждём
                 else:
                     # Стандартный backoff: 3, 5, 9 секунд
                     wait_time = [3, 5, 9][min(attempt, 2)]
