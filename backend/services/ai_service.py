@@ -472,62 +472,135 @@ class AiService:
 
         return False
 
-    def _rule_based_extract_requirement_positions(self, text: str) -> list[dict]:
-        lines = self._split_lines_for_requirements(text)
-        raw_items = []
+    def _is_specification_line(self, line: str) -> bool:
+        """
+        Возвращает True только для строк, которые похожи на товарную/спецификационную позицию,
+        а не на договорной, процедурный или служебный текст.
+        """
+        if not line:
+            return False
 
-        quantity_pattern = re.compile(
-            r"(?P<qty>\d+(?:[.,]\d+)?)\s*(?P<unit>м2|м²|м|кг|г|т|тонн|л|шт|штук|рулон(?:ов)?|ведр(?:о|а|а)|компл(?:ект)?|упак(?:овка)?|усл\.?\s*ед|пачк|ампул|флакон|доз)",
-            flags=re.IGNORECASE
-        )
+        raw = str(line).strip()
+        if len(raw) < 8:
+            return False
+
+        lower = raw.lower()
+
+        negative_markers = [
+            'штраф', 'пеня', 'неустойк', 'оплат', 'аванс', 'расчет', 'расчёт',
+            'приемк', 'приёмк', 'расторжен', 'ответственност', 'обеспечени',
+            'реквизит', 'подсудност', 'гарант', 'срок исполнен', 'срок поставки',
+            'нацрежим', 'нац режим', 'реестр', 'нмцк', 'обоснован', 'извещени',
+            'комисси', 'заявк', 'участник', 'контракт', 'договор', 'проект договора',
+            'пик', 'стр.', '.doc', '.docx', '.pdf', '.xls', '.xlsx'
+        ]
+        if any(marker in lower for marker in negative_markers):
+            return False
+
+        strong_positive_markers = [
+            'техноэласт', 'унифлекс', 'линокром', 'бикрост', 'рубитэкс',
+            'филизол', 'стеклоэласт', 'эластоизол', 'гидроизол', 'гидростеклоизол',
+            'праймер', 'мастика', 'мембрана', 'герметик', 'геомембрана',
+            'геотекстиль', 'лента', 'шпонка'
+        ]
+        if any(marker in lower for marker in strong_positive_markers):
+            return True
+
+        mark_codes = ['тпп', 'ткп', 'эпп', 'экп', 'хпп', 'хкп', 'эмп']
+        if any(code in lower for code in mark_codes):
+            return True
+
+        table_markers = [
+            'наименование', 'характерист', 'материал', 'товар', 'количеств',
+            'ед. изм', 'ед изм', 'единица измерения', 'толщина', 'масса',
+            'основа', 'гибкость', 'теплостойкость'
+        ]
+        table_hits = sum(1 for marker in table_markers if marker in lower)
+        if table_hits >= 2:
+            return True
+
+        if self._looks_like_material_line(raw):
+            return True
+
+        return False
+
+    def _normalize_search_query(self, text: str) -> str:
+        if not text:
+            return ''
+
+        q = str(text)
+        q = re.sub(r'^[\d\s\.)-]+', '', q)
+        q = re.sub(r'\|', ' ', q)
+        q = re.sub(r'\b(или эквивалент|эквивалент|аналог)\b', '', q, flags=re.IGNORECASE)
+        q = re.sub(r'\b(стр\.?|страница)\s*\d+\b', '', q, flags=re.IGNORECASE)
+        q = re.sub(r'\b\S+\.(doc|docx|pdf|xls|xlsx)\b', '', q, flags=re.IGNORECASE)
+        q = re.sub(r'\s{2,}', ' ', q)
+        return q.strip(' -;,.')
+
+    def _rule_based_extract_requirement_positions(self, text: str) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        if not text:
+            return items
+
+        lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+        seen_keys = set()
 
         for line in lines:
-            if not self._is_specification_line(line):
+            try:
+                if not self._is_specification_line(line):
+                    continue
+
+                normalized = re.sub(r'^[\d\s\.)-]+', '', line).strip()
+                normalized = re.sub(r'\s{2,}', ' ', normalized)
+                if len(normalized) < 5:
+                    continue
+
+                quantity_match = re.search(
+                    r'(\d+[\d\s.,]*)\s*(м2|м²|м3|м³|м|кг|т|л|шт|рул|упак|компл|комплект|ведро)',
+                    normalized,
+                    flags=re.IGNORECASE
+                )
+
+                quantity = None
+                unit = None
+                if quantity_match:
+                    quantity = quantity_match.group(1).replace(' ', '').strip()
+                    unit = quantity_match.group(2).strip()
+
+                cleaned_name = normalized
+                cleaned_name = re.sub(r'\|', ' ', cleaned_name)
+                cleaned_name = re.sub(r'\s{2,}', ' ', cleaned_name).strip(' -;,.')
+
+                if quantity_match:
+                    start, end = quantity_match.span()
+                    cleaned_name = (normalized[:start] + ' ' + normalized[end:]).strip(' -;,.')
+                    cleaned_name = re.sub(r'\s{2,}', ' ', cleaned_name)
+
+                if len(cleaned_name) < 3:
+                    continue
+
+                search_query = self._normalize_search_query(cleaned_name)
+                if len(search_query) < 3:
+                    continue
+
+                dedupe_key = search_query.lower()
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+
+                items.append({
+                    'position_name': cleaned_name,
+                    'search_query': search_query,
+                    'quantity': quantity,
+                    'unit': unit,
+                    'requirements': normalized,
+                    'source': 'rule_based'
+                })
+            except Exception as inner_error:
+                logger.warning(f"[AiService] Skip broken specification line: {inner_error}; line={line[:200]}")
                 continue
 
-            quantity = ""
-            unit = ""
-            qty_match = quantity_pattern.search(line)
-            if qty_match:
-                quantity = qty_match.group("qty").replace(",", ".")
-                unit = qty_match.group("unit")
-
-            characteristics = []
-            for pattern in [
-                r"(основа[^,;.]*)",
-                r"(толщина[^,;.]*)",
-                r"(масса[^,;.]*)",
-                r"(гибкость[^,;.]*)",
-                r"(теплостойкость[^,;.]*)",
-                r"(цвет[^,;.]*)",
-                r"(гост[^,;.]*)",
-                r"(ту[^,;.]*)",
-                r"(не менее[^,;.]*)",
-                r"(не более[^,;.]*)",
-            ]:
-                for match in re.findall(pattern, line, flags=re.IGNORECASE):
-                    value = self._normalize_requirement_text(match)
-                    if value and value not in characteristics:
-                        characteristics.append(value)
-
-            position_name = line
-            if qty_match:
-                position_name = line[:qty_match.start()].strip(" ,;:-")
-            position_name = re.sub(r"\s{2,}", " ", position_name).strip()
-
-            if not position_name:
-                position_name = line
-
-            raw_items.append({
-                "position_name": position_name,
-                "quantity": quantity,
-                "unit": unit,
-                "characteristics": characteristics,
-                "notes": "",
-                "search_query": position_name,
-            })
-
-        return self._merge_requirement_positions(raw_items)
+        return items
 
     def _prepare_requirement_candidate_text(self, text: str) -> str:
         selected_text = self._select_requirement_relevant_blocks(text, max_chars=55000)
@@ -884,7 +957,14 @@ class AiService:
 
         logger.info(f"Extracting tender requirement positions. Length: {len(candidate_text)}")
 
-        fallback_items = self._rule_based_extract_requirement_positions(candidate_text)
+        try:
+            fallback_items = self._rule_based_extract_requirement_positions(candidate_text)
+        except Exception as fallback_error:
+            logger.error(
+                f"[AiService] Rule-based extraction failed: {fallback_error}",
+                exc_info=True
+            )
+            fallback_items = []
 
         if not self.client:
             logger.warning("AI client is unavailable. Returning rule-based requirement extraction.")

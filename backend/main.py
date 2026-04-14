@@ -1146,22 +1146,29 @@ async def api_extract_tender_requirements(
     warnings: List[Dict[str, Any]] = []
 
     if manual_text:
-        extracted = ai_service.extract_tender_requirement_positions(manual_text)
-        for index, item in enumerate(extracted, start=1):
-            position_name = str(item.get("position_name") or "").strip()
-            if not position_name:
-                continue
+        try:
+            extracted = ai_service.extract_tender_requirement_positions(manual_text)
+            for index, item in enumerate(extracted, start=1):
+                position_name = str(item.get("position_name") or "").strip()
+                if not position_name:
+                    continue
 
-            items.append({
-                "id": f"manual-{index}",
-                "source": "manual",
-                "source_label": "Ручной ввод",
-                "position_name": position_name,
-                "quantity": str(item.get("quantity") or "").strip(),
-                "unit": str(item.get("unit") or "").strip(),
-                "characteristics": item.get("characteristics") or [],
-                "notes": str(item.get("notes") or "").strip(),
-                "search_query": str(item.get("search_query") or position_name).strip(),
+                items.append({
+                    "id": f"manual-{index}",
+                    "source": "manual",
+                    "source_label": "Ручной ввод",
+                    "position_name": position_name,
+                    "quantity": str(item.get("quantity") or "").strip(),
+                    "unit": str(item.get("unit") or "").strip(),
+                    "characteristics": item.get("characteristics") or [],
+                    "notes": str(item.get("notes") or "").strip(),
+                    "search_query": str(item.get("search_query") or position_name).strip(),
+                })
+        except Exception as e:
+            logger.error(f"Extraction endpoint failed for manual text: {e}", exc_info=True)
+            warnings.append({
+                "status": "error",
+                "message": f"Извлечение требований из ручного ввода выполнено с ошибкой: {str(e)}"
             })
 
     for tender_id in tender_ids:
@@ -1185,25 +1192,33 @@ async def api_extract_tender_requirements(
             })
             continue
 
-        extracted = ai_service.extract_tender_requirement_positions(source_text)
+        try:
+            extracted = ai_service.extract_tender_requirement_positions(source_text)
 
-        for index, item in enumerate(extracted, start=1):
-            position_name = str(item.get("position_name") or "").strip()
-            if not position_name:
-                continue
+            for index, item in enumerate(extracted, start=1):
+                position_name = str(item.get("position_name") or "").strip()
+                if not position_name:
+                    continue
 
-            items.append({
-                "id": f"{tender.id}-{index}",
+                items.append({
+                    "id": f"{tender.id}-{index}",
+                    "tender_id": tender.id,
+                    "tender_title": tender.title or "",
+                    "source": "crm",
+                    "source_label": f"{tender.id} — {tender.title or ''}".strip(),
+                    "position_name": position_name,
+                    "quantity": str(item.get("quantity") or "").strip(),
+                    "unit": str(item.get("unit") or "").strip(),
+                    "characteristics": item.get("characteristics") or [],
+                    "notes": str(item.get("notes") or "").strip(),
+                    "search_query": str(item.get("search_query") or position_name).strip(),
+                })
+        except Exception as e:
+            logger.error(f"Extraction endpoint failed for tender {tender.id}: {e}", exc_info=True)
+            warnings.append({
                 "tender_id": tender.id,
-                "tender_title": tender.title or "",
-                "source": "crm",
-                "source_label": f"{tender.id} — {tender.title or ''}".strip(),
-                "position_name": position_name,
-                "quantity": str(item.get("quantity") or "").strip(),
-                "unit": str(item.get("unit") or "").strip(),
-                "characteristics": item.get("characteristics") or [],
-                "notes": str(item.get("notes") or "").strip(),
-                "search_query": str(item.get("search_query") or position_name).strip(),
+                "status": "error",
+                "message": f"Извлечение требований выполнено с ошибкой: {str(e)}"
             })
 
         for warning in source_data.get("warnings") or []:

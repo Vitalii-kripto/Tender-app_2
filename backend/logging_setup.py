@@ -59,6 +59,7 @@ def _configure_root_logger() -> None:
 
     file_handler = RotatingFileHandler(
         _LOG_FILE_PATH,
+        mode="w",
         maxBytes=10 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",
