@@ -228,7 +228,16 @@ class AiService:
             "гидроизол", "гидростеклоизол", "изоэласт", "тэксослой",
             "мастика", "праймер", "мембрана", "геотекстиль", "геомембрана",
             "герметик", "лента", "пароизоляция", "пленка", "рубероид",
-            "шпонка", "битум", "полотно", "стеклоткань", "утеплитель"
+            "шпонка", "битум", "полотно", "стеклоткань", "утеплитель",
+            "пергамин", "рулонный", "кровельный", "изоляция", "цемент",
+            "песок", "щебень", "бетон", "арматура", "труба", "кабель",
+            "краска", "грунтовка", "шпатлевка", "штукатурка", "клей",
+            "пена", "профлист", "кирпич", "блок", "доска", "фанера",
+            "гипсокартон", "плитка", "керамогранит", "линолеум", "ламинат",
+            "плинтус", "дверь", "окно", "светильник", "розетка",
+            "выключатель", "автомат", "кабель-канал", "лоток", "гофра",
+            "фитинг", "кран", "задвижка", "клапан", "насос", "радиатор",
+            "смеситель", "унитаз", "раковина", "ванна"
         ]
 
         service_noise = [
@@ -315,17 +324,17 @@ class AiService:
 
         for idx, line in enumerate(lines):
             if self._looks_like_material_line(line):
-                start = max(0, idx - 1)
-                end = min(len(lines), idx + 2)
+                start = max(0, idx - 15)
+                end = min(len(lines), idx + 16)
                 for item in lines[start:end]:
                     if item not in selected:
                         selected.append(item)
 
         candidate_text = "\n".join(selected).strip()
         if candidate_text:
-            return candidate_text[:60000]
+            return candidate_text[:150000]
 
-        return self._normalize_requirement_text(text)[:60000]
+        return self._normalize_requirement_text(text)[:150000]
 
     def _split_text_for_llm(self, text: str, chunk_size: int = 12000, overlap: int = 1200) -> list[str]:
         text = self._normalize_requirement_text(text)
@@ -669,11 +678,11 @@ class AiService:
             return fallback_items
 
         candidate_text = self._prepare_requirement_candidate_text(text)
-        chunks = self._split_text_for_llm(candidate_text, chunk_size=12000, overlap=1000)
+        chunks = self._split_text_for_llm(candidate_text, chunk_size=30000, overlap=2000)
 
         ai_items = []
 
-        for chunk_index, chunk in enumerate(chunks[:6], start=1):
+        for chunk_index, chunk in enumerate(chunks[:8], start=1):
             prompt = f"""
             Роль: старший инженер-сметчик и эксперт по строительным материалам.
 
