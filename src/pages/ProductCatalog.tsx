@@ -45,7 +45,7 @@ const ProductCatalog = () => {
         updateGlobalMock(data);
         setStatusMsg(`Всего товаров: ${data.length}`);
     } catch (e) {
-        logger.error(e);
+        logger.error(String(e));
         setStatusMsg("Ошибка загрузки");
     }
   };
@@ -65,7 +65,7 @@ const ProductCatalog = () => {
         updateGlobalMock(data);
         setStatusMsg(`Парсинг завершен. Найдено: ${data.length} шт.`);
     } catch (err) {
-        logger.error(err);
+        logger.error(String(err));
         setStatusMsg("Ошибка парсинга");
     } finally {
         setIsParsing(false);

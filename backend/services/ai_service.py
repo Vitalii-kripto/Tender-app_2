@@ -180,12 +180,12 @@ class AiService:
                         f"[AIService] Quota exhausted on model {kwargs['model']}. "
                         f"Fallback already used or unavailable. Stopping AI call."
                     )
-                    raise
+                    raise HTTPException(status_code=429, detail="QUOTA_EXHAUSTED")
 
                 if not is_transient or attempt == max_retries:
                     if is_transient:
                         logger.error(f"AI Call: All {max_retries} attempts exhausted for transient errors.")
-                    raise Exception("Внешний AI-сервис временно недоступен, анализ не завершен") from e
+                    raise HTTPException(status_code=503, detail="SERVICE_UNAVAILABLE")
 
                 if (
                     attempt == max_retries // 2
@@ -204,23 +204,6 @@ class AiService:
                 time.sleep(wait_time)
 
         return None
-
-    def _clear_last_error(self):
-        self.last_error_code = ""
-        self.last_error_message = ""
-
-    def _set_last_error(self, message: str):
-        message = str(message or "").strip()
-        self.last_error_message = message
-        lower = message.lower()
-        if "429" in lower or "resource_exhausted" in lower or "quota" in lower:
-            self.last_error_code = "QUOTA_EXHAUSTED"
-        elif "503" in lower or "service unavailable" in lower:
-            self.last_error_code = "SERVICE_UNAVAILABLE"
-        elif "timeout" in lower or "deadline exceeded" in lower:
-            self.last_error_code = "TIMEOUT"
-        else:
-            self.last_error_code = "UNKNOWN"
 
     def _normalize_requirement_text(self, text: str) -> str:
         text = (text or "").replace("\xa0", " ")
@@ -250,18 +233,18 @@ class AiService:
         if not low:
             return True
 
+        # Generic patterns for products/specifications
         product_like = (
             any(term in low for term in [
-                "гидроизол", "техноэласт", "унифлекс", "линокром", "биполь",
-                "филизол", "рубитэкс", "эластобит", "стеклоэласт", "стеклоизол",
-                "гидростеклоизол", "изоэласт", "мостослой", "тэксослой", "мастика",
-                "праймер", "мембрана", "герметик", "лента", "геотекстиль",
-                "геомембрана", "шпонка", "пароизоляция"
+                "гост", "ту ", "ост ", "характеристик", "параметр", "значение",
+                "толщин", "масса", "вес ", "длина", "ширина", "высота", "диаметр",
+                "марка", "модель", "артикул", "тип ", "состав", "свойства",
+                "наименование", "материал", "товар", "количеств", "ед. изм", "ед изм"
             ])
-            or bool(re.search(r"\b(тпп|ткп|хпп|хкп|эпп|экп|эмп)\b", low, flags=re.IGNORECASE))
+            or bool(re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон|компл|уп|т|гр|см)\b", low))
         )
 
-        if product_like and re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон)\b", low):
+        if product_like:
             return False
 
         noise_terms = [
@@ -336,7 +319,7 @@ class AiService:
             "техническое задание", "описание объекта закупки", "спецификац",
             "ведомость материалов", "наименование товара", "характерист",
             "материал", "товар", "поставка", "основа", "толщин",
-            "масса", "гибкост", "теплостойк"
+            "масса", "параметр", "значение", "требован", "гост", "ту ", "ост "
         ]
         negative_terms = [
             "оплата", "штраф", "пеня", "неустойк", "расторжен", "ответственность",
@@ -347,15 +330,13 @@ class AiService:
 
         if any(term in low for term in positive_terms):
             score += 4
-        if re.search(r"\b(тпп|ткп|хпп|хкп|эпп|экп|эмп)\b", low, flags=re.IGNORECASE):
-            score += 4
-        if re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон)\b", low, flags=re.IGNORECASE):
-            score += 2
-        if any(term in low for term in [
-            "гидроизол", "техноэласт", "унифлекс", "линокром", "биполь", "филизол",
-            "рубитэкс", "эластобит", "стеклоэласт", "стеклоизол", "гидростеклоизол",
-            "изоэласт", "мастика", "праймер", "мембрана", "герметик", "лента"
-        ]):
+        
+        # Generic patterns for quantities and units
+        if re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон|компл|уп|т|гр|см)\b", low, flags=re.IGNORECASE):
+            score += 3
+            
+        # Check for table-like structure or list of characteristics
+        if ":" in low and any(term in low for term in ["характерист", "параметр", "значение"]):
             score += 3
 
         score -= sum(1 for term in negative_terms if term in low) * 2
@@ -440,7 +421,7 @@ class AiService:
         return lines
 
 
-    def _looks_like_material_line(self, line: str) -> bool:
+    def _looks_like_specification_line(self, line: str) -> bool:
         low = (line or "").lower().strip()
         if not low:
             return False
@@ -448,27 +429,19 @@ class AiService:
         if self._is_noise_line_for_requirements(low):
             return False
 
-        material_keywords = [
-            "техноэласт", "унифлекс", "линокром", "биполь", "филизол",
-            "рубитэкс", "эластобит", "стеклоэласт", "стеклоизол",
-            "гидроизол", "гидростеклоизол", "изоэласт", "мостослой",
-            "тэксослой", "мастика", "праймер", "мембрана", "геотекстиль",
-            "геомембрана", "герметик", "лента", "пароизоляция", "шпонка"
-        ]
+        # Generic patterns for products and characteristics
+        has_qty = bool(re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон|компл|уп|т|гр|см)\b", low, flags=re.IGNORECASE))
+        has_tech = any(term in low for term in ["основа", "толщин", "масса", "характерист", "параметр", "значение", "гост", "ту "])
+        has_product_indicator = any(term in low for term in ["наименование", "товар", "материал", "марка", "модель", "артикул"])
 
-        has_material = any(keyword in low for keyword in material_keywords)
-        has_mark = bool(re.search(r"\b(тпп|ткп|хпп|хкп|эпп|экп|эмп)\b", low, flags=re.IGNORECASE))
-        has_qty = bool(re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон)\b", low, flags=re.IGNORECASE))
-        has_tech = any(term in low for term in ["основа", "толщин", "масса", "гибкост", "теплостойк", "характерист"])
-
-        # Строка считается товарной, если:
-        # - есть материал/марка;
-        # - или есть материал + тех.характеристика;
-        # - или есть марка + количество/единица;
-        # - или это строка спецификации с материалом и количеством.
-        if has_material and (has_tech or has_qty or len(low) <= 220):
+        # Line is likely a product if:
+        # - it has a quantity and some technical term
+        # - it has a product indicator and a quantity
+        # - it looks like a table row with multiple values
+        if has_qty and (has_tech or has_product_indicator):
             return True
-        if has_mark and (has_qty or has_tech):
+        
+        if "|" in low and has_qty:
             return True
 
         return False
@@ -498,29 +471,21 @@ class AiService:
         if any(marker in lower for marker in negative_markers):
             return False
 
-        strong_positive_markers = [
-            'техноэласт', 'унифлекс', 'линокром', 'бикрост', 'рубитэкс',
-            'филизол', 'стеклоэласт', 'эластоизол', 'гидроизол', 'гидростеклоизол',
-            'праймер', 'мастика', 'мембрана', 'герметик', 'геомембрана',
-            'геотекстиль', 'лента', 'шпонка'
+        # Generic positive markers for products/specifications
+        generic_positive_markers = [
+            'гост', 'ту ', 'ост ', 'характеристик', 'параметр', 'значение',
+            'толщин', 'масса', 'вес ', 'длина', 'ширина', 'высота', 'диаметр',
+            'марка', 'модель', 'артикул', 'тип ', 'состав', 'свойства',
+            'наименование', 'материал', 'товар', 'количеств', 'ед. изм', 'ед изм'
         ]
-        if any(marker in lower for marker in strong_positive_markers):
+        if any(marker in lower for marker in generic_positive_markers):
             return True
 
-        mark_codes = ['тпп', 'ткп', 'эпп', 'экп', 'хпп', 'хкп', 'эмп']
-        if any(code in lower for code in mark_codes):
+        # If it has a quantity and unit, it's likely a specification line
+        if re.search(r"\b\d+(?:[.,]\d+)?\s*(мм|м2|м²|м|кг|л|шт|рулон|компл|уп|т|гр|см)\b", lower):
             return True
 
-        table_markers = [
-            'наименование', 'характерист', 'материал', 'товар', 'количеств',
-            'ед. изм', 'ед изм', 'единица измерения', 'толщина', 'масса',
-            'основа', 'гибкость', 'теплостойкость'
-        ]
-        table_hits = sum(1 for marker in table_markers if marker in lower)
-        if table_hits >= 2:
-            return True
-
-        if self._looks_like_material_line(raw):
+        if self._looks_like_specification_line(raw):
             return True
 
         return False
@@ -609,7 +574,7 @@ class AiService:
 
         selected: list[str] = []
         for idx, line in enumerate(lines):
-            if self._looks_like_material_line(line):
+            if self._looks_like_specification_line(line):
                 start = max(0, idx - 1)
                 end = min(len(lines), idx + 2)
                 for candidate in lines[start:end]:
@@ -712,10 +677,8 @@ class AiService:
     def generate_with_search(self, prompt: str) -> str:
         if not self.client:
             logger.error("generate_with_search called without initialized Gemini client.")
-            self._set_last_error("Gemini client is not initialized")
-            return ""
+            raise HTTPException(status_code=503, detail="Gemini client is not initialized")
 
-        self._clear_last_error()
         logger.info("generate_with_search started.")
 
         import time
@@ -754,17 +717,13 @@ class AiService:
             )
 
             if not response:
-                self._set_last_error("Empty response object from Gemini")
                 logger.warning("generate_with_search returned empty response object.")
-                return ""
+                raise HTTPException(status_code=500, detail="Empty response object from Gemini")
 
             text = (response.text or "").strip()
             if not text:
-                self._set_last_error("Empty response text from Gemini")
                 logger.warning("generate_with_search returned empty response text.")
-                return ""
-
-            self._clear_last_error()
+                raise HTTPException(status_code=500, detail="Empty response text from Gemini")
 
             # Сохраняем в кэш
             self._search_cache[cache_key] = (time.time(), text)
@@ -775,10 +734,11 @@ class AiService:
 
             return text
 
+        except HTTPException:
+            raise
         except Exception as e:
-            self._set_last_error(str(e))
             logger.error(f"generate_with_search failed: {e}", exc_info=True)
-            return ""
+            raise HTTPException(status_code=500, detail=str(e))
 
     def find_product_equivalent(self, tender_specs: str, catalog: list):
         if not self.client:
@@ -790,7 +750,7 @@ class AiService:
         catalog_context = json.dumps([{"id": p['id'], "title": p['title'], "specs": p['specs']} for p in catalog], ensure_ascii=False)
 
         prompt = f"""
-        Роль: Технический эксперт по гидроизоляции.
+        Роль: Технический эксперт по материально-техническому снабжению.
         Задача: Подобрать НАИЛУЧШИЙ аналог из каталога для запроса.
         
         ЗАПРОС (Товар/Характеристики): {tender_specs[:1000]}
@@ -830,11 +790,11 @@ class AiService:
         logger.info(f"Searching internet for product: {query}")
         # Промпт усилен для поиска АНАЛОГОВ и ЦЕН
         prompt = f"""
-        ЗАДАЧА: Выполни поиск в Google и найди доступные в РФ гидроизоляционные материалы по запросу: "{query}".
+        ЗАДАЧА: Выполни поиск в Google и найди доступные в РФ товары/материалы по запросу: "{query}".
         
-        ЕСЛИ ЗАПРОШЕН БРЕНД (например, Технониколь):
+        ЕСЛИ ЗАПРОШЕН БРЕНД:
         - Найди этот товар.
-        - Найди 1-2 прямых АНАЛОГА от других производителей (Изофлекс, Оргкровля, КРЗ и др.), если они сопоставимы по качеству.
+        - Найди 1-2 прямых АНАЛОГА от других производителей, если они сопоставимы по качеству.
         
         ДЛЯ КАЖДОГО ТОВАРА УКАЖИ:
         1. **Полное название** (Бренд + Марка).
@@ -911,8 +871,8 @@ class AiService:
 
         logger.info(f"Extracting products from text. Length: {len(text)}")
         prompt = f"""
-        Роль: Парсер строительных смет.
-        Задача: Извлеки из текста список гидроизоляционных материалов и их характеристики.
+        Роль: Парсер строительных смет и спецификаций.
+        Задача: Извлеки из текста список товаров/материалов и их характеристики.
         Игнорируй работы (укладка, монтаж), только материалы.
         
         ТЕКСТ:
@@ -976,7 +936,7 @@ class AiService:
 
         for chunk_index, chunk in enumerate(chunks[:6], start=1):
             prompt = f"""
-            Роль: старший инженер-сметчик и эксперт по строительным материалам.
+            Роль: старший инженер-сметчик и эксперт по материально-техническому снабжению.
 
             Нужно извлечь только поставляемые материальные позиции из фрагмента ТЗ.
             Игнорируй работы, услуги, этапы, договорные условия, требования к участнику,
@@ -989,12 +949,12 @@ class AiService:
             Верни СТРОГО JSON-массив.
             Формат каждой записи:
             {{
-              "position_name": "нормализованное название материала",
+              "position_name": "нормализованное название товара/материала",
               "quantity": "количество строкой",
               "unit": "единица измерения",
-              "characteristics": ["список характеристик"],
+              "characteristics": ["список технических характеристик"],
               "notes": "важная оговорка",
-              "search_query": "короткий поисковый запрос"
+              "search_query": "короткий поисковый запрос для поиска аналогов"
             }}
 
             ФРАГМЕНТ ТЗ:

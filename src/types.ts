@@ -83,7 +83,7 @@ export interface AnalysisResult {
   critical_mismatches: string[];
 }
 
-export type MatchingSearchMode = 'catalog' | 'internet' | 'both';
+export type MatchingSearchMode = 'local' | 'ai' | 'both';
 
 export interface TenderRequirementItem {
   id: string;

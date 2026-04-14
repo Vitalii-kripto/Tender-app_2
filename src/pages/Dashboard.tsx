@@ -33,7 +33,7 @@ const Dashboard = () => {
         const data = await fetchDashboardStats();
         setStats(data);
     } catch (e) {
-        logger.error(e);
+        logger.error(String(e));
     } finally {
         setLoading(false);
     }

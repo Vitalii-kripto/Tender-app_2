@@ -347,16 +347,20 @@ def migrate_db():
         ("created_at", "tenders", "DATETIME"),
         ("description", "products", "TEXT"),
         ("updated_at", "products", "DATETIME"),
+        ("normalized_category", "products", "TEXT"),
+        ("searchable_for_analogs", "products", "BOOLEAN DEFAULT 1"),
     ]
     
     for col_name, table_name, col_type in new_columns:
         try:
             cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
             logger.info(f"Added column {col_name} to table {table_name}")
-        except sqlite3.OperationalError:
-            # Колонка уже существует
-            pass
-            
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" in str(e).lower():
+                pass
+            else:
+                logger.critical(f"Migration error for {table_name}.{col_name}: {e}")
+                
     conn.commit()
     conn.close()
 
@@ -1511,34 +1515,9 @@ async def refresh_catalog(background_tasks: BackgroundTasks):
     async def _do_refresh():
         logger.info("[CATALOG] Starting catalog refresh from gidroizol.ru...")
         try:
-            products = parser_service.parse_full_catalog(max_categories=5)
-            from sqlalchemy import text
-            import json as json_lib
             with next(get_db()) as db:
-                saved = 0
-                for p in products:
-                    try:
-                        db.execute(
-                            text(
-                                "INSERT OR REPLACE INTO products "
-                                "(title, category, material_type, price, specs, url, description) "
-                                "VALUES (:title, :cat, :mat, :price, :specs, :url, :desc)"
-                            ),
-                            {
-                                "title": p.get("title", ""),
-                                "cat": p.get("category", ""),
-                                "mat": p.get("material_type", ""),
-                                "price": p.get("price"),
-                                "specs": json_lib.dumps(p.get("specs", {}), ensure_ascii=False),
-                                "url": p.get("url", ""),
-                                "desc": p.get("description", ""),
-                            }
-                        )
-                        saved += 1
-                    except Exception as e:
-                        logger.debug(f"[CATALOG] Skip product: {e}")
-                db.commit()
-            logger.info(f"[CATALOG] Refresh complete. Saved {saved} products.")
+                saved_count = await parser_service.parse_and_save(db)
+            logger.info(f"[CATALOG] Refresh complete. Saved {saved_count} products.")
         except Exception as e:
             logger.error(f"[CATALOG] Refresh failed: {e}")
 

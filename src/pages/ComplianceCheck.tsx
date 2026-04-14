@@ -20,7 +20,7 @@ const ComplianceCheck = () => {
             setAvailableTenders(tenders);
             if (tenders.length > 0) setSelectedTenderId(tenders[0].id);
         } catch (e) {
-            logger.error(e);
+            logger.error(String(e));
         }
     };
     loadData();
@@ -49,7 +49,7 @@ const ComplianceCheck = () => {
         const res = await checkTenderCompliance(tender.title, tender.description, fileNames);
         setResult(res);
     } catch (e) {
-        logger.error(e);
+        logger.error(String(e));
         alert("Ошибка при проверке. Проверьте консоль.");
     } finally {
         setLoading(false);

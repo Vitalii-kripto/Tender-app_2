@@ -96,7 +96,7 @@ const TenderCRM = () => {
               alert('Закупка не найдена в поиске. Попробуйте ввести данные вручную.');
           }
       } catch (e) {
-          logger.error(e);
+          logger.error(String(e));
           alert('Ошибка при обращении к серверу.');
       } finally {
           setIsAnalyzing(false);

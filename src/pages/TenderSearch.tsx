@@ -85,7 +85,7 @@ const TenderSearch = () => {
         prev.filter(t => !snapshot.some(s => s.id === t.id))
       );
     } catch (error) {
-      logger.error(error);
+      logger.error(String(error));
     } finally {
       setProcessing(false);
     }
@@ -105,7 +105,7 @@ const TenderSearch = () => {
     try {
       const catalogContext = MOCK_CATALOG.map(p => `${p.title} (${p.category})`).join(', ');
       const effectiveQuery = searchMode === 'catalog' 
-        ? `Найти тендеры, где требуются товары из списка: ${catalogContext}.`
+        ? `Найти тендеры, где требуются товары/материалы из списка: ${catalogContext}.`
         : query;
 
       if (!effectiveQuery && searchMode === 'keyword') {

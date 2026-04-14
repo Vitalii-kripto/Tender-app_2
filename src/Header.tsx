@@ -83,7 +83,7 @@ const Header = () => {
               setSearchResults({ tenders: foundTenders, products: foundProducts });
               setShowSearchResults(true);
           } catch (error) {
-              logger.error(error);
+              logger.error(String(error));
           } finally {
               setIsSearching(false);
           }

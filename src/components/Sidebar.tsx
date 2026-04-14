@@ -15,7 +15,7 @@ const Sidebar = () => {
       <div className="p-6 border-b border-slate-800">
         <h1 className="text-xl font-bold text-white tracking-tight flex flex-col">
           <span className="text-blue-500">TenderSmart</span>
-          <span className="text-xs font-normal text-slate-400">Gidroizol AI System</span>
+          <span className="text-xs font-normal text-slate-400">Supply Chain AI System</span>
         </h1>
       </div>
 

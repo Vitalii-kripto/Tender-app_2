@@ -21,7 +21,7 @@ import { logger } from "./loggerService";
 // Если false - пытается подключиться к API (localhost:8000).
 const IS_DEMO_MODE = false; 
 
-export const API_BASE_URL = 'http://localhost:8000'; 
+export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''; 
 
 const LOCAL_STORAGE_KEY_CRM = 'TENDER_SMART_CRM_DATA';
 const LOCAL_STORAGE_KEY_PRODUCTS = 'TENDER_SMART_PRODUCTS_DATA';
@@ -77,7 +77,7 @@ export const getCompanyProfile = (): CompanyProfile => {
     try {
         const stored = localStorage.getItem(LOCAL_STORAGE_KEY_COMPANY);
         if (stored) return JSON.parse(stored);
-    } catch (e) { logger.error(e); }
+    } catch (e) { logger.error(String(e)); }
     
     const defaults: CompanyProfile = {
         name: 'ООО "ГидроСтройКомплект"',
@@ -249,7 +249,7 @@ export const getProductsFromBackend = async (): Promise<Product[]> => {
         if (products.length > 0) saveLocalProducts(products);
         return products;
     } catch (e) {
-        return getLocalProducts();
+        throw new Error("Ошибка при загрузке каталога: " + (e as Error).message);
     }
 };
 
@@ -318,7 +318,7 @@ export const searchRequirementAnalogs = async (
     ai_results: Product[];
     total: number;
 }> => {
-    if (mode === 'catalog') {
+    if (mode === 'local') {
         const response = await fetch(`${API_BASE_URL}/api/products/search`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -728,18 +728,16 @@ export const findProductEquivalent = async (tenderSpecs: string): Promise<any> =
         return { is_equivalent: false, confidence: 0, reasoning: "Ничего не найдено", critical_mismatches: [], all_matches: [] };
 
     } catch (e) {
-        return demoMatch;
+        throw new Error("Ошибка при подборе продукта: " + (e as Error).message);
     }
 };
 
 export const searchProductsInternet = async (tenderSpecs: string): Promise<any> => {
-    const demoResult = { 
-        text: `[РЕЖИМ ДЕМО] Backend недоступен.\n\nИмитация ответа:\n1. Изопласт К-ЭПП-4.0 (~280 руб/м2)\n2. Филизол Супер ЭПП (~310 руб/м2)` 
-    };
-
     if (IS_DEMO_MODE) {
         await delay(2000);
-        return demoResult;
+        return { 
+            text: `[РЕЖИМ ДЕМО] Backend недоступен.\n\nИмитация ответа:\n1. Изопласт К-ЭПП-4.0 (~280 руб/м2)\n2. Филизол Супер ЭПП (~310 руб/м2)` 
+        };
     }
 
     try {
@@ -751,7 +749,7 @@ export const searchProductsInternet = async (tenderSpecs: string): Promise<any> 
         if(!response.ok) throw new Error("Backend error");
         return await response.json(); 
     } catch (e) {
-        return demoResult;
+        throw new Error("Ошибка при поиске в интернете: " + (e as Error).message);
     }
 };
 

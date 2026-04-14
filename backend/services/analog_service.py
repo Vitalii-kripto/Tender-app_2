@@ -21,7 +21,6 @@ class AnalogService:
     def __init__(self, ai_service, db_session_factory):
         self.ai_service = ai_service
         self.db_session_factory = db_session_factory
-        self.last_ai_error = ""
         self._ai_blocked_until: float = 0.0  # timestamp до которого AI заблокирован
         logger.info("[AnalogService] Initialized.")
 
@@ -36,8 +35,7 @@ class AnalogService:
             "и", "или", "для", "по", "на", "с", "из", "под", "над", "в",
             "материал", "товар", "требуется", "аналог", "серый", "черный",
             "поставка", "закупка", "техническое", "задание", "описание",
-            "объекта", "документация", "характеристики", "требования",
-            "кровельный", "рулонный", "битумно", "полимерное"
+            "объекта", "документация", "характеристики", "требования"
         }
         tokens = []
         for token in self._normalize_text(text).split():
@@ -424,7 +422,7 @@ class AnalogService:
         requirements: str = None,
         max_results: int = 5,
         local_db_products: list = None
-    ) -> list:
+    ) -> tuple[list, str]:
         import time
         # Проверяем флаг блокировки AI (устанавливается при 429)
         blocked_until = getattr(self, '_ai_blocked_until', 0)
@@ -434,15 +432,13 @@ class AnalogService:
                 f"[AnalogService] AI is blocked for {remaining} more min "
                 f"(quota exhausted). Skipping AI search."
             )
-            return []
+            return [], "QUOTA_EXHAUSTED"
 
         logger.info(f"[AnalogService] AI search: '{query}' | requirements={bool(requirements)}")
-        self.last_ai_error = ""
 
         if not self.ai_service:
-            self.last_ai_error = "AI service is not initialized"
-            logger.error(f"[AnalogService] {self.last_ai_error}")
-            return []
+            logger.error(f"[AnalogService] AI service is not initialized")
+            return [], "AI service is not initialized"
 
         # Очищаем запрос перед отправкой в AI
         clean_q = self._clean_search_query(query)
@@ -463,17 +459,17 @@ class AnalogService:
                 )
             local_items_text = "\n".join(lines)
 
-        prompt = f"""Ты эксперт по строительным гидроизоляционным материалам для тендерных закупок.
+        prompt = f"""Ты эксперт по материально-техническому снабжению и подбору аналогов промышленной продукции для тендерных закупок.
 
-ЗАДАЧА: Подобрать аналоги для материала: "{clean_q}"
+ЗАДАЧА: Подобрать аналоги для товара/материала: "{clean_q}"
 
 {"ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ ИЗ ТЗ ТЕНДЕРА:" + chr(10) + requirements[:800] if requirements else ""}
 
-{"УЖЕ ЕСТЬ В НАШЕМ КАТАЛОГЕ (gidroizol.ru):" + chr(10) + local_items_text if local_items_text else ""}
+{"УЖЕ ЕСТЬ В НАШЕМ КАТАЛОГЕ:" + chr(10) + local_items_text if local_items_text else ""}
 
 ИНСТРУКЦИЯ:
 1. Если в нашем каталоге уже есть подходящий аналог — укажи его первым со score >= 85
-2. Найди ещё {max_results} аналогов от других производителей (ТехноНИКОЛЬ, Технопласт, Изофлекс и др.)
+2. Найди ещё {max_results} аналогов от других производителей
 3. Для каждого аналога укажи конкретные технические характеристики
 4. Проверяй соответствие требованиям ТЗ если они указаны
 5. В поле match_reason объясни конкретно почему это аналог
@@ -484,21 +480,17 @@ class AnalogService:
 {{
   "analogs": [
     {{
-      "title": "Гидроизол ХПП-3,0 (gidroizol.ru)",
-      "manufacturer": "ЗАО Оргкровля",
-      "material_type": "Рулонная гидроизоляция",
+      "title": "Название аналога",
+      "manufacturer": "Производитель",
+      "material_type": "Тип/Категория товара",
       "specs": {{
-        "Основа": "Стеклохолст",
-        "Толщина, мм": "2.3",
-        "Масса 1м², кг": "3.0",
-        "Класс": "стандарт",
-        "Срок службы": "8 лет",
-        "ГОСТ/ТУ": "ГОСТ 32805-2014"
+        "Характеристика 1": "Значение 1",
+        "Характеристика 2": "Значение 2"
       }},
-      "price": 108,
-      "price_unit": "руб/м²",
-      "url": "https://gidroizol.ru/214?city=1",
-      "match_reason": "Аналог по основе (стеклохолст), типу (рулонный наплавляемый), назначению (нижний слой кровли/гидроизоляция фундамента)",
+      "price": 100,
+      "price_unit": "руб/ед",
+      "url": "ссылка на товар",
+      "match_reason": "Почему это аналог",
       "match_score": 90,
       "in_local_db": true
     }}
@@ -511,11 +503,11 @@ class AnalogService:
                 logger.warning(
                     f"[AnalogService] AI returned empty response."
                 )
-                return []
+                return [], "Empty response"
         except Exception as e:
             error_str = str(e)
-            is_quota = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
-            is_unavailable = "недоступен" in error_str or "временно" in error_str
+            is_quota = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "QUOTA_EXHAUSTED" in error_str
+            is_unavailable = "недоступен" in error_str or "временно" in error_str or "SERVICE_UNAVAILABLE" in error_str
 
             if is_quota or is_unavailable:
                 logger.warning(
@@ -529,16 +521,16 @@ class AnalogService:
                     f"[AnalogService] AI blocked for 1 hour "
                     f"(until {time.strftime('%H:%M', time.localtime(self._ai_blocked_until))})"
                 )
+                return [], "QUOTA_EXHAUSTED" if is_quota else "SERVICE_UNAVAILABLE"
             else:
                 logger.error(f"[AnalogService] AI search error: {e}")
-            return []
+                return [], str(e)
 
         try:
             json_match = re.search(r'\{[\s\S]*\}', response_text)
             if not json_match:
-                self.last_ai_error = "AI не вернул JSON"
                 logger.warning(f"[AnalogService] No JSON found in AI response: {response_text[:500]}")
-                return []
+                return [], "AI не вернул JSON"
 
             data = json.loads(json_match.group())
             analogs = data.get("analogs", [])
@@ -560,18 +552,15 @@ class AnalogService:
                     "source": "ai_search",
                 })
 
-            self.last_ai_error = ""
             logger.info(f"[AnalogService] AI found {len(result)} analogs for '{query}'")
-            return result
+            return result, ""
 
         except json.JSONDecodeError as e:
-            self.last_ai_error = f"AI вернул невалидный JSON: {e}"
             logger.error(f"[AnalogService] JSON parse error: {e}", exc_info=True)
-            return []
+            return [], f"AI вернул невалидный JSON: {e}"
         except Exception as e:
-            self.last_ai_error = str(e)
             logger.error(f"[AnalogService] AI search error: {e}", exc_info=True)
-            return []
+            return [], str(e)
 
     # ─────────────────────────────────────────────────────────────────────────
     # КОМБИНИРОВАННЫЙ ПОИСК
@@ -600,7 +589,8 @@ class AnalogService:
             "original_query": "исходный запрос",
             "local_results": [...],
             "ai_results": [...],
-            "total": N
+            "total": N,
+            "ai_error": "..."
           }
         """
         # Очищаем запрос
@@ -616,9 +606,10 @@ class AnalogService:
 
         # AI поиск с передачей контекста из БД
         ai_results = []
+        ai_error = ""
         if use_ai:
             # Передаём в AI что уже есть в БД — чтобы он не дублировал
-            ai_results = await self.search_ai(
+            ai_results, ai_error = await self.search_ai(
                 query=clean_query,
                 requirements=requirements,
                 max_results=5,
@@ -645,6 +636,7 @@ class AnalogService:
             "local_results": local_results,
             "ai_results": ai_unique,
             "total": len(local_results) + len(ai_unique),
+            "ai_error": ai_error
         }
 
     # ─────────────────────────────────────────────────────────────────────────
