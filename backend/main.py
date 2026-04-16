@@ -1505,7 +1505,7 @@ async def search_products_ai(request: dict):
     
     # Add mode and ai_error to match frontend expectations
     result["mode"] = mode
-    result["ai_error"] = analog_service.last_ai_error or getattr(analog_service.ai_service, "last_error_message", "")
+    result["ai_error"] = result.get("ai_error", "")
     
     return result
 

@@ -6,6 +6,7 @@
 import json
 import logging
 import re
+import time
 from typing import Optional
 from sqlalchemy.orm import Session
 
@@ -515,7 +516,6 @@ class AnalogService:
                     f"AI search skipped — returning local DB results only."
                 )
                 # Устанавливаем флаг блокировки AI на 1 час
-                import time
                 self._ai_blocked_until = time.time() + 3600
                 logger.warning(
                     f"[AnalogService] AI blocked for 1 hour "

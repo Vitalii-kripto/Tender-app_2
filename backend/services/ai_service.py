@@ -1,12 +1,14 @@
 import os
 import time
 from typing import List, Dict, Any, Optional
+from fastapi import HTTPException
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 import json
 import re
 import logging
+import hashlib
 from backend.config import GEMINI_MODEL, GEMINI_FALLBACK_MODEL
 from backend.logger import logger
 
@@ -671,7 +673,6 @@ class AiService:
         except json.JSONDecodeError as e:
             logger.error(f"JSON Decode Error: {e}")
             logger.error(f"Raw AI Response:\n{text}")
-            from fastapi import HTTPException
             raise HTTPException(status_code=500, detail=f"AI returned invalid JSON: {e}. Raw response: {text}")
 
     def generate_with_search(self, prompt: str) -> str:
@@ -680,9 +681,6 @@ class AiService:
             raise HTTPException(status_code=503, detail="Gemini client is not initialized")
 
         logger.info("generate_with_search started.")
-
-        import time
-        import hashlib
 
         # Проверяем кэш
         cache_key = hashlib.md5(prompt.encode("utf-8", errors="replace")).hexdigest()
@@ -776,7 +774,6 @@ class AiService:
             )
             return self._parse_json_response(response.text)
         except Exception as e:
-            from fastapi import HTTPException
             if isinstance(e, HTTPException):
                 raise e
             logger.error(f"AI Error (find_product_equivalent): {e}", exc_info=True)
@@ -897,7 +894,6 @@ class AiService:
             )
             return self._parse_json_response(response.text)
         except Exception as e:
-            from fastapi import HTTPException
             if isinstance(e, HTTPException):
                 raise e
             logger.error(f"Extraction Error: {e}", exc_info=True)
@@ -1037,7 +1033,6 @@ class AiService:
             )
             return self._parse_json_response(response.text)
         except Exception as e:
-            from fastapi import HTTPException
             if isinstance(e, HTTPException):
                 raise e
             logger.error(f"Comparison Error: {e}", exc_info=True)
@@ -1067,7 +1062,6 @@ class AiService:
             )
             return self._parse_json_response(response.text)
         except Exception as e:
-            from fastapi import HTTPException
             if isinstance(e, HTTPException):
                 raise e
             logger.error(f"Compliance Check Error: {e}", exc_info=True)
@@ -1112,7 +1106,6 @@ class AiService:
             )
             return self._parse_json_response(response.text)
         except Exception as e:
-            from fastapi import HTTPException
             if isinstance(e, HTTPException):
                 raise e
             logger.error(f"Extraction Error: {e}", exc_info=True)
