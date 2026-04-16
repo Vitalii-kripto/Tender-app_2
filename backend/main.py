@@ -10,6 +10,11 @@ from dotenv import load_dotenv
 
 # Загружаем переменные окружения в самом начале
 load_dotenv()
+
+from backend.logging_setup import setup_logging
+# Инициализируем логирование максимально рано
+setup_logging("LegalAI")
+
 from typing import List, Dict, Any
 from docx import Document
 from docx.shared import Pt, RGBColor
@@ -1566,4 +1571,5 @@ async def delete_product(product_id: int, db: Session = Depends(get_db)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)
+    # log_config=None заставляет uvicorn использовать уже настроенное логирование root-логгера
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True, log_config=None)

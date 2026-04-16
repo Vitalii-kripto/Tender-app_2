@@ -59,9 +59,9 @@ def _configure_root_logger() -> None:
 
     file_handler = RotatingFileHandler(
         _LOG_FILE_PATH,
-        mode="w",
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
+        mode="w",  # Явно указываем 'w' для перезаписи при каждом старте приложения
+        maxBytes=20 * 1024 * 1024,
+        backupCount=10,
         encoding="utf-8",
     )
     file_handler.setLevel(logging.DEBUG)
@@ -83,6 +83,11 @@ def _configure_root_logger() -> None:
         "asyncio",
         "sqlalchemy",
         "sqlalchemy.engine",
+        "google",
+        "httpx",
+        "httpcore",
+        "urllib3",
+        "playwright",
     ]
     for name in important_loggers:
         lg = logging.getLogger(name)

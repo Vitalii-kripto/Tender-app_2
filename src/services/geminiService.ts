@@ -425,8 +425,8 @@ export const cancelSearch = async (): Promise<void> => {
     if (IS_DEMO_MODE) return;
     try {
         await fetch(`${API_BASE_URL}/api/search-tenders/cancel`, { method: 'POST' });
-    } catch (error) {
-        logger.error("Failed to cancel search", error);
+    } catch (error: unknown) {
+        logger.error("Failed to cancel search", String(error));
     }
 };
 
@@ -560,8 +560,8 @@ export const skipTender = async (tender: Tender): Promise<void> => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(tender)
         });
-    } catch (error) {
-        logger.error("Error skipping tender", error);
+    } catch (error: unknown) {
+        logger.error("Error skipping tender", String(error));
     }
 };
 

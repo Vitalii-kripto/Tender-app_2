@@ -84,7 +84,7 @@ const TenderSearch = () => {
       setSelectedTenders(prev =>
         prev.filter(t => !snapshot.some(s => s.id === t.id))
       );
-    } catch (error) {
+    } catch (error: unknown) {
       logger.error(String(error));
     } finally {
       setProcessing(false);

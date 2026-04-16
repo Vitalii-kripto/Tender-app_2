@@ -267,9 +267,9 @@ export default function AnalysisPage() {
         if (list.length > 0) {
           setSelectedTenderId((prev) => prev ?? list[0].id);
         }
-      } catch (error) {
-        logger.error("Failed to load tenders:", error);
-      }
+    } catch (error: unknown) {
+      logger.error("Failed to load tenders:", String(error));
+    }
     };
 
     loadTenders();
@@ -286,8 +286,8 @@ export default function AnalysisPage() {
         const data = await response.json();
         const files = Array.isArray(data) ? data : data.files || [];
         setTenderFiles((prev) => ({ ...prev, [selectedTenderId]: files }));
-      } catch (error) {
-        logger.error("Failed to load files:", error);
+      } catch (error: unknown) {
+        logger.error("Failed to load files:", String(error));
         setTenderFiles((prev) => ({ ...prev, [selectedTenderId]: [] }));
       } finally {
         setLoadingFilesId(null);
@@ -320,9 +320,9 @@ export default function AnalysisPage() {
         }
 
         window.setTimeout(poll, 2000);
-      } catch (error) {
+      } catch (error: unknown) {
         if (isCancelled) return;
-        logger.error("Polling error:", error);
+        logger.error("Polling error:", String(error));
         setPollError(String(error));
         window.setTimeout(poll, 3000);
       }
@@ -432,8 +432,8 @@ export default function AnalysisPage() {
 
         return { ...prev, [tenderId]: next };
       });
-    } catch (error) {
-      logger.error("Refresh failed:", error);
+    } catch (error: unknown) {
+      logger.error("Refresh failed:", String(error));
       setRefreshErrors((prev) => ({
         ...prev,
         [tenderId]: [{ message: String(error) }],
@@ -511,8 +511,8 @@ export default function AnalysisPage() {
 
       const data = await response.json();
       setCurrentJobId(data.job_id);
-    } catch (error) {
-      logger.error("Analyze error:", error);
+    } catch (error: unknown) {
+      logger.error("Analyze error:", String(error));
       alert(`Ошибка запуска анализа: ${String(error)}`);
     } finally {
       setLaunchingAnalysis(false);
@@ -556,8 +556,8 @@ export default function AnalysisPage() {
       link.click();
       link.remove();
       window.URL.revokeObjectURL(blobUrl);
-    } catch (error) {
-      logger.error("Export error:", error);
+    } catch (error: unknown) {
+      logger.error("Export error:", String(error));
       alert(`Ошибка экспорта отчёта: ${String(error)}`);
     } finally {
       setExportingReport(false);

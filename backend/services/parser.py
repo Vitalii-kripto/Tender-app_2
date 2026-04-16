@@ -10,7 +10,7 @@ from langchain_community.document_loaders.recursive_url_loader import RecursiveU
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger("GidroizolParser")
-logger.setLevel(logging.INFO)
+# logger.setLevel(logging.INFO) - Удалено для использования общего уровня DEBUG
 
 ASYNC_CONCURRENCY = 10
 ASYNC_TIMEOUT = 30

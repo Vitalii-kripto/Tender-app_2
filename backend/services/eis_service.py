@@ -56,7 +56,7 @@ def ensure_dir(p: str):
 
 # Use a specific logger for this service
 logger = logging.getLogger("EIS_Service")
-logger.setLevel(logging.INFO)
+# logger.setLevel(logging.INFO) - Удалено для использования общего уровня DEBUG
 
 def log(message: str):
     logger.info(message)
