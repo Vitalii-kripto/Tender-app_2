@@ -1095,6 +1095,14 @@ class EisService:
         item = result[0]
         ok = item.get("status") == "selected" and bool(item.get("files"))
 
+        if ok and os.path.isdir(tender_dir):
+            try:
+                from backend.services.archive_service import archive_service
+                archive_service.unpack_directory(tender_dir)
+            except Exception as e:
+                import logging
+                logging.getLogger("eis").error(f"Error unpacking docs in redownload: {e}")
+
         return {
             "ok": ok,
             "reason": item.get("reason", "" if ok else "download_failed"),
@@ -1279,12 +1287,23 @@ class EisService:
                                 })
 
                         if downloaded_files:
+                            try:
+                                from backend.services.archive_service import archive_service
+                                archive_service.unpack_directory(reg_dir)
+                            except Exception as e:
+                                logger.error(f"Error unpacking docs in process_tenders: {e}")
+
+                            final_files = []
+                            for root, _, files in os.walk(reg_dir):
+                                for f in files:
+                                    final_files.append(os.path.join(root, f))
+
                             mark_seen(n.reg)
                             results.append({
                                 "reg": n.reg,
                                 "status": "selected",
                                 "docs_url": d_url,
-                                "files": downloaded_files,
+                                "files": final_files,
                                 "failed_downloads": failed_downloads,
                             })
                         else:

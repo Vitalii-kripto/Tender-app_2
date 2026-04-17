@@ -18,11 +18,12 @@ const logStream = createWriteStream(LOG_FILE, {
 
 const VENV_PYTHON_WIN = join(__dirname, ".venv", "Scripts", "python.exe");
 const VENV_PYTHON_UNIX = join(__dirname, ".venv", "bin", "python");
+const isWin = process.platform === "win32";
 const PYTHON_CMD = existsSync(VENV_PYTHON_WIN)
   ? VENV_PYTHON_WIN
   : existsSync(VENV_PYTHON_UNIX)
     ? VENV_PYTHON_UNIX
-    : "python";
+    : isWin ? "python" : "python3";
 
 const BACKEND_CMD = ["-m", "uvicorn", "backend.main:app", "--reload", "--port", "8000"];
 const FRONTEND_CMD = ["run", "dev:frontend"];

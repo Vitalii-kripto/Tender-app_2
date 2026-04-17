@@ -354,6 +354,23 @@ class AnalogService:
                     params[pname] = like
 
                 where = " OR ".join(conditions)
+                
+                # Дополнительная фильтрация: только профильные категории материалов
+                # Исключаем оборудование, электротехнику и т.д.
+                CATEGORY_WHITELIST = [
+                    "гидроизоляция", "мастика", "праймер", "рубероид", "гидроизол",
+                    "материалы", "кровля", "строительные", "битум", "изоляция", "утеплитель"
+                ]
+                
+                cat_conditions = []
+                for idx, c_val in enumerate(CATEGORY_WHITELIST):
+                    p_name = f"c_white_{idx}"
+                    cat_conditions.append(f"LOWER(category) LIKE :{p_name} OR LOWER(title) LIKE :{p_name}")
+                    params[p_name] = f"%{c_val}%"
+                
+                cat_where = " OR ".join(cat_conditions)
+                
+                where = f"({where}) AND searchable_for_analogs = 1 AND ({cat_where})"
 
                 if category:
                     where = f"({where}) AND LOWER(category) LIKE :user_cat"

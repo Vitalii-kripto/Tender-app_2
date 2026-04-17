@@ -1026,12 +1026,19 @@ def get_tender_files(tender_id: str, _ = Depends(check_doc_service)):
     if not os.path.exists(tender_dir):
         return []
     
+    try:
+        from backend.services.archive_service import archive_service
+        # Распаковываем старые/ручные архивы, если они есть
+        archive_service.unpack_directory(tender_dir)
+    except Exception as e:
+        logger.error(f"Error unpacking docs in get_tender_files: {e}")
+
     files = []
-    for filename in os.listdir(tender_dir):
-        filepath = os.path.join(tender_dir, filename)
-        if os.path.isfile(filepath):
+    for root, _, filenames in os.walk(tender_dir):
+        for filename in filenames:
+            filepath = os.path.join(root, filename)
             files.append({
-                "name": filename,
+                "name": os.path.relpath(filepath, tender_dir).replace("\\", "/"),
                 "size": os.path.getsize(filepath),
                 "ext": os.path.splitext(filename)[1].lower()
             })
@@ -1064,11 +1071,11 @@ async def refresh_tender_files(
 
     files = []
     if os.path.exists(tender_dir):
-        for f in os.listdir(tender_dir):
-            f_path = os.path.join(tender_dir, f)
-            if os.path.isfile(f_path):
+        for root, _, filenames in os.walk(tender_dir):
+            for f in filenames:
+                f_path = os.path.join(root, f)
                 files.append({
-                    "name": f,
+                    "name": os.path.relpath(f_path, tender_dir).replace("\\", "/"),
                     "size": os.path.getsize(f_path),
                     "path": f_path
                 })
@@ -1195,6 +1202,13 @@ async def api_extract_tender_requirements(payload: dict = Body(...), db: Session
             all_files = []
             has_archives = False
             if local_path and os.path.exists(local_path):
+                if os.path.isdir(local_path):
+                    try:
+                        from backend.services.archive_service import archive_service
+                        archive_service.unpack_directory(local_path)
+                    except Exception as e:
+                        logger.error(f"Error unpacking docs in api_extract_tender_requirements: {e}")
+
                 if os.path.isfile(local_path):
                     all_files.append(local_path)
                     if local_path.lower().endswith(('.zip', '.7z', '.rar')):
@@ -1320,10 +1334,34 @@ async def api_extract_tender_requirements(payload: dict = Body(...), db: Session
             job_id="crm_goods_extraction",
         )
 
-        # Совместимость со старым frontend:
-        # positions -> items
-        result["items"] = [
-            {
+        result["items"] = []
+        for pos in result.get("positions", []):
+            name = pos.get("position_name_normalized") or pos.get("position_name_raw") or ""
+            
+            # Form search_query using name and key characteristics
+            chars = pos.get("characteristics", [])
+            key_chars = []
+            for c in chars:
+                c_name = str(c.get("name", "")).lower()
+                c_val = str(c.get("value", ""))
+                # Add key characteristics to query (like thickness, mass, brand, size)
+                if any(k in c_name for k in ["толщина", "масса", "марка", "размер", "плотность", "гост", "ту"]):
+                     key_chars.append(f"{c_val}")
+            
+            search_query = name
+            if key_chars:
+                search_query += " " + " ".join(key_chars[:3]) # Limit to 3 key chars so it's not too long
+
+            # Define if the item is degraded
+            qty = str(pos.get("quantity", "")).strip().lower()
+            unt = str(pos.get("unit", "")).strip().lower()
+            has_qty = qty and qty not in ["не указано", "нет", "none", "null"]
+            has_unt = unt and unt not in ["не указано", "нет", "none", "null"]
+            has_chars = len(chars) > 0
+            
+            is_low_quality = not has_chars and not has_qty
+
+            result["items"].append({
                 "position_name": pos.get("position_name_normalized") or pos.get("position_name_raw"),
                 "normalized_name": pos.get("position_name_normalized") or pos.get("position_name_raw"),
                 "quantity": pos.get("quantity"),
@@ -1333,13 +1371,12 @@ async def api_extract_tender_requirements(payload: dict = Body(...), db: Session
                     for c in pos.get("characteristics", [])
                 ],
                 "notes": pos.get("notes", ""),
-                "search_query": pos.get("position_name_normalized") or pos.get("position_name_raw"),
+                "search_query": search_query.strip(),
                 "source_documents": pos.get("source_documents", []),
                 "general_requirements_applied": pos.get("general_requirements_applied", False),
                 "analog_allowed": pos.get("analog_allowed", False),
-            }
-            for pos in result.get("positions", [])
-        ]
+                "quality_status": "degraded" if is_low_quality else "good",
+            })
 
         result["general_requirements"] = [
             req.get("value") for req in result.get("general_goods_requirements") or []
@@ -1418,11 +1455,20 @@ async def upload_tender_file(
 
     logger.info(f"Manually uploaded file {file.filename} for tender {tender_id}")
     
+    # UNPACK if archive
+    try:
+        from backend.services.archive_service import archive_service
+        if archive_service.is_archive(file_path):
+            archive_service.unpack_directory(tender_dir)
+            logger.info(f"Unpacked manual upload {file.filename} in {tender_dir}")
+    except Exception as e:
+        logger.error(f"Error unpacking manual upload {file.filename}: {e}")
+
     return {
         "status": "success",
         "file": {
             "name": file.filename,
-            "size": os.path.getsize(file_path),
+            "size": os.path.getsize(file_path) if os.path.exists(file_path) else 0,
             "path": file_path
         }
     }
@@ -1607,6 +1653,12 @@ async def search_products_ai(request: dict):
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
 
+    warnings = []
+    # If the query is too short or too generic (no digits, no specific markings)
+    import re
+    if len(query) < 10 or (not bool(re.search(r'\d|[a-zA-Z]', query)) and len(query.split()) < 3):
+         warnings.append("Поисковый запрос выглядит слишком общим (вероятно из-за низкого качества извлечения ТЗ). Данные поиска могут быть нерелевантными.")
+
     if analog_service is None:
         raise HTTPException(status_code=503, detail="AnalogService is not initialized")
 
@@ -1625,6 +1677,7 @@ async def search_products_ai(request: dict):
         result["ai_results"] = []
         
     result["total"] = len(result["local_results"]) + len(result["ai_results"])
+    result["warnings"] = warnings
     
     # Add mode and ai_error to match frontend expectations
     result["mode"] = mode

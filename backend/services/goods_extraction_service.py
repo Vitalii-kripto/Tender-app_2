@@ -15,7 +15,7 @@ PROMPT_UNIFIED_GOODS_EXTRACTION = """
 1) товарные позиции,
 2) количества,
 3) единицы измерения,
-4) конкретные технические характеристики,
+4) конкретные технические характеристики (масса, толщина, плотность, класс, размер, гост и т.д.),
 5) общие требования к качеству, упаковке, происхождению, сертификатам, гарантиям,
 6) признаки допуска аналога / эквивалента,
 7) ссылки на источник (файл, страница, лист, таблица).
@@ -23,50 +23,51 @@ PROMPT_UNIFIED_GOODS_EXTRACTION = """
 ТЕБЕ ПЕРЕДАЮТ НЕ ОТДЕЛЬНОЕ ТЗ, А ВЕСЬ ПАКЕТ ДОКУМЕНТАЦИИ:
 включая извещение, документацию, описание объекта закупки, проект договора, приложения, спецификации, excel-листы, сметы и прочее.
 
-ОБЯЗАТЕЛЬНОЕ ПРАВИЛО:
-Сначала классифицируй каждый фрагмент документа как один из типов:
-- GOODS_SPEC — товарная спецификация / таблица поставки / описание объекта закупки / ТЗ;
-- GOODS_GENERAL_REQUIREMENTS — общие требования к товару;
-- CONTRACT_TERMS — условия договора, оплаты, ответственности, приемки, расторжения;
-- PROCUREMENT_RULES — требования к участнику, состав заявки, критерии оценки;
-- PRICE_JUSTIFICATION — НМЦК, расчеты, сметы, коммерческие предложения;
-- OTHER — прочее.
+ОБЯЗАТЕЛЬНОЕ ПРАВИЛО КЛАССИФИКАЦИИ (ИГНОРИРУЙ ЮР. МУСОР):
+1. Используй для извлечения позиций только товарные спецификации, таблицы и описание объекта закупки (GOODS_SPEC).
+2. Используй для общих требований к товару только разделы с требованиями (GOODS_GENERAL_REQUIREMENTS), такие как гарантии, требования к новизне, сертификаты.
+3. НИКОГДА не извлекай позиции из инструкций для участников, условий оплаты, штрафов, НМЦК, если там нет конкретных требований к товару.
 
-ДАЛЬШЕ:
-1. Используй для извлечения позиций только фрагменты типа GOODS_SPEC.
-2. Используй для общих требований к товару только GOODS_GENERAL_REQUIREMENTS.
-3. CONTRACT_TERMS, PROCUREMENT_RULES и PRICE_JUSTIFICATION НЕ должны превращаться в товарные позиции.
-4. Если спецификация встречается и в ТЗ, и в приложении к договору, считай это дублем одной и той же позиции и не дублируй её.
-5. Если характеристики даны отдельно от таблицы позиций, привяжи их ко всем позициям или к тем позициям, к которым они явно относятся.
-6. Если товар задан точным наименованием/маркой — сохраняй точное наименование.
-7. Если товар задан параметрически — собирай нормализованное название из типа товара и ключевых признаков.
-8. Не подменяй отсутствующие данные догадками.
-9. Не извлекай:
-   - оплату,
-   - штрафы,
-   - пени,
-   - сроки подписания,
-   - банковские реквизиты,
-   - требования к участнику,
-   - формы заявок,
-   - НМЦК,
-   - национальный режим,
-   - протоколы и служебные разделы,
-   если они не содержат прямых требований к самому товару.
-10. Если количество или единица измерения указаны только в дублирующем документе (например, в спецификации к договору), а характеристики — в ТЗ, объедини данные в одну позицию.
+ПРАВИЛА ИЗВЛЕЧЕНИЯ И НОРМАЛИЗАЦИИ НАИМЕНОВАНИЯ (КРИТИЧЕСКИ ВАЖНО):
+1. ЗАПРЕЩАЕТСЯ сводить позицию к общему классу товара.
+   ПЛОХО: "Материал кровельный рулонный"
+   ХОРОШО: "Материал кровельный рулонный верхний слой ТКП-4,5"
+   ПЛОХО: "Мастика битумная"
+   ХОРОШО: "Мастика битумная ТехноНИКОЛЬ №24 20 кг" 
+2. При нормализации (position_name_normalized) ОБЯЗАТЕЛЬНО сохраняй:
+   - марку (например, ТКП, ХПП, ЭПП);
+   - буквенную маркировку;
+   - слой (верхний / нижний);
+   - материал основы (стеклоткань, полиэфир и т.д.);
+   - ключевые размерные признаки;
+   - точное товарное наименование, если оно указано.
+3. Слова "или эквивалент", "аналог" удаляются из названия товара, но флаг analog_allowed ставится в true.
 
-ФОРМАТ ОТВЕТА — СТРОГО JSON И НИЧЕГО КРОМЕ JSON:
+ПРАВИЛА ИЗВЛЕЧЕНИЯ КОЛИЧЕСТВА И ЕДИНИЦ ИЗМЕРЕНИЯ:
+1. Ищи количество и единицу измерения по всей строке таблицы или в соседних столбцах (шт, м2, м, мм, кг, т, л, рулон, упак, мешок, комплект, лист).
+2. Если в ТЗ нет количества, но есть дублирующая спецификация (приложение к договору / сметный расчет), возьми количество оттуда и объедини в одну позицию.
+3. ЗАПРЕЩАЕТСЯ выводить quantity: null / "не указано", если эти данные физически есть в переданном тексте.
+
+ПРАВИЛА ИЗВЛЕЧЕНИЯ ХАРАКТЕРИСТИК:
+1. Вытаскивай все технические характеристики в поле characteristics (name и value).
+2. Толщина, ширина, длина, масса 1 м2, плотность, теплостойкость, гибкость, прочность, водопоглощение, температурные диапазоны, ГОСТ/ТУ.
+3. Запрещено оставлять пустой массив characteristics, если в тексте рядом с названием позиции указаны параметры. Поищи параметры в той же ячейке, соседних, или общем тексте ТЗ к этой позиции.
+
+ПРАВИЛА ВЫДЕЛЕНИЯ ОБЩИХ ТРЕБОВАНИЙ:
+1. Если в тексте есть общие требования к качеству, новизне, упаковке, сертификации, ГОСТам, срокам годности товара — выдели их в массив `general_goods_requirements`.
+
+ПРАВИЛА ФОРМАТА (ТОЛЬКО JSON):
 
 {
   "positions": [
     {
       "position_id": 1,
-      "position_name_raw": "...",
-      "position_name_normalized": "...",
-      "quantity": "...",
-      "unit": "...",
+      "position_name_raw": "ОРИГИНАЛЬНОЕ НАЗВАНИЕ ИЗ ТЕКСТА",
+      "position_name_normalized": "ТОЧНОЕ НАИМЕНОВАНИЕ С МАРКОЙ И СЛОЕМ",
+      "quantity": "число или диапазон",
+      "unit": "м2, шт, кг и др.",
       "characteristics": [
-        {"name": "...", "value": "..."}
+        {"name": "Толщина", "value": "не менее 3 мм"}
       ],
       "general_requirements_applied": true,
       "analog_allowed": true,
@@ -84,16 +85,9 @@ PROMPT_UNIFIED_GOODS_EXTRACTION = """
   ],
   "general_goods_requirements": [
     {
-      "name": "...",
-      "value": "...",
-      "source_documents": [
-        {
-          "file": "...",
-          "page_or_sheet": "...",
-          "fragment_type": "GOODS_GENERAL_REQUIREMENTS",
-          "evidence": "короткая цитата"
-        }
-      ]
+      "name": "Требования к новизне",
+      "value": "Товар должен быть новым, не бывшим в употреблении...",
+      "source_documents": [...]
     }
   ],
   "extraction_summary": {
@@ -104,12 +98,7 @@ PROMPT_UNIFIED_GOODS_EXTRACTION = """
   }
 }
 
-ОСОБЫЕ ПРАВИЛА НОРМАЛИЗАЦИИ:
-- Если в позиции есть марка типа ТКП, ТПП, ЭПП, ХПП и т.п. — сохраняй её в normalized name.
-- Если есть "или эквивалент" / "аналог" — это не часть названия товара, а отдельный признак analog_allowed.
-- Если общие требования относятся ко всем товарам, не копируй их в text blob, а вынеси в general_goods_requirements.
-- Если фрагмент содержит только юр./процедурную информацию — не создавай из него позицию.
-- Если видишь повтор позиции в проекте договора и в ТЗ — оставь одну запись, но сохрани оба источника.
+ПОМНИ: Твоя главная задача — ИЗБЕЖАТЬ ПОТЕРИ ДАННЫХ. Сохрани техническую конкретику товара, его количество и характеристики. Не обобщай!
 
 ТЕПЕРЬ ПРОАНАЛИЗИРУЙ ПАКЕТ ДОКУМЕНТОВ НИЖЕ:
 
@@ -655,7 +644,7 @@ class GoodsExtractionService:
                 "position_id": 0,
                 "position_name_raw": raw_name or norm_name,
                 "position_name_normalized": norm_name or raw_name,
-                "quantity": self._normalize_quantity(item.get("quantity")),
+                "quantity": self._normalize_string(item.get("quantity")), # DO NOT STRIP ALL SPACES
                 "unit": self._normalize_string(item.get("unit")),
                 "characteristics": self._normalize_characteristics(item.get("characteristics")),
                 "general_requirements_applied": bool(item.get("general_requirements_applied")),
@@ -716,6 +705,32 @@ class GoodsExtractionService:
                     if w and w not in warnings:
                         warnings.append(w)
 
+        positions_with_quantity = sum(1 for p in positions if p.get("quantity") and str(p.get("quantity")).lower() not in ["не указано", "нет", "null", "none", ""])
+        positions_with_unit = sum(1 for p in positions if p.get("unit") and str(p.get("unit")).lower() not in ["не указано", "нет", "null", "none", ""])
+        positions_with_characteristics = sum(1 for p in positions if p.get("characteristics"))
+
+        if positions:
+            missing_qty = len(positions) - positions_with_quantity
+            missing_chars = len(positions) - positions_with_characteristics
+            if missing_chars == len(positions):
+                warnings.append("У найденных позиций отсутствуют характеристики")
+            if missing_qty == len(positions):
+                warnings.append("У найденных позиций отсутствуют количества из-за неполного распознавания или их отсутствия в тексте")
+
+        quality_summary = {
+            "positions_found": len(positions),
+            "positions_with_quantity": positions_with_quantity,
+            "positions_with_unit": positions_with_unit,
+            "positions_with_characteristics": positions_with_characteristics,
+            "general_requirements_found": len(general_goods_requirements),
+            "archives_blocking": len(context_meta.get("archives_skipped", [])) > 0,
+            "critical_degraded": False
+        }
+        
+        # Determine degraded status
+        if (len(positions) > 0 and positions_with_characteristics == 0 and positions_with_quantity == 0) or quality_summary["archives_blocking"]:
+             quality_summary["critical_degraded"] = True
+
         result = {
             "positions": positions,
             "general_goods_requirements": general_goods_requirements,
@@ -726,6 +741,7 @@ class GoodsExtractionService:
                 "duplicates_merged": duplicates_merged,
                 "ignored_fragments_types": ["CONTRACT_TERMS", "PROCUREMENT_RULES", "PRICE_JUSTIFICATION"],
                 "warnings": warnings,
+                "quality_summary": quality_summary
             }
         }
         return result
