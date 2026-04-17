@@ -1188,61 +1188,110 @@ async def api_extract_tender_requirements(payload: dict = Body(...), db: Session
             if not tender:
                 continue
 
-            added_any = False
-
-            # 2.1 Если есть путь к файлу или папке с документами
             local_path = (getattr(tender, "local_file_path", None) or "").strip()
+            extracted_text = (getattr(tender, "extracted_text", None) or "").strip()
+            description_text = (getattr(tender, "description", None) or "").strip()
+
+            all_files = []
+            has_archives = False
             if local_path and os.path.exists(local_path):
                 if os.path.isfile(local_path):
-                    extracted = doc_service.extract_document_data(local_path)
-                    files_data.append(extracted)
-
-                    if extracted.get("status") == "success" and extracted.get("extracted_text"):
-                        processed_files += 1
-                    else:
-                        failed_files += 1
-
-                    added_any = True
-
+                    all_files.append(local_path)
+                    if local_path.lower().endswith(('.zip', '.7z', '.rar')):
+                        has_archives = True
                 elif os.path.isdir(local_path):
                     for root, _, filenames in os.walk(local_path):
                         for filename in filenames:
-                            file_path = os.path.join(root, filename)
-                            extracted = doc_service.extract_document_data(file_path)
-                            files_data.append(extracted)
+                            fpath = os.path.join(root, filename)
+                            all_files.append(fpath)
+                            if fpath.lower().endswith(('.zip', '.7z', '.rar')):
+                                has_archives = True
 
-                            if extracted.get("status") == "success" and extracted.get("extracted_text"):
-                                processed_files += 1
-                            else:
-                                failed_files += 1
+            logger.info(
+                f"[GOODS_PACKET_START] tender_id={tender_id} selected_files_count={len(all_files)} "
+                f"selected_filenames={[os.path.basename(f) for f in all_files]} request_source='CRM' "
+                f"has_archives={has_archives} has_local_file_path={bool(local_path)} has_extracted_text={bool(extracted_text)}"
+            )
 
-                            added_any = True
+            added_any = False
+            packet_files_data = []
 
-            # 2.2 Fallback: если файлов нет, но есть ранее извлеченный текст
-            extracted_text = (getattr(tender, "extracted_text", None) or "").strip()
+            # Process files
+            for fpath in all_files:
+                filename = os.path.basename(fpath)
+                ext = os.path.splitext(fpath)[1].lower()
+                size_bytes = os.path.getsize(fpath) if os.path.exists(fpath) else 0
+
+                extracted = doc_service.extract_document_data(fpath, tender_id=tender_id)
+                packet_files_data.append(extracted)
+
+                if extracted.get("status") == "success" and extracted.get("extracted_text"):
+                    decision = "included"
+                    reason = "Success"
+                    added_any = True
+                elif ext in ['.zip', '.7z', '.rar']:
+                    decision = "archive_skipped"
+                    reason = "Archive not supported"
+                elif extracted.get("status") == "skipped_empty":
+                    decision = "empty"
+                    reason = "Empty text"
+                else:
+                    decision = "skipped"
+                    reason = extracted.get("error_message") or "Unknown"
+
+                logger.info(
+                    f"[GOODS_PACKET_FILE_DECISION] tender_id={tender_id} filename='{filename}' full_path='{fpath}' "
+                    f"extension='{ext}' decision='{decision}' reason='{reason}' priority='N/A' size_bytes={size_bytes}"
+                )
+
+            # Fallbacks
             if not added_any and extracted_text:
-                files_data.append({
+                packet_files_data.append({
                     "filename": f"{tender_id}_extracted_text.txt",
                     "status": "success",
                     "error_message": "",
                     "extracted_text": extracted_text,
                     "pages": [{"page_num": 1, "text": extracted_text, "tables": []}],
                 })
-                processed_files += 1
+                logger.warning(
+                    f"[GOODS_PACKET_FILE_DECISION] tender_id={tender_id} filename='{tender_id}_extracted_text.txt' full_path='N/A' "
+                    f"extension='.txt' decision='degraded' reason='Fallback to extracted_text' priority='N/A' size_bytes={len(extracted_text)}"
+                )
                 added_any = True
 
-            # 2.3 Последний fallback: описание тендера
-            description_text = (getattr(tender, "description", None) or "").strip()
             if not added_any and description_text:
-                files_data.append({
+                packet_files_data.append({
                     "filename": f"{tender_id}_description.txt",
                     "status": "success",
                     "error_message": "",
                     "extracted_text": description_text,
                     "pages": [{"page_num": 1, "text": description_text, "tables": []}],
                 })
-                processed_files += 1
+                logger.warning(
+                    f"[GOODS_PACKET_FILE_DECISION] tender_id={tender_id} filename='{tender_id}_description.txt' full_path='N/A' "
+                    f"extension='.txt' decision='degraded' reason='Fallback to description' priority='N/A' size_bytes={len(description_text)}"
+                )
                 added_any = True
+
+            files_data.extend(packet_files_data)
+
+            total_text_chars = sum(len(f.get("extracted_text", "")) for f in packet_files_data if f.get("status") == "success")
+            total_pages = sum(len(f.get("pages", [])) for f in packet_files_data if f.get("status") == "success")
+            total_tables = sum(sum(len(p.get("tables", [])) for p in f.get("pages", [])) for f in packet_files_data if f.get("status") == "success")
+            
+            success_files = sum(1 for f in packet_files_data if f.get("status") == "success" and f.get("extracted_text"))
+            packet_failed_files = len(packet_files_data) - success_files
+            archives_skipped = sum(1 for f in all_files if f.lower().endswith(('.zip', '.7z', '.rar')))
+            
+            processed_files += success_files
+            failed_files += packet_failed_files
+
+            logger.info(
+                f"[GOODS_PACKET_READY] tender_id={tender_id} total_input_files={len(all_files)} "
+                f"included_files_count={success_files} skipped_files_count={packet_failed_files} archives_skipped_count={archives_skipped} "
+                f"success_files={success_files} failed_files={packet_failed_files} total_text_chars={total_text_chars} total_pages={total_pages} "
+                f"total_tables={total_tables} critical_degraded={not added_any or (not all_files and bool(extracted_text or description_text))}"
+            )
 
         if not files_data:
             return {

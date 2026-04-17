@@ -246,13 +246,15 @@ class DocumentService:
             logger.warning(f"Error checking if file is HTML: {e}")
         return False
 
-    def extract_document_data(self, file_path: str, use_cache: bool = True) -> Dict[str, Any]:
+    def extract_document_data(self, file_path: str, use_cache: bool = True, tender_id: str = "unknown") -> Dict[str, Any]:
         """
         Извлечение структурированных данных из документа (страницы, листы, статус).
         """
         filename = os.path.basename(file_path)
         ext = os.path.splitext(file_path)[1].lower()
         
+        logger.info(f"[DOC_EXTRACT_START] tender_id={tender_id} filename='{filename}' extension='{ext}' file_path='{file_path}'")
+
         result = {
             "filename": filename,
             "file_path": file_path,
@@ -269,6 +271,7 @@ class DocumentService:
         if not os.path.exists(file_path):
             result["status"] = "skipped_not_found"
             result["error_message"] = "Файл не найден"
+            logger.info(f"[DOC_EXTRACT_RESULT] tender_id={tender_id} filename='{filename}' extension='{ext}' status='{result['status']}' extract_method='none' text_length=0 pages_count=0 tables_count=0 quality_flags='' error_message='{result['error_message']}'")
             return result
             
         file_size = os.path.getsize(file_path)
@@ -277,11 +280,20 @@ class DocumentService:
         if file_size == 0:
             result["status"] = "skipped_empty"
             result["error_message"] = "Файл пуст"
+            logger.info(f"[DOC_EXTRACT_RESULT] tender_id={tender_id} filename='{filename}' extension='{ext}' status='{result['status']}' extract_method='none' text_length=0 pages_count=0 tables_count=0 quality_flags='' error_message='{result['error_message']}'")
+            return result
+
+        if ext in ['.zip', '.7z', '.rar']:
+            result["status"] = "skipped_unsupported_type"
+            result["error_message"] = "Archive not supported for direct analysis"
+            logger.warning(f"[DOC_ARCHIVE_UNSUPPORTED] tender_id={tender_id} filename='{filename}' extension='{ext}' reason=archive_not_supported_for_direct_analysis")
+            logger.info(f"[DOC_EXTRACT_RESULT] tender_id={tender_id} filename='{filename}' extension='{ext}' status='{result['status']}' extract_method='none' text_length=0 pages_count=0 tables_count=0 quality_flags='' error_message='{result['error_message']}'")
             return result
 
         if self._is_html_file(file_path):
             result["status"] = "skipped_invalid_file"
             result["error_message"] = "Файл является HTML-страницей (ошибка скачивания)"
+            logger.info(f"[DOC_EXTRACT_RESULT] tender_id={tender_id} filename='{filename}' extension='{ext}' status='{result['status']}' extract_method='none' text_length=0 pages_count=0 tables_count=0 quality_flags='' error_message='{result['error_message']}'")
             return result
 
         mtime = os.path.getmtime(file_path)
@@ -440,14 +452,36 @@ class DocumentService:
             result["status"] = "failed_text_extraction"
             result["error_message"] = str(e)
 
-        result["text_length"] = len(result["extracted_text"])
+        result["text_length"] = len(result.get("extracted_text", ""))
 
         if result.get("status") == "success":
             # For cache compatibility, we store it in the old format too
             cache_data = result.copy()
             cache_data["text"] = result["extracted_text"]
             self.text_cache[cache_key] = cache_data
-            
+
+        # Final DOC_EXTRACT_RESULT log
+        tables_total = sum(len(p.get("tables", [])) for p in result.get("pages", []))
+        pages_count = len(result.get("pages", []))
+        logger.info(
+            f"[DOC_EXTRACT_RESULT] tender_id={tender_id} filename='{filename}' extension='{ext}' status='{result['status']}' "
+            f"extract_method='{result['extract_method']}' text_length={result['text_length']} pages_count={pages_count} "
+            f"tables_count={tables_total} quality_flags='' error_message='{result['error_message']}'"
+        )
+        
+        # DOC_PAGE_STATS logs
+        for p in result.get("pages", []):
+            pnum = p.get("page_num", 0)
+            plen = len(p.get("text", ""))
+            ptab = len(p.get("tables", []))
+            ocr_used = result.get("ocr_used", False)
+            # degraded could mean skipped empty due to low quality but let's default to False
+            degraded = False
+            logger.debug(
+                f"[DOC_PAGE_STATS] tender_id={tender_id} filename='{filename}' page_num={pnum} "
+                f"text_length={plen} tables_count={ptab} ocr_used={ocr_used} degraded={degraded} quality_score='N/A'"
+            )
+
         return result
 
     def extract_text(self, file_path: str) -> str:

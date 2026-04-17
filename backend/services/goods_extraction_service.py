@@ -136,7 +136,7 @@ class GoodsExtractionService:
         job_id: str = "N/A",
         callback: Optional[Callable[[str, int, str], None]] = None,
     ) -> Dict[str, Any]:
-        documents_block, context_meta = self._build_goods_documents_block(files_data)
+        documents_block, context_meta = self._build_goods_documents_block(files_data, tender_id=tender_id)
 
         logger.info(
             f"[GOODS_EXTRACTION_START] tender_id={tender_id} job_id={job_id} "
@@ -154,6 +154,8 @@ class GoodsExtractionService:
                     "В пакете обнаружены архивы, которые не были распакованы до извлечения: "
                     + ", ".join(item["filename"] for item in context_meta["archives_skipped"])
                 )
+            
+            logger.warning(f"[GOODS_EXTRACTION_WARNING] tender_id={tender_id} reason='no_documents_block' raw_data=''")
             return self._empty_result(context_meta, warnings)
 
         prompt = PROMPT_UNIFIED_GOODS_EXTRACTION.replace("__DOCUMENTS__", documents_block)
@@ -163,6 +165,12 @@ class GoodsExtractionService:
                 callback("Извлечение товарных позиций из всей документации", 55, "running")
 
             start_time = time.time()
+            prompt_chars = len(prompt)
+
+            logger.info(
+                f"[GOODS_EXTRACTION_PROMPT_STATS] tender_id={tender_id} job_id={job_id} "
+                f"prompt_length_chars={prompt_chars} model_tier='gemini' max_output_tokens='N/A' temperature='N/A'"
+            )
 
             response = self.ai_service._call_ai_with_retry(
                 self.ai_service.client.models.generate_content,
@@ -170,19 +178,37 @@ class GoodsExtractionService:
             )
 
             raw_text = response.text if response else ""
+            preview = raw_text[:100].replace('\n', ' ').replace('\r', '')
+
+            logger.info(
+                f"[GOODS_EXTRACTION_AI_RAW] tender_id={tender_id} job_id={job_id} "
+                f"response_length_chars={len(raw_text)} response_preview='{preview}...'"
+            )
+
             parsed = self._parse_json_response(raw_text)
 
-            normalized = self._normalize_extraction_result(parsed, context_meta)
+            logger.info(
+                f"[GOODS_EXTRACTION_JSON_PARSE] tender_id={tender_id} job_id={job_id} "
+                f"status='success' raw_positions_count={len(parsed.get('positions', []))} "
+                f"raw_general_requirements_count={len(parsed.get('general_goods_requirements', []))}"
+            )
+
+            normalized = self._normalize_extraction_result(parsed, context_meta, tender_id, job_id)
             duration = time.time() - start_time
 
             logger.info(
-                f"[GOODS_EXTRACTION_DONE] tender_id={tender_id} "
-                f"positions={len(normalized['positions'])} duration={duration:.2f}s"
+                f"[GOODS_EXTRACTION_DONE] tender_id={tender_id} job_id={job_id} "
+                f"final_positions_count={len(normalized.get('positions', []))} final_general_requirements_count={len(normalized.get('general_goods_requirements', []))} "
+                f"duration_seconds={duration:.2f} errors_count={len(normalized.get('warnings', []))}"
             )
             return normalized
 
         except Exception as e:
             logger.error(f"Goods extraction error for tender {tender_id}: {e}", exc_info=True)
+            logger.info(
+                f"[GOODS_EXTRACTION_JSON_PARSE] tender_id={tender_id} job_id={job_id} "
+                f"status='failed' raw_positions_count=0 raw_general_requirements_count=0"
+            )
             return self._empty_result(
                 context_meta,
                 [f"Ошибка извлечения товарных данных: {str(e)}"]
@@ -279,7 +305,7 @@ class GoodsExtractionService:
 
         return "OTHER"
 
-    def _render_goods_pages(self, file_data: Dict[str, Any]) -> str:
+    def _render_goods_pages(self, file_data: Dict[str, Any], tender_id: str = "N/A") -> str:
         filename = file_data.get("filename", "Unknown")
         status = file_data.get("status", "success")
         pages = file_data.get("pages", []) or []
@@ -298,9 +324,24 @@ class GoodsExtractionService:
         if not pages:
             cleaned = self._clean_text(text)
             frag_type = self._classify_text_fragment(cleaned)
+            logger.info(
+                f"[GOODS_CONTEXT_FILE_CLASSIFIED] tender_id={tender_id} filename='{filename}' doc_class_hint='{doc_hint}' "
+                f"priority={priority} status='single_block' pages_included=1 tables_included=0 text_chars_included={len(cleaned)}"
+            )
             return header + f"--- PAGE_OR_SHEET: 1 | FRAGMENT_TYPE_HINT: {frag_type} ---\n[TEXT]\n{cleaned}\n"
 
         blocks: List[str] = [header]
+        fragments_stats = {
+            "GOODS_SPEC": 0,
+            "GOODS_GENERAL_REQUIREMENTS": 0,
+            "CONTRACT_TERMS": 0,
+            "PROCUREMENT_RULES": 0,
+            "PRICE_JUSTIFICATION": 0,
+            "OTHER": 0,
+        }
+        tables_count = 0
+        text_chars = 0
+
         for page in pages:
             page_num = page.get("page_num", "")
             page_text = self._clean_text(page.get("text", "") or "")
@@ -311,6 +352,11 @@ class GoodsExtractionService:
                 all_fragment_text += "\n\n" + "\n\n".join(self._clean_text(t) for t in tables if t)
             fragment_type = self._classify_text_fragment(all_fragment_text)
 
+            if fragment_type in fragments_stats:
+                fragments_stats[fragment_type] += 1
+            else:
+                fragments_stats["OTHER"] = fragments_stats.get("OTHER", 0) + 1
+
             blocks.append(
                 f"--- PAGE_OR_SHEET: {page_num} | FRAGMENT_TYPE_HINT: {fragment_type} ---"
             )
@@ -318,6 +364,7 @@ class GoodsExtractionService:
             if page_text:
                 blocks.append("[TEXT]")
                 blocks.append(page_text)
+                text_chars += len(page_text)
 
             if tables:
                 blocks.append("[TABLES]")
@@ -326,14 +373,31 @@ class GoodsExtractionService:
                     if table_clean:
                         blocks.append(f"[TABLE {idx}]")
                         blocks.append(table_clean)
+                        tables_count += 1
+                        text_chars += len(table_clean)
+
+        logger.info(
+            f"[GOODS_CONTEXT_FRAGMENT_STATS] tender_id={tender_id} filename='{filename}' "
+            f"goods_spec_fragments={fragments_stats['GOODS_SPEC']} goods_general_requirement_fragments={fragments_stats['GOODS_GENERAL_REQUIREMENTS']} "
+            f"contract_terms_fragments={fragments_stats['CONTRACT_TERMS']} procurement_rule_fragments={fragments_stats['PROCUREMENT_RULES']} "
+            f"price_fragments={fragments_stats['PRICE_JUSTIFICATION']} other_fragments={fragments_stats['OTHER']}"
+        )
+        
+        logger.info(
+            f"[GOODS_CONTEXT_FILE_CLASSIFIED] tender_id={tender_id} filename='{filename}' doc_class_hint='{doc_hint}' "
+            f"priority={priority} status='success' pages_included={len(pages)} tables_included={tables_count} text_chars_included={text_chars}"
+        )
 
         return "\n\n".join(blocks).strip() + "\n"
 
     def _build_goods_documents_block(
         self,
         files_data: List[Dict[str, Any]],
+        tender_id: str = "N/A",
         max_total_chars: int = 180000,
     ) -> Tuple[str, Dict[str, Any]]:
+        logger.info(f"[GOODS_CONTEXT_BUILD_START] tender_id={tender_id} files_count={len(files_data)}")
+
         sorted_files = sorted(files_data, key=lambda f: self._document_priority_for_goods(f.get("filename", "")))
 
         included_files: List[str] = []
@@ -341,6 +405,8 @@ class GoodsExtractionService:
         archives_skipped: List[Dict[str, Any]] = []
         rendered_parts: List[str] = []
         total_chars = 0
+        total_pages = 0
+        total_tables = 0
 
         for file_data in sorted_files:
             filename = file_data.get("filename", "Unknown")
@@ -361,7 +427,7 @@ class GoodsExtractionService:
                 })
                 continue
 
-            rendered = self._render_goods_pages(file_data)
+            rendered = self._render_goods_pages(file_data, tender_id=tender_id)
             if not rendered.strip():
                 skipped_files.append({"filename": filename, "reason": "empty_render"})
                 continue
@@ -373,6 +439,8 @@ class GoodsExtractionService:
             rendered_parts.append(rendered)
             included_files.append(filename)
             total_chars += len(rendered)
+            total_pages += len(file_data.get("pages", []))
+            total_tables += sum(len(p.get("tables", [])) for p in file_data.get("pages", []))
 
         block = "\n\n".join(rendered_parts).strip()
         meta = {
@@ -382,6 +450,12 @@ class GoodsExtractionService:
             "archives_skipped": archives_skipped,
             "total_chars": total_chars,
         }
+
+        logger.info(
+            f"[GOODS_CONTEXT_BUILD_DONE] tender_id={tender_id} included_files={len(included_files)} skipped_files={len(skipped_files)} "
+            f"total_chars={total_chars} total_pages={total_pages} total_tables={total_tables} block_count={len(rendered_parts)} context_truncated={len(skipped_files) > 0}"
+        )
+
         return block, meta
 
     def _parse_json_response(self, raw_text: str) -> Dict[str, Any]:
@@ -544,13 +618,17 @@ class GoodsExtractionService:
     def _normalize_extraction_result(
         self,
         parsed: Dict[str, Any],
-        context_meta: Dict[str, Any]
+        context_meta: Dict[str, Any],
+        tender_id: str = "N/A",
+        job_id: str = "N/A",
     ) -> Dict[str, Any]:
         raw_positions = parsed.get("positions", []) if isinstance(parsed, dict) else []
         raw_general = parsed.get("general_goods_requirements", []) if isinstance(parsed, dict) else []
         raw_summary = parsed.get("extraction_summary", {}) if isinstance(parsed, dict) else {}
 
         positions: List[Dict[str, Any]] = []
+        rejected_count = 0
+
         for item in raw_positions:
             if not isinstance(item, dict):
                 continue
@@ -559,10 +637,21 @@ class GoodsExtractionService:
             norm_name = self._normalize_position_name(
                 item.get("position_name_normalized") or raw_name
             )
+            
+            logger.debug(
+                f"[GOODS_EXTRACTION_POSITION_RAW] tender_id={tender_id} position_name_raw='{raw_name}' "
+                f"quantity='{item.get('quantity')}' unit='{item.get('unit')}' chars_count={len(item.get('characteristics', []))}"
+            )
+
             if not raw_name and not norm_name:
+                rejected_count += 1
+                logger.warning(
+                    f"[GOODS_EXTRACTION_WARNING] tender_id={tender_id} reason='empty_name' "
+                    f"raw_data='{json.dumps(item, ensure_ascii=False)[:200]}'"
+                )
                 continue
 
-            positions.append({
+            validated_item = {
                 "position_id": 0,
                 "position_name_raw": raw_name or norm_name,
                 "position_name_normalized": norm_name or raw_name,
@@ -574,9 +663,24 @@ class GoodsExtractionService:
                 "manufacturer_or_brand_required": bool(item.get("manufacturer_or_brand_required")),
                 "source_documents": self._normalize_source_documents(item.get("source_documents")),
                 "notes": self._normalize_string(item.get("notes")),
-            })
+            }
+            positions.append(validated_item)
+
+            logger.debug(
+                f"[GOODS_EXTRACTION_POSITION_NORMALIZED] tender_id={tender_id} position_name_normalized='{validated_item['position_name_normalized']}' "
+                f"quantity='{validated_item['quantity']}' unit='{validated_item['unit']}' chars_count={len(validated_item['characteristics'])} "
+                f"analog_allowed={validated_item['analog_allowed']}"
+            )
 
         positions, duplicates_merged = self._merge_positions(positions)
+        
+        logger.info(
+            f"[GOODS_EXTRACTION_MERGE] tender_id={tender_id} initial_positions={len(raw_positions)} "
+            f"rejected_positions={rejected_count} duplicates_merged={duplicates_merged} final_positions={len(positions)}"
+        )
+
+        if not positions:
+            logger.warning(f"[GOODS_EXTRACTION_WARNING] tender_id={tender_id} reason='no_positions_found' raw_data=''")
 
         general_goods_requirements: List[Dict[str, Any]] = []
         seen_general = set()
