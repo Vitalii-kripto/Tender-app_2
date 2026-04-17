@@ -1188,34 +1188,61 @@ async def api_extract_tender_requirements(payload: dict = Body(...), db: Session
             if not tender:
                 continue
 
-            docs = db.query(DocumentModel).filter(DocumentModel.tender_id == tender_id).all()
+            added_any = False
 
-            for doc in docs:
-                file_path = doc.file_path
-                if not file_path:
-                    continue
-
-                extracted = doc_service.extract_document_data(file_path)
-
-                if extracted.get("status") == "success" and extracted.get("extracted_text"):
-                    files_data.append(extracted)
-                    processed_files += 1
-                else:
-                    failed_files += 1
+            # 2.1 Если есть путь к файлу или папке с документами
+            local_path = (getattr(tender, "local_file_path", None) or "").strip()
+            if local_path and os.path.exists(local_path):
+                if os.path.isfile(local_path):
+                    extracted = doc_service.extract_document_data(local_path)
                     files_data.append(extracted)
 
-            # fallback: если документов нет, но есть описание тендера
-            if not docs and getattr(tender, "description", None):
-                fallback_text = tender.description.strip()
-                if fallback_text:
-                    files_data.append({
-                        "filename": f"{tender_id}_crm_description.txt",
-                        "status": "success",
-                        "error_message": "",
-                        "extracted_text": fallback_text,
-                        "pages": [{"page_num": 1, "text": fallback_text, "tables": []}],
-                    })
-                    processed_files += 1
+                    if extracted.get("status") == "success" and extracted.get("extracted_text"):
+                        processed_files += 1
+                    else:
+                        failed_files += 1
+
+                    added_any = True
+
+                elif os.path.isdir(local_path):
+                    for root, _, filenames in os.walk(local_path):
+                        for filename in filenames:
+                            file_path = os.path.join(root, filename)
+                            extracted = doc_service.extract_document_data(file_path)
+                            files_data.append(extracted)
+
+                            if extracted.get("status") == "success" and extracted.get("extracted_text"):
+                                processed_files += 1
+                            else:
+                                failed_files += 1
+
+                            added_any = True
+
+            # 2.2 Fallback: если файлов нет, но есть ранее извлеченный текст
+            extracted_text = (getattr(tender, "extracted_text", None) or "").strip()
+            if not added_any and extracted_text:
+                files_data.append({
+                    "filename": f"{tender_id}_extracted_text.txt",
+                    "status": "success",
+                    "error_message": "",
+                    "extracted_text": extracted_text,
+                    "pages": [{"page_num": 1, "text": extracted_text, "tables": []}],
+                })
+                processed_files += 1
+                added_any = True
+
+            # 2.3 Последний fallback: описание тендера
+            description_text = (getattr(tender, "description", None) or "").strip()
+            if not added_any and description_text:
+                files_data.append({
+                    "filename": f"{tender_id}_description.txt",
+                    "status": "success",
+                    "error_message": "",
+                    "extracted_text": description_text,
+                    "pages": [{"page_num": 1, "text": description_text, "tables": []}],
+                })
+                processed_files += 1
+                added_any = True
 
         if not files_data:
             return {
