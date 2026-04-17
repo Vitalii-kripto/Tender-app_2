@@ -170,9 +170,15 @@ class GoodsExtractionService:
                 f"prompt_length_chars={prompt_chars} model_tier='gemini' max_output_tokens='N/A' temperature='N/A'"
             )
 
+            from google.genai import types
+            
             response = self.ai_service._call_ai_with_retry(
                 self.ai_service.client.models.generate_content,
                 contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1
+                )
             )
 
             raw_text = response.text if response else ""
