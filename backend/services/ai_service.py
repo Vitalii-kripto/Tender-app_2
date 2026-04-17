@@ -101,9 +101,10 @@ class AiService:
         except Exception as e:
             logger.error(f"Startup check: Fallback model {self.fallback_model_name} is also OFFLINE: {e}")
 
-        logger.critical("Startup check: CRITICAL - No AI models are available! Analysis will be blocked.")
-        self.active_model = ""
-        return ""
+        logger.critical("Startup check: WARNING - No AI models are available right now. Backend will start in degraded mode, AI operations will fail until models come online.")
+        # DO NOT DO THIS: self.active_model = "" 
+        # By keeping active_model, we can try to call the AI when it's back online!
+        return self.model_name
 
     def _is_transient_error(self, error: Exception) -> bool:
         """Определяет, является ли ошибка временной (429, 503, 504, timeout)."""
