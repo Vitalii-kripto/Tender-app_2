@@ -37,6 +37,7 @@ from .services.parser import GidroizolParser
 from .services.document_service import DocumentService
 from .services.ai_service import AiService
 from .services.legal_analysis_service import LegalAnalysisService
+from .services.goods_extraction_service import GoodsExtractionService
 from .services.batch_analysis import analyze_tenders_batch_job
 from .services.job_service import job_service
 from pydantic import BaseModel
@@ -425,6 +426,12 @@ try:
         logger.info("[OK] LegalAnalysisService initialized.")
     except Exception as e:
         logger.error(f"[FAILED] LegalAnalysisService initialization error: {e}")
+
+    try:
+        goods_extraction_service = GoodsExtractionService(ai_service)
+        logger.info("[OK] GoodsExtractionService initialized.")
+    except Exception as e:
+        logger.error(f"[FAILED] GoodsExtractionService initialization error: {e}")
 
 except Exception as e:
     logger.error(f"[FAILED] AiService initialization error: {e}")
@@ -1138,135 +1145,143 @@ async def api_extract_products(data: dict = Body(...), _ = Depends(check_ai_serv
     return ai_service.extract_products_from_text(text)
 
 @app.post("/api/ai/extract-tender-requirements")
-async def api_extract_tender_requirements(
-    data: dict = Body(...),
-    db: Session = Depends(get_db),
-    _ = Depends(check_ai_service)
-):
+async def api_extract_tender_requirements(payload: dict = Body(...), db: Session = Depends(get_db)):
     """
-    Извлечение позиций ТЗ:
-    - либо из ручного текста,
-    - либо из выбранных тендеров CRM.
+    Новое извлечение товарных позиций по всей документации
+    по архитектуре блока "ИИ-юрист".
     """
-    manual_text = (data.get("manual_text") or "").strip()
-    tender_ids = data.get("tender_ids") or []
+    tender_ids = payload.get("tender_ids") or []
+    manual_text = (payload.get("manual_text") or "").strip()
 
-    items: List[Dict[str, Any]] = []
-    warnings: List[Dict[str, Any]] = []
-    general_requirements: List[str] = []
+    try:
+        # 1. Режим ручного текста
+        if manual_text:
+            files_data = [{
+                "filename": "manual_input.txt",
+                "status": "success",
+                "error_message": "",
+                "extracted_text": manual_text,
+                "pages": [{"page_num": 1, "text": manual_text, "tables": []}],
+            }]
 
-    if manual_text:
-        try:
-            extraction_data = ai_service.extract_tender_requirement_positions(manual_text)
-            extracted_items = extraction_data.get("items") or []
-            
-            for index, item in enumerate(extracted_items, start=1):
-                position_name = str(item.get("position_name") or "").strip()
-                if not position_name:
+            result = goods_extraction_service.extract_goods_requirements(
+                files_data=files_data,
+                tender_id="manual",
+                job_id="manual_goods_extraction",
+            )
+            # Adapt general requirements payload for frontend compatibility
+            result["general_requirements"] = [
+                req.get("value") for req in result.get("general_goods_requirements") or []
+            ]
+            return result
+
+        # 2. Режим тендеров из CRM
+        if not tender_ids:
+            raise HTTPException(status_code=400, detail="Не передан ни manual_text, ни tender_ids")
+
+        files_data = []
+        processed_files = 0
+        failed_files = 0
+
+        for tender_id in tender_ids:
+            tender = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
+            if not tender:
+                continue
+
+            docs = db.query(DocumentModel).filter(DocumentModel.tender_id == tender_id).all()
+
+            for doc in docs:
+                file_path = doc.file_path
+                if not file_path:
                     continue
 
-                items.append({
-                    "id": f"manual-{index}",
-                    "source": "manual",
-                    "source_label": "Ручной ввод",
-                    "position_name": position_name,
-                    "quantity": str(item.get("quantity") or "").strip(),
-                    "unit": str(item.get("unit") or "").strip(),
-                    "characteristics": item.get("characteristics") or [],
-                    "notes": str(item.get("notes") or "").strip(),
-                    "search_query": str(item.get("search_query") or position_name).strip(),
-                })
-            
-            # Добавляем общие требования
-            for gr in extraction_data.get("general_requirements") or []:
-                general_requirements.append(gr)
+                extracted = doc_service.extract_document_data(file_path)
 
-            for w in extraction_data.get("warnings") or []:
-                warnings.append({
-                    "source": "manual",
-                    "status": "warning",
-                    "message": w
-                })
-        except Exception as e:
-            logger.error(f"Extraction endpoint failed for manual text: {e}", exc_info=True)
-            warnings.append({
-                "status": "error",
-                "message": f"Извлечение требований из ручного ввода выполнено с ошибкой: {str(e)}"
-            })
+                if extracted.get("status") == "success" and extracted.get("extracted_text"):
+                    files_data.append(extracted)
+                    processed_files += 1
+                else:
+                    failed_files += 1
+                    files_data.append(extracted)
 
-    for tender_id in tender_ids:
-        tender = db.query(TenderModel).filter(TenderModel.id == tender_id).first()
-        if not tender:
-            warnings.append({
-                "tender_id": tender_id,
-                "status": "not_found",
-                "message": "Тендер не найден в CRM",
-            })
-            continue
+            # fallback: если документов нет, но есть описание тендера
+            if not docs and getattr(tender, "description", None):
+                fallback_text = tender.description.strip()
+                if fallback_text:
+                    files_data.append({
+                        "filename": f"{tender_id}_crm_description.txt",
+                        "status": "success",
+                        "error_message": "",
+                        "extracted_text": fallback_text,
+                        "pages": [{"page_num": 1, "text": fallback_text, "tables": []}],
+                    })
+                    processed_files += 1
 
-        source_data = collect_tender_text_for_matching(tender)
-        source_text = (source_data.get("text") or "").strip()
+        if not files_data:
+            return {
+                "positions": [],
+                "general_goods_requirements": [],
+                "general_requirements": [],
+                "warnings": ["Не удалось получить текст ни из одного документа тендера"],
+                "debug": {
+                    "documents_count": 0,
+                    "included_files": [],
+                    "skipped_files": [],
+                    "archives_skipped": [],
+                    "total_chars": 0,
+                },
+                "extraction_summary": {
+                    "positions_count": 0,
+                    "duplicates_merged": 0,
+                    "ignored_fragments_types": ["CONTRACT_TERMS", "PROCUREMENT_RULES", "PRICE_JUSTIFICATION"],
+                    "warnings": ["Не удалось получить текст ни из одного документа тендера"],
+                }
+            }
 
-        if not source_text:
-            warnings.append({
-                "tender_id": tender.id,
-                "status": "empty_source",
-                "message": "Для тендера нет текста ТЗ и нет пригодного описания",
-            })
-            continue
+        result = goods_extraction_service.extract_goods_requirements(
+            files_data=files_data,
+            tender_id=",".join(str(x) for x in tender_ids),
+            job_id="crm_goods_extraction",
+        )
 
-        try:
-            extraction_data = ai_service.extract_tender_requirement_positions(source_text)
-            extracted_items = extraction_data.get("items") or []
+        # Совместимость со старым frontend:
+        # positions -> items
+        result["items"] = [
+            {
+                "position_name": pos.get("position_name_normalized") or pos.get("position_name_raw"),
+                "normalized_name": pos.get("position_name_normalized") or pos.get("position_name_raw"),
+                "quantity": pos.get("quantity"),
+                "unit": pos.get("unit"),
+                "characteristics": [
+                    f"{c.get('name')}: {c.get('value')}" if c.get("name") and c.get("value") else c.get("value") or c.get("name") or ""
+                    for c in pos.get("characteristics", [])
+                ],
+                "notes": pos.get("notes", ""),
+                "search_query": pos.get("position_name_normalized") or pos.get("position_name_raw"),
+                "source_documents": pos.get("source_documents", []),
+                "general_requirements_applied": pos.get("general_requirements_applied", False),
+                "analog_allowed": pos.get("analog_allowed", False),
+            }
+            for pos in result.get("positions", [])
+        ]
 
-            for index, item in enumerate(extracted_items, start=1):
-                position_name = str(item.get("position_name") or "").strip()
-                if not position_name:
-                    continue
+        result["general_requirements"] = [
+            req.get("value") for req in result.get("general_goods_requirements") or []
+        ]
 
-                items.append({
-                    "id": f"{tender.id}-{index}",
-                    "tender_id": tender.id,
-                    "tender_title": tender.title or "",
-                    "source": "crm",
-                    "source_label": f"{tender.id} — {tender.title or ''}".strip(),
-                    "position_name": position_name,
-                    "quantity": str(item.get("quantity") or "").strip(),
-                    "unit": str(item.get("unit") or "").strip(),
-                    "characteristics": item.get("characteristics") or [],
-                    "notes": str(item.get("notes") or "").strip(),
-                    "search_query": str(item.get("search_query") or position_name).strip(),
-                })
-            
-            # Добавляем общие требования
-            for gr in extraction_data.get("general_requirements") or []:
-                general_requirements.append(gr)
+        result["processing_stats"] = {
+            "processed_files": processed_files,
+            "failed_files": failed_files,
+            "input_tenders": tender_ids,
+        }
 
-            for w in extraction_data.get("warnings") or []:
-                warnings.append({
-                    "tender_id": tender.id,
-                    "status": "warning",
-                    "message": w
-                })
-        except Exception as e:
-            logger.error(f"Extraction endpoint failed for tender {tender.id}: {e}", exc_info=True)
-            warnings.append({
-                "tender_id": tender.id,
-                "status": "error",
-                "message": f"Извлечение требований выполнено с ошибкой: {str(e)}"
-            })
+        return result
 
-        for warning in source_data.get("warnings") or []:
-            warnings.append({
-                "tender_id": tender.id,
-                **warning,
-            })
-
-    return {
-        "items": items,
-        "warnings": warnings,
-        "general_requirements": list(set(general_requirements))
-    }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"api_extract_tender_requirements failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка извлечения ТЗ: {str(e)}")
 
 @app.post("/api/ai/enrich-specs")
 async def api_enrich_specs(data: dict = Body(...), _ = Depends(check_ai_service)):
