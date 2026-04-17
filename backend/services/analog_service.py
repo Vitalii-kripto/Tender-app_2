@@ -445,9 +445,9 @@ class AnalogService:
         # Проверяем флаг блокировки AI (устанавливается при 429)
         blocked_until = getattr(self, '_ai_blocked_until', 0)
         if time.time() < blocked_until:
-            remaining = int(blocked_until - time.time()) // 60
+            remaining = int(blocked_until - time.time())
             logger.info(
-                f"[AnalogService] AI is blocked for {remaining} more min "
+                f"[AnalogService] AI is blocked for {remaining} more sec "
                 f"(quota exhausted). Skipping AI search."
             )
             return [], "QUOTA_EXHAUSTED"
@@ -532,11 +532,11 @@ class AnalogService:
                     f"[AnalogService] AI quota/unavailable: {error_str[:100]}. "
                     f"AI search skipped — returning local DB results only."
                 )
-                # Устанавливаем флаг блокировки AI на 1 час
-                self._ai_blocked_until = time.time() + 3600
+                # Setting block flag for 10 seconds (transient block) instead of 1 hr to allow testing
+                self._ai_blocked_until = time.time() + 10
                 logger.warning(
-                    f"[AnalogService] AI blocked for 1 hour "
-                    f"(until {time.strftime('%H:%M', time.localtime(self._ai_blocked_until))})"
+                    f"[AnalogService] AI blocked for 10 seconds "
+                    f"(until {time.strftime('%H:%M:%S', time.localtime(self._ai_blocked_until))})"
                 )
                 return [], "QUOTA_EXHAUSTED" if is_quota else "SERVICE_UNAVAILABLE"
             else:

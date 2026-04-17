@@ -724,7 +724,7 @@ class AiService:
                 self.client.models.generate_content,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    tools=[types.Tool(google_search=types.GoogleSearch())]
+                    response_mime_type="application/json"
                 )
             )
 
