@@ -102,9 +102,12 @@ class AiService:
             logger.error(f"Startup check: Fallback model {self.fallback_model_name} is also OFFLINE: {e}")
 
         logger.critical("Startup check: WARNING - No AI models are available right now. Backend will start in degraded mode, AI operations will fail until models come online.")
-        # DO NOT DO THIS: self.active_model = "" 
-        # By keeping active_model, we can try to call the AI when it's back online!
-        return self.model_name
+        
+        # When all models fail, we still assign the primary model to self.active_model.
+        # This ensures the rest of the application won't crash due to empty active_model
+        # and it will attempt to hit the primary model once quota limits reset.
+        self.active_model = self.model_name
+        return self.active_model
 
     def _is_transient_error(self, error: Exception) -> bool:
         """Определяет, является ли ошибка временной (429, 503, 504, timeout)."""
@@ -131,8 +134,9 @@ class AiService:
             raise Exception("Gemini Client not initialized")
 
         if not self.active_model:
-            raise Exception("Внешний AI-сервис временно недоступен, анализ не завершен")
-
+            logger.warning("[AIService] active_model was empty. Setting to primary model.")
+            self.active_model = self.model_name
+        
         max_retries = 4
         kwargs["model"] = kwargs.get("model") or self.active_model
         quota_switched = False
