@@ -1153,11 +1153,14 @@ async def api_extract_tender_requirements(
 
     items: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
+    general_requirements: List[str] = []
 
     if manual_text:
         try:
-            extracted = ai_service.extract_tender_requirement_positions(manual_text)
-            for index, item in enumerate(extracted, start=1):
+            extraction_data = ai_service.extract_tender_requirement_positions(manual_text)
+            extracted_items = extraction_data.get("items") or []
+            
+            for index, item in enumerate(extracted_items, start=1):
                 position_name = str(item.get("position_name") or "").strip()
                 if not position_name:
                     continue
@@ -1172,6 +1175,17 @@ async def api_extract_tender_requirements(
                     "characteristics": item.get("characteristics") or [],
                     "notes": str(item.get("notes") or "").strip(),
                     "search_query": str(item.get("search_query") or position_name).strip(),
+                })
+            
+            # Добавляем общие требования
+            for gr in extraction_data.get("general_requirements") or []:
+                general_requirements.append(gr)
+
+            for w in extraction_data.get("warnings") or []:
+                warnings.append({
+                    "source": "manual",
+                    "status": "warning",
+                    "message": w
                 })
         except Exception as e:
             logger.error(f"Extraction endpoint failed for manual text: {e}", exc_info=True)
@@ -1202,9 +1216,10 @@ async def api_extract_tender_requirements(
             continue
 
         try:
-            extracted = ai_service.extract_tender_requirement_positions(source_text)
+            extraction_data = ai_service.extract_tender_requirement_positions(source_text)
+            extracted_items = extraction_data.get("items") or []
 
-            for index, item in enumerate(extracted, start=1):
+            for index, item in enumerate(extracted_items, start=1):
                 position_name = str(item.get("position_name") or "").strip()
                 if not position_name:
                     continue
@@ -1221,6 +1236,17 @@ async def api_extract_tender_requirements(
                     "characteristics": item.get("characteristics") or [],
                     "notes": str(item.get("notes") or "").strip(),
                     "search_query": str(item.get("search_query") or position_name).strip(),
+                })
+            
+            # Добавляем общие требования
+            for gr in extraction_data.get("general_requirements") or []:
+                general_requirements.append(gr)
+
+            for w in extraction_data.get("warnings") or []:
+                warnings.append({
+                    "tender_id": tender.id,
+                    "status": "warning",
+                    "message": w
                 })
         except Exception as e:
             logger.error(f"Extraction endpoint failed for tender {tender.id}: {e}", exc_info=True)
@@ -1239,6 +1265,7 @@ async def api_extract_tender_requirements(
     return {
         "items": items,
         "warnings": warnings,
+        "general_requirements": list(set(general_requirements))
     }
 
 @app.post("/api/ai/enrich-specs")

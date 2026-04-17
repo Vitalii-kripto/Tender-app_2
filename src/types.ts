@@ -109,6 +109,7 @@ export interface RequirementExtractionWarning {
 export interface RequirementExtractionResponse {
   items: TenderRequirementItem[];
   warnings: RequirementExtractionWarning[];
+  general_requirements?: string[];
 }
 
 export interface ComplianceFileStatus {

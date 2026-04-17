@@ -5,6 +5,13 @@ from fastapi import HTTPException
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+from backend.services.tz_extractor import (
+    extract_tz_from_text, 
+    extract_relevant_text, 
+    MODEL_AGNOSTIC_PROMPT,
+    RequirementItem,
+    ExtractionResult
+)
 import json
 import re
 import logging
@@ -898,64 +905,35 @@ class AiService:
             logger.error(f"Extraction Error: {e}", exc_info=True)
             return []
 
-    def extract_tender_requirement_positions(self, text: str):
+    def extract_tender_requirement_positions(self, text: str) -> Dict[str, Any]:
         """
-        Извлекает из ТЗ только поставляемые материальные позиции.
-        Перед extraction сначала выделяет релевантные блоки и убирает шум.
+        Универсальное извлечение позиций ТЗ (rule-based + AI).
+        Сначала выполняется rule-based анализ, затем AI дообработка по очищенному тексту.
         """
-        text = self._normalize_requirement_text(text)
-        if not text:
-            return []
-
-        candidate_text = self._prepare_requirement_candidate_text(text)
-        if not candidate_text:
-            return []
-
-        logger.info(f"Extracting tender requirement positions. Length: {len(candidate_text)}")
-
-        try:
-            fallback_items = self._rule_based_extract_requirement_positions(candidate_text)
-        except Exception as fallback_error:
-            logger.error(
-                f"[AiService] Rule-based extraction failed: {fallback_error}",
-                exc_info=True
-            )
-            fallback_items = []
-
+        logger.info(f"Extracting universal requirements. Raw text length: {len(text)}")
+        
+        # 1. Сначала используем универсальный rule-based экстрактор
+        rb_result = extract_tz_from_text(text)
+        
+        # 2. Если AI клиент недоступен, возвращаем rule-based результат
         if not self.client:
-            logger.warning("AI client is unavailable. Returning rule-based requirement extraction.")
-            return fallback_items
+            logger.warning("AI client is unavailable. Returning rule-based extraction result only.")
+            return rb_result
 
-        chunks = self._split_text_for_llm(candidate_text, chunk_size=12000, overlap=1000)
-        ai_items = []
+        # 3. Выделяем очищенный релевантный текст для AI
+        relevant_text, debug_info = extract_relevant_text(text)
+        if not relevant_text.strip():
+            return rb_result
 
-        for chunk_index, chunk in enumerate(chunks[:6], start=1):
-            prompt = f"""
-            Роль: старший инженер-сметчик и эксперт по материально-техническому снабжению.
-
-            Нужно извлечь только поставляемые материальные позиции из фрагмента ТЗ.
-            Игнорируй работы, услуги, этапы, договорные условия, требования к участнику,
-            НМЦД, расчеты, национальный режим, извещение и общие процедурные формулировки.
-            Нельзя додумывать характеристики, которых нет в тексте.
-            Если одна и та же позиция встречается несколько раз, возвращай одну нормализованную запись.
-            Если строка содержит служебные ссылки на файл/страницу/источник — игнорируй такие хвосты
-            и извлекай только чистое название товара и характеристики.
-
-            Верни СТРОГО JSON-массив.
-            Формат каждой записи:
-            {{
-              "position_name": "нормализованное название товара/материала",
-              "quantity": "количество строкой",
-              "unit": "единица измерения",
-              "characteristics": ["список технических характеристик"],
-              "notes": "важная оговорка",
-              "search_query": "короткий поисковый запрос для поиска аналогов"
-            }}
-
-            ФРАГМЕНТ ТЗ:
-            {chunk}
-            """
-
+        # 4. Выполняем AI извлечение по очищенному тексту
+        ai_result = {"items": [], "general_requirements": [], "warnings": []}
+        
+        # Разбиваем на чанки если текст слишком длинный
+        chunks = self._split_text_for_llm(relevant_text, chunk_size=15000, overlap=1000)
+        
+        for chunk in chunks[:4]: # Ограничиваем количество чанков для экономии токенов
+            prompt = f"{MODEL_AGNOSTIC_PROMPT}\n\nФРАГМЕНТ ТЗ:\n{chunk}"
+            
             try:
                 response = self._call_ai_with_retry(
                     self.client.models.generate_content,
@@ -965,16 +943,74 @@ class AiService:
                     )
                 )
                 part = self._parse_json_response(response.text)
-                if isinstance(part, list):
-                    ai_items.extend(part)
+                if isinstance(part, dict):
+                    ai_result["items"].extend(part.get("items", []))
+                    ai_result["general_requirements"].extend(part.get("general_requirements", []))
+                    ai_result["warnings"].extend(part.get("warnings", []))
             except Exception as e:
-                logger.warning(
-                    f"Requirement extraction chunk {chunk_index} failed, "
-                    f"rule-based fallback will be used for this fragment: {e}"
-                )
+                logger.error(f"AI requirement extraction chunk failed: {e}")
 
-        merged = self._merge_requirement_positions(fallback_items + ai_items)
-        return merged
+        # 5. Смерживаем результаты
+        # Собираем все айтемы
+        combined_items = rb_result.get("items", []) + ai_result.get("items", [])
+        
+        # Нормализуем и мержим дубликаты
+        # (в tz_extractor есть merge_similar_items, но он работает с RequirementItem)
+        # Для простоты превратим все в словари и используем логику мерджа
+        
+        final_items = self._merge_requirement_positions_v2(combined_items)
+        
+        final_warnings = list(set(rb_result.get("warnings", []) + ai_result.get("warnings", [])))
+        final_reqs = list(set(rb_result.get("general_requirements", []) + ai_result.get("general_requirements", [])))
+        
+        return {
+            "items": final_items,
+            "general_requirements": final_reqs,
+            "warnings": final_warnings,
+            "debug": {
+                "rule_based": rb_result.get("debug"),
+                "ai_chunks": len(chunks)
+            }
+        }
+
+    def _merge_requirement_positions_v2(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Мержит похожие позиции, приоритизируя данные из более уверенных источников.
+        """
+        merged: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            name = str(item.get("normalized_name") or item.get("position_name") or "").strip()
+            if not name:
+                continue
+            
+            key = re.sub(r"\s+", " ", name.lower()).strip()
+            if not key:
+                continue
+                
+            if key not in merged:
+                # Генерируем search_query если его нет
+                if not item.get("search_query"):
+                    # Здесь могла бы быть логика build_search_query, но мы надеемся на LLM/Extractor
+                    item["search_query"] = name
+                merged[key] = item
+                continue
+                
+            base = merged[key]
+            # Дополняем характеристики
+            chars = list(set((base.get("characteristics") or []) + (item.get("characteristics") or [])))
+            base["characteristics"] = chars
+            
+            # Обновляем количество если в базе его нет
+            if not base.get("quantity") and item.get("quantity"):
+                base["quantity"] = item.get("quantity")
+            if not base.get("unit") and item.get("unit"):
+                base["unit"] = item.get("unit")
+            
+            # Прихватываем примечания
+            if not base.get("notes") and item.get("notes"):
+                base["notes"] = item.get("notes")
+
+        return list(merged.values())
 
     def compare_requirements_vs_proposal(self, requirements_text: str, proposal_json_str: str):
         """

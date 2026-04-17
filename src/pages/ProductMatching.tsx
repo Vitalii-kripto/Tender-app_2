@@ -324,6 +324,7 @@ export default function ProductMatching() {
   // Состояние для извлечения ТЗ
   const [manualText, setManualText] = useState("");
   const [extractedItems, setExtractedItems] = useState<TenderRequirementItem[]>([]);
+  const [generalRequirements, setGeneralRequirements] = useState<string[]>([]);
   const [extractionWarnings, setExtractionWarnings] = useState<RequirementExtractionWarning[]>([]);
   const [isExtracting, setIsExtracting] = useState(false);
   const [selectedTendersForExtraction, setSelectedTendersForExtraction] = useState<Tender[]>([]);
@@ -488,6 +489,9 @@ export default function ProductMatching() {
     try {
       const res = await extractTenderRequirementsFromText(manualText);
       setExtractedItems(prev => [...prev, ...res.items]);
+      if (res.general_requirements) {
+        setGeneralRequirements(prev => [...new Set([...prev, ...res.general_requirements!])]);
+      }
       if (res.warnings.length > 0) {
         setExtractionWarnings(prev => [...prev, ...res.warnings]);
       }
@@ -507,6 +511,9 @@ export default function ProductMatching() {
       const ids = selectedTendersForExtraction.map(t => t.id);
       const res = await extractTenderRequirementsFromCrm(ids);
       setExtractedItems(prev => [...prev, ...res.items]);
+      if (res.general_requirements) {
+        setGeneralRequirements(prev => [...new Set([...prev, ...res.general_requirements!])]);
+      }
       if (res.warnings.length > 0) {
         setExtractionWarnings(prev => [...prev, ...res.warnings]);
       }
@@ -882,7 +889,11 @@ export default function ProductMatching() {
                     Извлеченные позиции ({extractedItems.length})
                   </h3>
                   <button 
-                    onClick={() => setExtractedItems([])}
+                    onClick={() => {
+                      setExtractedItems([]);
+                      setGeneralRequirements([]);
+                      setExtractionWarnings([]);
+                    }}
                     className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1"
                   >
                     <Trash2 className="w-3 h-3" /> Очистить
@@ -899,6 +910,21 @@ export default function ProductMatching() {
                         • {w.tender_id ? `[${w.tender_id}] ` : ""}{w.message}
                       </div>
                     ))}
+                  </div>
+                )}
+
+                {generalRequirements.length > 0 && (
+                  <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg space-y-1">
+                    <h4 className="text-xs font-semibold text-blue-800 flex items-center gap-1">
+                      <ListChecks className="w-3 h-3" /> Общие требования к продукции:
+                    </h4>
+                    <ul className="list-disc list-inside space-y-1">
+                      {generalRequirements.map((req, i) => (
+                        <li key={i} className="text-xs text-blue-700 ml-1">
+                          {req}
+                        </li>
+                      ))}
+                    </ul>
                   </div>
                 )}
 
