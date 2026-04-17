@@ -1201,23 +1201,38 @@ async def api_extract_tender_requirements(payload: dict = Body(...), db: Session
 
             all_files = []
             has_archives = False
-            if local_path and os.path.exists(local_path):
-                if os.path.isdir(local_path):
+            
+            # Определяем пути для поиска файлов
+            paths_to_check = []
+            if local_path:
+                paths_to_check.append(local_path)
+            
+            standard_dir = os.path.join(DOCUMENTS_ROOT, tender_id)
+            if standard_dir not in paths_to_check:
+                paths_to_check.append(standard_dir)
+
+            for path in paths_to_check:
+                if not os.path.exists(path):
+                    continue
+                    
+                if os.path.isdir(path):
                     try:
                         from backend.services.archive_service import archive_service
-                        archive_service.unpack_directory(local_path)
+                        archive_service.unpack_directory(path)
                     except Exception as e:
-                        logger.error(f"Error unpacking docs in api_extract_tender_requirements: {e}")
+                        logger.error(f"Error unpacking docs in {path}: {e}")
 
-                if os.path.isfile(local_path):
-                    all_files.append(local_path)
-                    if local_path.lower().endswith(('.zip', '.7z', '.rar')):
+                if os.path.isfile(path):
+                    if path not in all_files:
+                        all_files.append(path)
+                    if path.lower().endswith(('.zip', '.7z', '.rar')):
                         has_archives = True
-                elif os.path.isdir(local_path):
-                    for root, _, filenames in os.walk(local_path):
+                elif os.path.isdir(path):
+                    for root, _, filenames in os.walk(path):
                         for filename in filenames:
                             fpath = os.path.join(root, filename)
-                            all_files.append(fpath)
+                            if fpath not in all_files:
+                                all_files.append(fpath)
                             if fpath.lower().endswith(('.zip', '.7z', '.rar')):
                                 has_archives = True
 

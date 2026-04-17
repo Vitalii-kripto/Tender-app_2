@@ -93,22 +93,63 @@ class DocumentService:
         return full_text, pages
 
     def _extract_pdf_text_native(self, file_path: str):
-        reader = PdfReader(file_path)
+        import pdfplumber
+        
         pages = []
         text_pages = []
 
-        for i, page in enumerate(reader.pages):
-            try:
-                extracted = (page.extract_text() or "").strip()
-            except Exception as e:
-                logger.warning(f"Failed to extract text from PDF page {i + 1}: {e}")
-                extracted = ""
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                for i, page in enumerate(pdf.pages):
+                    extracted_text = (page.extract_text() or "").strip()
+                    extracted_tables = []
+                    
+                    try:
+                        tables = page.extract_tables()
+                        for table in tables:
+                            table_rows = []
+                            for row in table:
+                                # Clean row from None and extra spaces
+                                clean_row = [str(cell).strip() if cell is not None else "" for cell in row]
+                                if any(clean_row):
+                                    table_rows.append(" | ".join(clean_row))
+                            if table_rows:
+                                table_text = "\n".join(table_rows)
+                                extracted_tables.append(table_text)
+                    except Exception as e:
+                        logger.warning(f"Failed to extract tables from PDF page {i+1}: {e}")
 
-            pages.append({"page_num": i + 1, "text": extracted})
-            if extracted:
-                text_pages.append(extracted)
-
-        return "\n".join(text_pages).strip(), pages
+                    page_data = {
+                        "page_num": i + 1,
+                        "text": extracted_text,
+                    }
+                    if extracted_tables:
+                        page_data["tables"] = extracted_tables
+                    
+                    pages.append(page_data)
+                    if extracted_text:
+                        text_pages.append(extracted_text)
+                    # Add table text to full text too to help classification and AI
+                    for t in extracted_tables:
+                        text_pages.append(t)
+                        
+            return "\n".join(text_pages).strip(), pages
+        except Exception as e:
+            logger.error(f"pdfplumber failed for {file_path}: {e}")
+            # Fallback to pypdf (existing logic)
+            from pypdf import PdfReader
+            reader = PdfReader(file_path)
+            pages = []
+            text_pages = []
+            for i, page in enumerate(reader.pages):
+                try:
+                    extracted = (page.extract_text() or "").strip()
+                except:
+                    extracted = ""
+                pages.append({"page_num": i + 1, "text": extracted})
+                if extracted:
+                    text_pages.append(extracted)
+            return "\n".join(text_pages).strip(), pages
 
     def _normalize_extracted_text(self, text: str) -> str:
         text = (text or "").replace("\xa0", " ")
@@ -555,7 +596,7 @@ class DocumentService:
         logger.info(f"Starting OCR for {file_path} using pypdfium2 + PaddleOCR")
 
         pdf = pdfium.PdfDocument(file_path)
-        pages_to_process = min(len(pdf), 30)
+        pages_to_process = min(len(pdf), 100)
         ocr_pages = []
 
         try:
