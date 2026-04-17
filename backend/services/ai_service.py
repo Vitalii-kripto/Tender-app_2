@@ -148,9 +148,11 @@ class AiService:
 
                 if kwargs["model"] != self.active_model:
                     logger.warning(
-                        f"Dynamic model switch: {self.active_model} -> {kwargs['model']} (Success after retry)"
+                        f"Dynamic model switch: {self.active_model} -> {kwargs['model']} (Success after retry). Active model NOT permanently changed."
                     )
-                    self.active_model = kwargs["model"]
+                    # We do NOT overwrite self.active_model here so that future calls 
+                    # will still prioritize the primary model when the RPM limit resets.
+                    # self.active_model = kwargs["model"]
 
                 return response
 
