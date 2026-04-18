@@ -1343,8 +1343,8 @@ class EisService:
         self.RECORDS_PER_PAGE = 50
         self.MAX_PAGES = 5
         self.OKPD2_IDS_WITH_NESTED = True
-        self.OKPD2_IDS = "8873861,8873862,8873863"
-        self.OKPD2_IDS_CODES = "A,B,C,23"
+        self.OKPD2_IDS = "8873861,8873862,8873863,8873903"
+        self.OKPD2_IDS_CODES = "A,B,C,D"
         self.HEADLESS = True
         self.SLOWMO_MS = 0
         self.REQ_HEADERS = {
@@ -1352,60 +1352,6 @@ class EisService:
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         }
         self._cancel_flag = False
-        self._okpd2_code_to_id = {}
-
-    def _resolve_okpd2_ids(self) -> str:
-        """
-        Dynamically fetches and resolves missing okpd2Ids if they are not in the hardcoded list.
-        """
-        target_codes = [c.strip() for c in self.OKPD2_IDS_CODES.split(",")]
-        current_ids = [i.strip() for i in self.OKPD2_IDS.split(",") if i.strip()]
-        
-        # Hardcoded map for fallbacks in case API request fails
-        hardcoded_map = {
-            "A": "8873861",
-            "B": "8873862",
-            "C": "8873863",
-        }
-        
-        import ssl
-        import urllib.request
-        import json
-        
-        for code in target_codes:
-            if code in hardcoded_map:
-                if hardcoded_map[code] not in current_ids:
-                    current_ids.append(hardcoded_map[code])
-                continue
-                
-            # If we don't have it explicitly hardcoded, fetch it from Zakupki API
-            if code not in self._okpd2_code_to_id:
-                try:
-                    url = f"https://zakupki.gov.ru/api/control/v1/nsi/okpd2?searchString={code}&pageNumber=1&recordsPerPage=10"
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    req = urllib.request.Request(url, headers=self.REQ_HEADERS)
-                    with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
-                        data = json.loads(response.read().decode('utf-8'))
-                        found_id = None
-                        for item in data.get('data', []):
-                            if item.get('code') == code:
-                                found_id = str(item.get('id', ''))
-                                break
-                        if found_id:
-                            self._okpd2_code_to_id[code] = found_id
-                            logger.info(f"[EisService] Successfully resolved OKPD2 ID for code {code}: {found_id}")
-                        else:
-                            logger.warning(f"[EisService] Could not find OKPD2 ID for code {code} in search results.")
-                except Exception as e:
-                    logger.warning(f"[EisService] Failed to dynamically fetch OKPD2 ID for {code}: {e}")
-            
-            resolved_id = self._okpd2_code_to_id.get(code)
-            if resolved_id and resolved_id not in current_ids:
-                current_ids.append(resolved_id)
-                
-        return ",".join(current_ids)
 
     def cancel_search(self):
         self._cancel_flag = True
@@ -1438,12 +1384,8 @@ class EisService:
 
         if self.OKPD2_IDS_WITH_NESTED:
             params["okpd2IdsWithNested"] = "on"
-        
-        # Dynamically evaluate the target OKPD2 IDs taking codes into consideration
-        resolved_okpd_ids = self._resolve_okpd2_ids()
-        if resolved_okpd_ids:
-            params["okpd2Ids"] = resolved_okpd_ids
-            
+        if self.OKPD2_IDS:
+            params["okpd2Ids"] = self.OKPD2_IDS
         if self.OKPD2_IDS_CODES:
             params["okpd2IdsCodes"] = self.OKPD2_IDS_CODES
 
