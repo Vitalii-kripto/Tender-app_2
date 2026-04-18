@@ -189,7 +189,18 @@ class GoodsExtractionService:
                 f"response_length_chars={len(raw_text)} response_preview='{preview}...'"
             )
 
-            parsed = self._parse_json_response(raw_text)
+            try:
+                parsed = self._parse_json_response(raw_text)
+            except json.JSONDecodeError as parse_error:
+                tail_preview = raw_text[-300:].replace("\n", " ").replace("\r", "")
+                logger.warning(
+                    f"[GOODS_EXTRACTION_JSON_REPAIR] tender_id={tender_id} job_id={job_id} "
+                    f"status='requested' error='{parse_error}' tail_preview='{tail_preview}'"
+                )
+                repaired_text = self._repair_json_with_ai(raw_text, tender_id=tender_id, job_id=job_id)
+                if not repaired_text:
+                    raise
+                parsed = self._parse_json_response(repaired_text)
 
             logger.info(
                 f"[GOODS_EXTRACTION_JSON_PARSE] tender_id={tender_id} job_id={job_id} "
@@ -462,8 +473,46 @@ class GoodsExtractionService:
 
         return block, meta
 
+    def _repair_json_with_ai(self, raw_text: str, tender_id: str, job_id: str) -> str:
+        if not raw_text.strip():
+            return ""
+        if not self.ai_service or not getattr(self.ai_service, "client", None):
+            return ""
+
+        from google.genai import types
+
+        repair_prompt = (
+            "Исправь синтаксис JSON, не меняя структуру и значения. "
+            "Верни только валидный JSON без markdown и пояснений.\n\n"
+            f"{raw_text.strip()}"
+        )
+
+        try:
+            response = self.ai_service._call_ai_with_retry(
+                self.ai_service.client.models.generate_content,
+                contents=repair_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0,
+                ),
+            )
+        except Exception as repair_error:
+            logger.warning(
+                f"[GOODS_EXTRACTION_JSON_REPAIR] tender_id={tender_id} job_id={job_id} "
+                f"status='failed' error='{repair_error}'"
+            )
+            return ""
+
+        repaired_text = response.text if response else ""
+        preview = repaired_text[:100].replace("\n", " ").replace("\r", "")
+        logger.info(
+            f"[GOODS_EXTRACTION_JSON_REPAIR] tender_id={tender_id} job_id={job_id} "
+            f"status='received' response_length_chars={len(repaired_text)} response_preview='{preview}...'"
+        )
+        return repaired_text
+
     def _parse_json_response(self, raw_text: str) -> Dict[str, Any]:
-        text = (raw_text or "").strip()
+        text = (raw_text or "").replace("\ufeff", "").replace("\u200b", "").strip()
 
         if text.startswith("```json"):
             text = text.replace("```json", "", 1).replace("```", "", 1).strip()
@@ -474,7 +523,27 @@ class GoodsExtractionService:
         if match:
             text = match.group(0).strip()
 
-        return json.loads(text)
+        candidates = [text]
+        without_trailing_commas = re.sub(r",(\s*[}\]])", r"\1", text)
+        if without_trailing_commas != text:
+            candidates.append(without_trailing_commas)
+
+        last_error = None
+        seen = set()
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+
+        raise json.JSONDecodeError("Empty JSON response", text, 0)
 
     def _normalize_string(self, value: Any) -> str:
         if value is None:

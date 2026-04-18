@@ -686,7 +686,7 @@ def check_analog_service():
 
 @app.post("/api/frontend-log")
 async def post_frontend_log(log_data: FrontendLog):
-    """Принимает frontend-логи и пишет их в общий tendersmart.log"""
+    """Принимает frontend-логи и пишет их в общий tendersmart.txt"""
     f_logger = logging.getLogger("Frontend")
 
     msg = f"[FRONTEND][{log_data.level.upper()}] {log_data.message}"

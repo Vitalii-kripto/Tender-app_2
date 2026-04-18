@@ -9,6 +9,7 @@ import asyncio
 import sys
 import html
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -66,6 +67,19 @@ def log_skip(message: str):
 
 def log_exception(prefix: str, exc: Exception):
     logger.error(f"{prefix}: {exc}", exc_info=True)
+
+
+def run_coroutine_in_dedicated_thread(coro_factory, *args, **kwargs):
+    def _runner():
+        if sys.platform == "win32":
+            try:
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            except Exception:
+                pass
+        return asyncio.run(coro_factory(*args, **kwargs))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(_runner).result()
 
 # =========================
 # ТУННЕЛЬ / ПРОКСИ
@@ -1198,7 +1212,11 @@ class EisService:
                                     f"{n.reg} | ntype={ntype_val}. "
                                     f"Starting Playwright fresh retry..."
                                 )
-                                raw_items = asyncio.run(self._fresh_retry_playwright(n.reg, ntype_val))
+                                raw_items = run_coroutine_in_dedicated_thread(
+                                    self._fresh_retry_playwright,
+                                    n.reg,
+                                    ntype_val,
+                                )
 
                             if not raw_items:
                                 html_text = page.content()

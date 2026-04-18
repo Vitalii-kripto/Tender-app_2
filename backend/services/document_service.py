@@ -1,683 +1,831 @@
-import os
-os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-os.environ.setdefault("FLAGS_use_mkldnn", "0")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-
+import json
 import re
-import io
-import numpy as np
-from pypdf import PdfReader
-from fastapi import UploadFile
-import aiofiles
-import platform
-import logging
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend.logger import logger
+from .ai_service import AiService
 
-import pypdfium2 as pdfium
-from paddleocr import PaddleOCR
 
-class DocumentService:
+PROMPT_UNIFIED_GOODS_EXTRACTION = """
+Ты — эксперт по анализу тендерной документации на поставку товаров и строительных материалов.
+
+ТВОЯ ЦЕЛЬ:
+Из всей документации закупки выделить только данные о закупаемом товаре:
+1) товарные позиции,
+2) количества,
+3) единицы измерения,
+4) конкретные технические характеристики (масса, толщина, плотность, класс, размер, гост и т.д.),
+5) общие требования к качеству, упаковке, происхождению, сертификатам, гарантиям,
+6) признаки допуска аналога / эквивалента,
+7) ссылки на источник (файл, страница, лист, таблица).
+
+ТЕБЕ ПЕРЕДАЮТ НЕ ОТДЕЛЬНОЕ ТЗ, А ВЕСЬ ПАКЕТ ДОКУМЕНТАЦИИ:
+включая извещение, документацию, описание объекта закупки, проект договора, приложения, спецификации, excel-листы, сметы и прочее.
+
+ОБЯЗАТЕЛЬНОЕ ПРАВИЛО КЛАССИФИКАЦИИ (ПРИОРИТЕТЫ):
+1. В первую очередь ищи данные в товарных спецификациях, таблицах и описании объекта закупки (GOODS_SPEC).
+2. Общие требования к товару (гарантии, качество, новизна) ищи в соответствующих разделах требований (GOODS_GENERAL_REQUIREMENTS).
+3. Игнорируй юридическую и финансовую информацию (условия оплаты, штрафы, НМЦК), если там нет характеристик товара. Но если требования к товару разбросаны по всему документу — собери их все.
+
+ПРАВИЛА ИЗВЛЕЧЕНИЯ И НОРМАЛИЗАЦИИ НАИМЕНОВАНИЯ (КРИТИЧЕСКИ ВАЖНО):
+1. ЗАПРЕЩАЕТСЯ сводить позицию к общему классу товара.
+   ПЛОХО: "Материал кровельный рулонный"
+   ХОРОШО: "Материал кровельный рулонный верхний слой ТКП-4,5"
+   ПЛОХО: "Мастика битумная"
+   ХОРОШО: "Мастика битумная ТехноНИКОЛЬ №24 20 кг" 
+2. При нормализации (position_name_normalized) ОБЯЗАТЕЛЬНО сохраняй:
+   - марку (например, ТКП, ХПП, ЭПП, Бикрост, Унифлекс, Техноэласт, Линокром, Стеклоизол и т.д.);
+   - все буквенные и цифровые индексы (4.5, 4.0, П, К, 3.5, 2.5);
+   - тип основы (стеклоткань, стеклохолст, полиэстер, полиэфирное полотно);
+   - вид посыпки (сланец, гранулят, песок, пленка);
+   - назначение (верхний слой, нижний слой, мостовой, К, П);
+   - ключевые размерные признаки (толщина в мм, вес 1м2 в кг, масса рулона).
+3. Слова "или эквивалент", "аналог" удаляются из названия товара, но флаг analog_allowed ставится в true.
+
+ПРАВИЛА ИЗВЛЕЧЕНИЯ КОЛИЧЕСТВА И ЕДИНИЦ ИЗМЕРЕНИЯ:
+1. Ищи количество и единицу измерения по всей строке таблицы или в соседних столбцах (шт, м2, м, мм, кг, т, л, рулон, упак, мешок, комплект, лист).
+2. Обращай внимание на "кг/м2" и подобные — это характеристика, а не единица закупаемого количества. Количество обычно в м2 или шт.
+3. Если закупка идет в рулонах, укажи количество рулонов и их площадь, если она известна.
+4. ЗАПРЕЩАЕТСЯ выводить quantity: null / "не указано", если эти данные физически есть в переданном тексте.
+
+ПРАВИЛА ИЗВЛЕЧЕНИЯ ХАРАКТЕРИСТИК (ПОЛНЫЙ СБОР):
+1. Вытаскивай все технические сведения в поле characteristics (name и value).
+2. Для гидроизоляции ВАЖНО: 
+   - Толщина полотна (мм); 
+   - Масса 1 кв.м. (кг); 
+   - Теплостойкость (градусы С); 
+   - Гибкость на брусе (градусы С); 
+   - Разрывная сила при растяжении (Н); 
+   - Водонепроницаемость (МПа).
+3. Если указан конкретный ГОСТ (например, ГОСТ 30547-97) или ТУ — обязательно добавь это в характеристики.
+4. Собирай характеристики из сложных вложенных таблиц, даже если названия параметров стоят в шапке таблицы за несколько строк до значений.
+5. Запрещено оставлять пустой массив characteristics, если в тексте рядом с названием позиции указаны параметры. Поищи параметры в той же ячейке, соседних, или общем тексте ТЗ к этой позиции.
+
+ПРАВИЛА ВЫДЕЛЕНИЯ ОБЩИХ ТРЕБОВАНИЙ:
+1. Если в тексте есть общие требования к качеству, новизне, упаковке, сертификации, ГОСТам, срокам годности товара — выдели их в массив `general_goods_requirements`.
+
+ПРАВИЛА ФОРМАТА (ТОЛЬКО JSON):
+
+{
+  "positions": [
+    {
+      "position_id": 1,
+      "position_name_raw": "ОРИГИНАЛЬНОЕ НАЗВАНИЕ ИЗ ТЕКСТА",
+      "position_name_normalized": "ТОЧНОЕ НАИМЕНОВАНИЕ С МАРКОЙ И СЛОЕМ",
+      "quantity": "число или диапазон",
+      "unit": "м2, шт, кг и др.",
+      "characteristics": [
+        {"name": "Толщина", "value": "не менее 3 мм"}
+      ],
+      "general_requirements_applied": true,
+      "analog_allowed": true,
+      "manufacturer_or_brand_required": false,
+      "source_documents": [
+        {
+          "file": "...",
+          "page_or_sheet": "...",
+          "fragment_type": "GOODS_SPEC",
+          "evidence": "короткая цитата"
+        }
+      ],
+      "notes": "..."
+    }
+  ],
+  "general_goods_requirements": [
+    {
+      "name": "Требования к новизне",
+      "value": "Товар должен быть новым, не бывшим в употреблении...",
+      "source_documents": [...]
+    }
+  ],
+  "extraction_summary": {
+    "positions_count": 0,
+    "duplicates_merged": 0,
+    "ignored_fragments_types": ["CONTRACT_TERMS", "PROCUREMENT_RULES", "PRICE_JUSTIFICATION"],
+    "warnings": []
+  }
+}
+
+ПОМНИ: Твоя главная задача — ИЗБЕЖАТЬ ПОТЕРИ ДАННЫХ. Сохрани техническую конкретику товара, его количество и характеристики. Не обобщай!
+
+ТЕПЕРЬ ПРОАНАЛИЗИРУЙ ПАКЕТ ДОКУМЕНТОВ НИЖЕ:
+
+__DOCUMENTS__
+""".strip()
+
+
+SUPPORTED_ARCHIVES = {".7z", ".zip", ".rar"}
+
+
+class GoodsExtractionService:
     """
-    Сервис для работы с документами.
-    Поддерживает извлечение текста из PDF и OCR (распознавание сканов) через PaddleOCR.
+    Извлечение товарных позиций из всей документации по аналогии с LegalAnalysisService.
     """
-    UPLOAD_DIR = "uploaded_docs"
 
-    def __init__(self):
-        os.makedirs(self.UPLOAD_DIR, exist_ok=True)
-        self.text_cache = {}
-        self.ocr_engine = None
-        self.ocr_init_error = ""
-        logger.info("DocumentService initialized in lazy OCR mode.")
+    def __init__(self, ai_service: Optional[AiService] = None):
+        self.ai_service = ai_service or AiService()
+        logger.info("GoodsExtractionService initialized (unified goods prompt mode).")
 
-    def _ensure_ocr_engine(self):
-        if self.ocr_engine is not None:
-            return self.ocr_engine
-        if self.ocr_init_error:
-            raise RuntimeError(self.ocr_init_error)
-        try:
-            self.ocr_engine = PaddleOCR(lang='ru')
-            logger.info("PaddleOCR engine initialized successfully (lazy).")
-            return self.ocr_engine
-        except Exception as e:
-            self.ocr_init_error = f"OCR Configuration Error: {e}"
-            logger.error(self.ocr_init_error, exc_info=True)
-            raise RuntimeError(self.ocr_init_error)
+    def extract_goods_requirements(
+        self,
+        files_data: List[Dict[str, Any]],
+        tender_id: str = "N/A",
+        job_id: str = "N/A",
+        callback: Optional[Callable[[str, int, str], None]] = None,
+    ) -> Dict[str, Any]:
+        documents_block, context_meta = self._build_goods_documents_block(files_data, tender_id=tender_id)
 
-    def _extract_docx_text_safely(self, file_path: str):
-        import docx
+        logger.info(
+            f"[GOODS_EXTRACTION_START] tender_id={tender_id} job_id={job_id} "
+            f"files_in_packet={context_meta['documents_count']} "
+            f"archives_skipped={len(context_meta['archives_skipped'])}"
+        )
 
-        doc = docx.Document(file_path)
-        text_parts = []
-        tables_data = []
+        if callback:
+            callback("Подготовка контекста товарных документов", 20, "running")
 
-        for para in doc.paragraphs:
-            value = (para.text or "").strip()
-            if value:
-                text_parts.append(value)
+        if not documents_block.strip():
+            warnings = ["Не удалось подготовить goods documents block для извлечения ТЗ"]
+            if context_meta["archives_skipped"]:
+                warnings.append(
+                    "В пакете обнаружены архивы, которые не были распакованы до извлечения: "
+                    + ", ".join(item["filename"] for item in context_meta["archives_skipped"])
+                )
+            
+            logger.warning(f"[GOODS_EXTRACTION_WARNING] tender_id={tender_id} reason='no_documents_block' raw_data=''")
+            return self._empty_result(context_meta, warnings)
 
-        for table in doc.tables:
-            table_rows = []
-            for row in table.rows:
-                row_data = [cell.text.strip() for cell in row.cells]
-                if any(cell for cell in row_data):
-                    joined = " | ".join(row_data)
-                    table_rows.append(joined)
-                    text_parts.append(joined)
-            if table_rows:
-                tables_data.append("\n".join(table_rows))
-
-        for section in doc.sections:
-            header = getattr(section, "header", None)
-            footer = getattr(section, "footer", None)
-
-            if header:
-                for para in header.paragraphs:
-                    value = (para.text or "").strip()
-                    if value:
-                        text_parts.append(value)
-
-            if footer:
-                for para in footer.paragraphs:
-                    value = (para.text or "").strip()
-                    if value:
-                        text_parts.append(value)
-
-        full_text = "\n".join(text_parts).strip()
-        pages = [{"page_num": 1, "text": full_text}]
-        if tables_data:
-            pages[0]["tables"] = tables_data
-
-        return full_text, pages
-
-    def _extract_pdf_text_native(self, file_path: str):
-        import pdfplumber
-        
-        pages = []
-        text_pages = []
+        prompt = PROMPT_UNIFIED_GOODS_EXTRACTION.replace("__DOCUMENTS__", documents_block)
 
         try:
-            with pdfplumber.open(file_path) as pdf:
-                for i, page in enumerate(pdf.pages):
-                    extracted_text = (page.extract_text() or "").strip()
-                    extracted_tables = []
-                    
-                    try:
-                        tables = page.extract_tables()
-                        for table in tables:
-                            table_rows = []
-                            for row in table:
-                                # Clean row from None and extra spaces
-                                clean_row = [str(cell).strip() if cell is not None else "" for cell in row]
-                                if any(clean_row):
-                                    table_rows.append(" | ".join(clean_row))
-                            if table_rows:
-                                table_text = "\n".join(table_rows)
-                                extracted_tables.append(table_text)
-                    except Exception as e:
-                        logger.warning(f"Failed to extract tables from PDF page {i+1}: {e}")
+            if callback:
+                callback("Извлечение товарных позиций из всей документации", 55, "running")
 
-                    page_data = {
-                        "page_num": i + 1,
-                        "text": extracted_text,
-                    }
-                    if extracted_tables:
-                        page_data["tables"] = extracted_tables
-                    
-                    pages.append(page_data)
-                    if extracted_text:
-                        text_pages.append(extracted_text)
-                    # Add table text to full text too to help classification and AI
-                    for t in extracted_tables:
-                        text_pages.append(t)
-                        
-            return "\n".join(text_pages).strip(), pages
+            start_time = time.time()
+            prompt_chars = len(prompt)
+
+            logger.info(
+                f"[GOODS_EXTRACTION_PROMPT_STATS] tender_id={tender_id} job_id={job_id} "
+                f"prompt_length_chars={prompt_chars} model_tier='gemini' max_output_tokens='N/A' temperature='N/A'"
+            )
+
+            from google.genai import types
+            
+            response = self.ai_service._call_ai_with_retry(
+                self.ai_service.client.models.generate_content,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1
+                )
+            )
+
+            raw_text = response.text if response else ""
+            preview = raw_text[:100].replace('\n', ' ').replace('\r', '')
+
+            logger.info(
+                f"[GOODS_EXTRACTION_AI_RAW] tender_id={tender_id} job_id={job_id} "
+                f"response_length_chars={len(raw_text)} response_preview='{preview}...'"
+            )
+
+            try:
+                parsed = self._parse_json_response(raw_text)
+            except json.JSONDecodeError as parse_error:
+                tail_preview = raw_text[-300:].replace("\n", " ").replace("\r", "")
+                logger.warning(
+                    f"[GOODS_EXTRACTION_JSON_REPAIR] tender_id={tender_id} job_id={job_id} "
+                    f"status='requested' error='{parse_error}' tail_preview='{tail_preview}'"
+                )
+                repaired_text = self._repair_json_with_ai(raw_text, tender_id=tender_id, job_id=job_id)
+                if not repaired_text:
+                    raise
+                parsed = self._parse_json_response(repaired_text)
+
+            logger.info(
+                f"[GOODS_EXTRACTION_JSON_PARSE] tender_id={tender_id} job_id={job_id} "
+                f"status='success' raw_positions_count={len(parsed.get('positions', []))} "
+                f"raw_general_requirements_count={len(parsed.get('general_goods_requirements', []))}"
+            )
+
+            normalized = self._normalize_extraction_result(parsed, context_meta, tender_id, job_id)
+            duration = time.time() - start_time
+
+            logger.info(
+                f"[GOODS_EXTRACTION_DONE] tender_id={tender_id} job_id={job_id} "
+                f"final_positions_count={len(normalized.get('positions', []))} final_general_requirements_count={len(normalized.get('general_goods_requirements', []))} "
+                f"duration_seconds={duration:.2f} errors_count={len(normalized.get('warnings', []))}"
+            )
+            return normalized
+
         except Exception as e:
-            logger.error(f"pdfplumber failed for {file_path}: {e}")
-            # Fallback to pypdf (existing logic)
-            from pypdf import PdfReader
-            reader = PdfReader(file_path)
-            pages = []
-            text_pages = []
-            for i, page in enumerate(reader.pages):
-                try:
-                    extracted = (page.extract_text() or "").strip()
-                except:
-                    extracted = ""
-                pages.append({"page_num": i + 1, "text": extracted})
-                if extracted:
-                    text_pages.append(extracted)
-            return "\n".join(text_pages).strip(), pages
+            logger.error(f"Goods extraction error for tender {tender_id}: {e}", exc_info=True)
+            logger.info(
+                f"[GOODS_EXTRACTION_JSON_PARSE] tender_id={tender_id} job_id={job_id} "
+                f"status='failed' raw_positions_count=0 raw_general_requirements_count=0"
+            )
+            return self._empty_result(
+                context_meta,
+                [f"Ошибка извлечения товарных данных: {str(e)}"]
+            )
 
-    def _normalize_extracted_text(self, text: str) -> str:
-        text = (text or "").replace("\xa0", " ")
+    def _empty_result(self, context_meta: Dict[str, Any], warnings: List[str]) -> Dict[str, Any]:
+        return {
+            "positions": [],
+            "general_goods_requirements": [],
+            "warnings": warnings,
+            "debug": context_meta,
+            "extraction_summary": {
+                "positions_count": 0,
+                "duplicates_merged": 0,
+                "ignored_fragments_types": ["CONTRACT_TERMS", "PROCUREMENT_RULES", "PRICE_JUSTIFICATION"],
+                "warnings": warnings,
+            }
+        }
+
+    def _document_priority_for_goods(self, filename: str) -> Tuple[int, str]:
+        name = (filename or "").lower()
+
+        # Самые приоритетные документы для товаров
+        if "описан" in name or "объект" in name or "тех" in name or "тз" in name:
+            return (1, "goods_main")
+        if "специфик" in name or "ведомост" in name or "номенклат" in name:
+            return (2, "goods_spec")
+        if name.endswith(".xls") or name.endswith(".xlsx"):
+            return (3, "goods_excel")
+        if "проект" in name or "контракт" in name or "договор" in name:
+            return (4, "contract")
+        if "извещ" in name:
+            return (5, "notice")
+        if "нмцк" in name or "обоснован" in name or "смет" in name:
+            return (6, "price")
+        return (10, "other")
+
+    def _is_archive(self, filename: str) -> bool:
+        ext = ""
+        if "." in (filename or ""):
+            ext = "." + filename.lower().rsplit(".", 1)[-1]
+        return ext in SUPPORTED_ARCHIVES
+
+    def _clean_text(self, text: str) -> str:
+        if not text:
+            return ""
+        text = text.replace("\xa0", " ")
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
-    def _extract_text_from_ocr_result(self, raw_result) -> str:
-        page_lines = []
+    def _classify_text_fragment(self, text: str) -> str:
+        low = (text or "").lower()
 
-        if raw_result is None:
-            return ""
-
-        if isinstance(raw_result, list):
-            for item in raw_result:
-                if isinstance(item, list):
-                    for row in item:
-                        if isinstance(row, list) and len(row) >= 2:
-                            maybe_text = row[1]
-                            if isinstance(maybe_text, (list, tuple)) and maybe_text:
-                                value = str(maybe_text[0]).strip()
-                                if value:
-                                    page_lines.append(value)
-                        elif isinstance(row, dict):
-                            value = str(row.get("text") or "").strip()
-                            if value:
-                                page_lines.append(value)
-                elif isinstance(item, dict):
-                    value = str(item.get("text") or "").strip()
-                    if value:
-                        page_lines.append(value)
-
-        elif isinstance(raw_result, dict):
-            rec_texts = raw_result.get("rec_texts") or raw_result.get("texts") or []
-            for value in rec_texts:
-                value = str(value).strip()
-                if value:
-                    page_lines.append(value)
-
-        return "\n".join(page_lines).strip()
-
-    def _ocr_single_image(self, img_array) -> str:
-        engine = self._ensure_ocr_engine()
-        attempts = [
-            ("ocr(img)", lambda: engine.ocr(img_array)),
-            ("ocr([img])", lambda: engine.ocr([img_array])),
-            ("predict(img)", lambda: engine.predict(img_array)),
-            ("predict(input=img)", lambda: engine.predict(input=img_array)),
+        goods_spec_markers = [
+            "техническое задание", "описание объекта закупки", "спецификация",
+            "наименование товара", "характеристики", "ведомость материалов",
+            "товар", "материал", "ед. изм", "количество", "кол-во"
+        ]
+        goods_general_markers = [
+            "товар должен быть новым", "гарантийный срок", "сертификат",
+            "декларация соответствия", "упаковка", "маркировка",
+            "общие требования к товарам", "общие требования к товару"
+        ]
+        contract_markers = [
+            "оплата", "штраф", "пеня", "неустойка", "расторжение",
+            "ответственность сторон", "порядок приемки", "приемка",
+            "расчеты", "реквизиты", "порядок расчетов"
+        ]
+        procurement_markers = [
+            "требования к участнику", "состав заявки", "критерии оценки",
+            "инструкция", "форма заявки", "обеспечение заявки",
+            "банковская гарантия", "участник закупки"
+        ]
+        price_markers = [
+            "нмцк", "обоснование цены", "обоснование начальной",
+            "смета", "коммерческое предложение", "расчет цены"
         ]
 
-        errors = []
-        for label, attempt in attempts:
-            try:
-                raw = attempt()
-                text = self._extract_text_from_ocr_result(raw)
-                if text:
-                    return text
-            except Exception as e:
-                errors.append(f"{label}: {e}")
+        if any(marker in low for marker in goods_general_markers):
+            return "GOODS_GENERAL_REQUIREMENTS"
+        if any(marker in low for marker in goods_spec_markers):
+            return "GOODS_SPEC"
+        if any(marker in low for marker in contract_markers):
+            return "CONTRACT_TERMS"
+        if any(marker in low for marker in procurement_markers):
+            return "PROCUREMENT_RULES"
+        if any(marker in low for marker in price_markers):
+            return "PRICE_JUSTIFICATION"
 
-        raise RuntimeError(" ; ".join(errors) if errors else "OCR failed with unknown error")
+        # fallback: если есть признак табличной товарной строки
+        if "|" in low and re.search(r"\b(товар|материал|характерист|кол-во|количество|ед\.?\s*изм)\b", low):
+            return "GOODS_SPEC"
 
-    async def save_file(self, file: UploadFile) -> str:
-        """Сохраняет загруженный файл"""
-        file_path = os.path.join(self.UPLOAD_DIR, file.filename)
-        logger.info(f"Saving file to: {file_path}")
-        async with aiofiles.open(file_path, 'wb') as out_file:
-            content = await file.read()
-            await out_file.write(content)
-        return file_path
+        return "OTHER"
 
-    def _convert_doc_to_docx(self, doc_path: str) -> str:
-        """
-        Пытается конвертировать .doc в .docx.
-        Возвращает путь к новому файлу или оригинальный путь, если не удалось.
-        """
-        docx_path = doc_path + "x"
-        if os.path.exists(docx_path):
-            logger.info(f"DOCX version already exists: {docx_path}")
-            return docx_path
+    def _render_goods_pages(self, file_data: Dict[str, Any], tender_id: str = "N/A") -> str:
+        filename = file_data.get("filename", "Unknown")
+        status = file_data.get("status", "success")
+        pages = file_data.get("pages", []) or []
+        text = file_data.get("extracted_text", "") or ""
+        priority, doc_hint = self._document_priority_for_goods(filename)
 
-        # 1. Попытка через win32com (только Windows + Word)
-        if platform.system() == "Windows":
-            try:
-                import win32com.client as win32
-                import pythoncom
-                # Инициализация COM для текущего потока (важно для FastAPI/async)
-                pythoncom.CoInitialize()
-                
-                word = win32.gencache.EnsureDispatch('Word.Application')
-                word.Visible = False
-                doc = word.Documents.Open(os.path.abspath(doc_path))
-                # 16 = wdFormatXMLDocument (.docx)
-                doc.SaveAs2(os.path.abspath(docx_path), FileFormat=16)
-                doc.Close()
-                word.Quit()
-                logger.info(f"Successfully converted {doc_path} to {docx_path} using MS Word.")
-                return docx_path
-            except Exception as e:
-                logger.warning(f"win32com conversion failed (check if Word is installed): {e}")
-            finally:
-                try:
-                    pythoncom.CoUninitialize()
-                except:
-                    pass
+        header = (
+            f"=== FILE: {filename} | DOC_CLASS_HINT: {doc_hint} | "
+            f"PRIORITY: {priority} | STATUS: {status} | TEXT_LEN: {len(text)} ===\n"
+        )
 
-        # 2. Попытка через извлечение текста и создание нового .docx (fallback)
-        text = self._extract_text_from_doc(doc_path)
-        if text and not text.startswith("[ОШИБКА"):
-            try:
-                import docx
-                new_doc = docx.Document()
-                new_doc.add_paragraph(f"--- АВТОМАТИЧЕСКАЯ КОНВЕРТАЦИЯ ИЗ .DOC ---\nОригинал: {os.path.basename(doc_path)}\n\n")
-                new_doc.add_paragraph(text)
-                new_doc.save(docx_path)
-                logger.info(f"Created {docx_path} from extracted text of {doc_path}")
-                return docx_path
-            except Exception as e:
-                logger.error(f"Failed to create docx from text: {e}")
+        if status != "success":
+            err = file_data.get("error_message", "") or status
+            return header + f"[FILE_WARNING] {err}\n"
 
-        return doc_path
+        if not pages:
+            cleaned = self._clean_text(text)
+            frag_type = self._classify_text_fragment(cleaned)
+            logger.info(
+                f"[GOODS_CONTEXT_FILE_CLASSIFIED] tender_id={tender_id} filename='{filename}' doc_class_hint='{doc_hint}' "
+                f"priority={priority} status='single_block' pages_included=1 tables_included=0 text_chars_included={len(cleaned)}"
+            )
+            return header + f"--- PAGE_OR_SHEET: 1 | FRAGMENT_TYPE_HINT: {frag_type} ---\n[TEXT]\n{cleaned}\n"
 
-    def _is_html_file(self, file_path: str) -> bool:
-        """
-        Проверяет, не является ли файл HTML-страницей (бывает при ошибках скачивания с ЕИС).
-        """
-        try:
-            with open(file_path, 'rb') as f:
-                chunk = f.read(2048)
-                # Ищем типичные HTML теги
-                chunk_str = chunk.decode('utf-8', errors='ignore').lower()
-                if '<html' in chunk_str or '<!doctype html' in chunk_str or '<head' in chunk_str:
-                    return True
-        except Exception as e:
-            logger.warning(f"Error checking if file is HTML: {e}")
-        return False
-
-    def extract_document_data(self, file_path: str, use_cache: bool = True, tender_id: str = "unknown") -> Dict[str, Any]:
-        """
-        Извлечение структурированных данных из документа (страницы, листы, статус).
-        """
-        filename = os.path.basename(file_path)
-        ext = os.path.splitext(file_path)[1].lower()
-        
-        logger.info(f"[DOC_EXTRACT_START] tender_id={tender_id} filename='{filename}' extension='{ext}' file_path='{file_path}'")
-
-        result = {
-            "filename": filename,
-            "file_path": file_path,
-            "file_extension": ext,
-            "file_size": 0,
-            "status": "failed_unknown",
-            "extract_method": "none",
-            "text_length": 0,
-            "extracted_text": "",
-            "error_message": "",
-            "pages": []
+        blocks: List[str] = [header]
+        fragments_stats = {
+            "GOODS_SPEC": 0,
+            "GOODS_GENERAL_REQUIREMENTS": 0,
+            "CONTRACT_TERMS": 0,
+            "PROCUREMENT_RULES": 0,
+            "PRICE_JUSTIFICATION": 0,
+            "OTHER": 0,
         }
+        tables_count = 0
+        text_chars = 0
 
-        if not os.path.exists(file_path):
-            result["status"] = "skipped_not_found"
-            result["error_message"] = "Файл не найден"
-            logger.info(f"[DOC_EXTRACT_RESULT] tender_id={tender_id} filename='{filename}' extension='{ext}' status='{result['status']}' extract_method='none' text_length=0 pages_count=0 tables_count=0 quality_flags='' error_message='{result['error_message']}'")
-            return result
-            
-        file_size = os.path.getsize(file_path)
-        result["file_size"] = file_size
+        for page in pages:
+            page_num = page.get("page_num", "")
+            page_text = self._clean_text(page.get("text", "") or "")
+            tables = page.get("tables", []) or []
 
-        if file_size == 0:
-            result["status"] = "skipped_empty"
-            result["error_message"] = "Файл пуст"
-            logger.info(f"[DOC_EXTRACT_RESULT] tender_id={tender_id} filename='{filename}' extension='{ext}' status='{result['status']}' extract_method='none' text_length=0 pages_count=0 tables_count=0 quality_flags='' error_message='{result['error_message']}'")
-            return result
+            all_fragment_text = page_text
+            if tables:
+                all_fragment_text += "\n\n" + "\n\n".join(self._clean_text(t) for t in tables if t)
+            fragment_type = self._classify_text_fragment(all_fragment_text)
 
-        if ext in ['.zip', '.7z', '.rar']:
-            result["status"] = "skipped_unsupported_type"
-            result["error_message"] = "Archive not supported for direct analysis"
-            logger.warning(f"[DOC_ARCHIVE_UNSUPPORTED] tender_id={tender_id} filename='{filename}' extension='{ext}' reason=archive_not_supported_for_direct_analysis")
-            logger.info(f"[DOC_EXTRACT_RESULT] tender_id={tender_id} filename='{filename}' extension='{ext}' status='{result['status']}' extract_method='none' text_length=0 pages_count=0 tables_count=0 quality_flags='' error_message='{result['error_message']}'")
-            return result
-
-        if self._is_html_file(file_path):
-            result["status"] = "skipped_invalid_file"
-            result["error_message"] = "Файл является HTML-страницей (ошибка скачивания)"
-            logger.info(f"[DOC_EXTRACT_RESULT] tender_id={tender_id} filename='{filename}' extension='{ext}' status='{result['status']}' extract_method='none' text_length=0 pages_count=0 tables_count=0 quality_flags='' error_message='{result['error_message']}'")
-            return result
-
-        mtime = os.path.getmtime(file_path)
-        cache_key = (file_path, mtime)
-        
-        if use_cache and cache_key in self.text_cache:
-            logger.info(f"Returning cached text for {file_path}")
-            cached = self.text_cache[cache_key]
-            # Update result with cached data
-            result.update({
-                "extracted_text": cached.get("text", ""),
-                "text_length": len(cached.get("text", "")),
-                "status": cached.get("status", "success"),
-                "error_message": cached.get("error_message", ""),
-                "pages": cached.get("pages", []),
-                "extract_method": cached.get("extract_method", "cache")
-            })
-            return result
-
-        logger.info(f"--- [START STRUCTURED EXTRACTION] ---")
-        logger.info(f"File path: {file_path}")
-        logger.info(f"Extension: {ext}")
-        
-        try:
-            if ext == '.doc':
-                result["extract_method"] = "antiword/striprtf"
-                docx_path = file_path + "x"
-                if os.path.exists(docx_path):
-                    file_path = docx_path
-                    ext = '.docx'
-                else:
-                    new_path = self._convert_doc_to_docx(file_path)
-                    if new_path.endswith('.docx'):
-                        file_path = new_path
-                        ext = '.docx'
-                    else:
-                        full_text = self._extract_text_from_doc(file_path)
-                        result["extracted_text"] = full_text
-                        result["pages"] = [{"page_num": 1, "text": full_text}]
-                        if not full_text.strip() or full_text.startswith("[ОШИБКА"):
-                            result["status"] = "failed_text_extraction"
-                            result["error_message"] = full_text
-                        else:
-                            result["status"] = "success"
-                        
-                        result["text_length"] = len(result["extracted_text"])
-                        return result
-
-            if ext == '.docx':
-                result["extract_method"] = "python-docx"
-                full_text, pages = self._extract_docx_text_safely(file_path)
-                result["extracted_text"] = self._normalize_extracted_text(full_text)
-                result["pages"] = pages
-                result["status"] = "success"
-            
-            elif ext == '.xlsx':
-                result["extract_method"] = "openpyxl"
-                import openpyxl
-                wb = openpyxl.load_workbook(file_path, data_only=True)
-                sheets_text = []
-                for sheet in wb.worksheets:
-                    sheet_data = []
-                    for row in sheet.iter_rows(values_only=True):
-                        row_text = " | ".join([str(cell) if cell is not None else "" for cell in row])
-                        if row_text.strip().replace("|", "").strip():
-                            sheet_data.append(row_text)
-                    if sheet_data:
-                        sheet_text = f"=== ЛИСТ: {sheet.title} ===\n" + "\n".join(sheet_data)
-                        sheets_text.append(sheet_text)
-                        result["pages"].append({"page_num": sheet.title, "text": sheet_text, "is_sheet": True, "tables": ["\n".join(sheet_data)]})
-                result["extracted_text"] = "\n\n".join(sheets_text)
-                result["status"] = "success"
-            
-            elif ext == '.xls':
-                result["extract_method"] = "xlrd"
-                import xlrd
-                wb = xlrd.open_workbook(file_path)
-                sheets_text = []
-                for sheet in wb.sheets():
-                    sheet_data = []
-                    for row_idx in range(sheet.nrows):
-                        row = sheet.row_values(row_idx)
-                        row_text = " | ".join([str(cell) if cell is not None else "" for cell in row])
-                        if row_text.strip().replace("|", "").strip():
-                            sheet_data.append(row_text)
-                    if sheet_data:
-                        sheet_text = f"=== ЛИСТ: {sheet.name} ===\n" + "\n".join(sheet_data)
-                        sheets_text.append(sheet_text)
-                        result["pages"].append({"page_num": sheet.name, "text": sheet_text, "is_sheet": True, "tables": ["\n".join(sheet_data)]})
-                result["extracted_text"] = "\n\n".join(sheets_text)
-                result["status"] = "success"
-            
-            elif ext == '.pdf':
-                result["extract_method"] = "pypdf"
-                native_text, native_pages = self._extract_pdf_text_native(file_path)
-                native_text = self._normalize_extracted_text(native_text)
-                result["pages"] = native_pages
-
-                if native_text and self._is_text_quality_good(native_text):
-                    result["extracted_text"] = native_text
-                    result["status"] = "success"
-                else:
-                    logger.info("PDF text quality is POOR. Triggering OCR fallback...")
-                    result["extract_method"] = "paddleocr"
-                    try:
-                        ocr_pages = self._perform_ocr(file_path)
-                        ocr_text = self._normalize_extracted_text(
-                            "\n\n".join([f"--- Page {p['page_num']} ---\n{p['text']}" for p in ocr_pages])
-                        )
-
-                        if ocr_text:
-                            result["pages"] = ocr_pages
-                            result["extracted_text"] = ocr_text
-                            result["ocr_used"] = True
-                            result["status"] = "success"
-                        elif native_text:
-                            result["pages"] = native_pages
-                            result["extracted_text"] = native_text
-                            result["ocr_used"] = True
-                            result["status"] = "success"
-                            result["error_message"] = "OCR не дал результата, использован нативно извлеченный текст PDF"
-                        else:
-                            result["pages"] = native_pages
-                            result["extracted_text"] = ""
-                            result["ocr_used"] = True
-                            result["status"] = "failed_ocr"
-                            result["error_message"] = "OCR не дал результата, а нативный текст PDF пуст"
-                    except Exception as e:
-                        logger.error(f"OCR failed: {e}", exc_info=True)
-                        result["ocr_used"] = True
-
-                        if native_text:
-                            result["pages"] = native_pages
-                            result["extracted_text"] = native_text
-                            result["status"] = "success"
-                            result["error_message"] = f"OCR failed, использован нативный текст PDF: {str(e)}"
-                        else:
-                            result["pages"] = native_pages
-                            result["extracted_text"] = ""
-                            result["status"] = "failed_ocr"
-                            result["error_message"] = f"OCR failed: {str(e)}"
-
-                filename_lower = filename.lower()
-                result["critical_for_analysis"] = any(x in filename_lower for x in ["нмцк", "обоснование", "смет"]) and not result.get("extracted_text")
-
+            if fragment_type in fragments_stats:
+                fragments_stats[fragment_type] += 1
             else:
-                result["status"] = "skipped_unsupported_type"
-                result["error_message"] = f"Unsupported file extension: {ext}"
+                fragments_stats["OTHER"] = fragments_stats.get("OTHER", 0) + 1
 
-            if result["status"] == "success" and not result["extracted_text"].strip():
-                result["status"] = "skipped_empty"
-                result["error_message"] = "Файл пуст или текст не извлечен"
+            blocks.append(
+                f"--- PAGE_OR_SHEET: {page_num} | FRAGMENT_TYPE_HINT: {fragment_type} ---"
+            )
 
-        except Exception as e:
-            logger.error(f"Extraction error for {file_path}: {e}", exc_info=True)
-            result["status"] = "failed_text_extraction"
-            result["error_message"] = str(e)
+            if page_text:
+                blocks.append("[TEXT]")
+                blocks.append(page_text)
+                text_chars += len(page_text)
 
-        result["text_length"] = len(result.get("extracted_text", ""))
+            if tables:
+                blocks.append("[TABLES]")
+                for idx, table_text in enumerate(tables, start=1):
+                    table_clean = self._clean_text(table_text or "")
+                    if table_clean:
+                        blocks.append(f"[TABLE {idx}]")
+                        blocks.append(table_clean)
+                        tables_count += 1
+                        text_chars += len(table_clean)
 
-        if result.get("status") == "success":
-            # For cache compatibility, we store it in the old format too
-            cache_data = result.copy()
-            cache_data["text"] = result["extracted_text"]
-            self.text_cache[cache_key] = cache_data
-
-        # Final DOC_EXTRACT_RESULT log
-        tables_total = sum(len(p.get("tables", [])) for p in result.get("pages", []))
-        pages_count = len(result.get("pages", []))
         logger.info(
-            f"[DOC_EXTRACT_RESULT] tender_id={tender_id} filename='{filename}' extension='{ext}' status='{result['status']}' "
-            f"extract_method='{result['extract_method']}' text_length={result['text_length']} pages_count={pages_count} "
-            f"tables_count={tables_total} quality_flags='' error_message='{result['error_message']}'"
+            f"[GOODS_CONTEXT_FRAGMENT_STATS] tender_id={tender_id} filename='{filename}' "
+            f"goods_spec_fragments={fragments_stats['GOODS_SPEC']} goods_general_requirement_fragments={fragments_stats['GOODS_GENERAL_REQUIREMENTS']} "
+            f"contract_terms_fragments={fragments_stats['CONTRACT_TERMS']} procurement_rule_fragments={fragments_stats['PROCUREMENT_RULES']} "
+            f"price_fragments={fragments_stats['PRICE_JUSTIFICATION']} other_fragments={fragments_stats['OTHER']}"
         )
         
-        # DOC_PAGE_STATS logs
-        for p in result.get("pages", []):
-            pnum = p.get("page_num", 0)
-            plen = len(p.get("text", ""))
-            ptab = len(p.get("tables", []))
-            ocr_used = result.get("ocr_used", False)
-            # degraded could mean skipped empty due to low quality but let's default to False
-            degraded = False
-            logger.debug(
-                f"[DOC_PAGE_STATS] tender_id={tender_id} filename='{filename}' page_num={pnum} "
-                f"text_length={plen} tables_count={ptab} ocr_used={ocr_used} degraded={degraded} quality_score='N/A'"
+        logger.info(
+            f"[GOODS_CONTEXT_FILE_CLASSIFIED] tender_id={tender_id} filename='{filename}' doc_class_hint='{doc_hint}' "
+            f"priority={priority} status='success' pages_included={len(pages)} tables_included={tables_count} text_chars_included={text_chars}"
+        )
+
+        return "\n\n".join(blocks).strip() + "\n"
+
+    def _build_goods_documents_block(
+        self,
+        files_data: List[Dict[str, Any]],
+        tender_id: str = "N/A",
+        max_total_chars: int = 400000,
+    ) -> Tuple[str, Dict[str, Any]]:
+        logger.info(f"[GOODS_CONTEXT_BUILD_START] tender_id={tender_id} files_count={len(files_data)}")
+
+        sorted_files = sorted(files_data, key=lambda f: self._document_priority_for_goods(f.get("filename", "")))
+
+        included_files: List[str] = []
+        skipped_files: List[Dict[str, Any]] = []
+        archives_skipped: List[Dict[str, Any]] = []
+        rendered_parts: List[str] = []
+        total_chars = 0
+        total_pages = 0
+        total_tables = 0
+
+        for file_data in sorted_files:
+            filename = file_data.get("filename", "Unknown")
+            status = file_data.get("status", "success")
+
+            if self._is_archive(filename):
+                archives_skipped.append({
+                    "filename": filename,
+                    "reason": "archive_not_supported_for_direct_analysis"
+                })
+                continue
+
+            if status != "success":
+                skipped_files.append({
+                    "filename": filename,
+                    "reason": f"status_{status}",
+                    "error_message": file_data.get("error_message", "")
+                })
+                continue
+
+            rendered = self._render_goods_pages(file_data, tender_id=tender_id)
+            if not rendered.strip():
+                skipped_files.append({"filename": filename, "reason": "empty_render"})
+                continue
+
+            if total_chars + len(rendered) > max_total_chars:
+                skipped_files.append({"filename": filename, "reason": "max_total_chars_exceeded"})
+                continue
+
+            rendered_parts.append(rendered)
+            included_files.append(filename)
+            total_chars += len(rendered)
+            total_pages += len(file_data.get("pages", []))
+            total_tables += sum(len(p.get("tables", [])) for p in file_data.get("pages", []))
+
+        block = "\n\n".join(rendered_parts).strip()
+        meta = {
+            "documents_count": len(included_files),
+            "included_files": included_files,
+            "skipped_files": skipped_files,
+            "archives_skipped": archives_skipped,
+            "total_chars": total_chars,
+        }
+
+        logger.info(
+            f"[GOODS_CONTEXT_BUILD_DONE] tender_id={tender_id} included_files={len(included_files)} skipped_files={len(skipped_files)} "
+            f"total_chars={total_chars} total_pages={total_pages} total_tables={total_tables} block_count={len(rendered_parts)} context_truncated={len(skipped_files) > 0}"
+        )
+
+        return block, meta
+
+    def _repair_json_with_ai(self, raw_text: str, tender_id: str, job_id: str) -> str:
+        if not raw_text.strip():
+            return ""
+        if not self.ai_service or not getattr(self.ai_service, "client", None):
+            return ""
+
+        from google.genai import types
+
+        repair_prompt = (
+            "Исправь синтаксис JSON, не меняя структуру и значения. "
+            "Верни только валидный JSON без markdown и пояснений.\n\n"
+            f"{raw_text.strip()}"
+        )
+
+        try:
+            response = self.ai_service._call_ai_with_retry(
+                self.ai_service.client.models.generate_content,
+                contents=repair_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0,
+                ),
             )
+        except Exception as repair_error:
+            logger.warning(
+                f"[GOODS_EXTRACTION_JSON_REPAIR] tender_id={tender_id} job_id={job_id} "
+                f"status='failed' error='{repair_error}'"
+            )
+            return ""
+
+        repaired_text = response.text if response else ""
+        preview = repaired_text[:100].replace("\n", " ").replace("\r", "")
+        logger.info(
+            f"[GOODS_EXTRACTION_JSON_REPAIR] tender_id={tender_id} job_id={job_id} "
+            f"status='received' response_length_chars={len(repaired_text)} response_preview='{preview}...'"
+        )
+        return repaired_text
+
+    def _parse_json_response(self, raw_text: str) -> Dict[str, Any]:
+        text = (raw_text or "").replace("\ufeff", "").replace("\u200b", "").strip()
+
+        if text.startswith("```json"):
+            text = text.replace("```json", "", 1).replace("```", "", 1).strip()
+        elif text.startswith("```"):
+            text = text.replace("```", "", 1).replace("```", "", 1).strip()
+
+        match = re.search(r"\{[\s\S]*\}", text)
+        if match:
+            text = match.group(0).strip()
+
+        candidates = [text]
+        without_trailing_commas = re.sub(r",(\s*[}\]])", r"\1", text)
+        if without_trailing_commas != text:
+            candidates.append(without_trailing_commas)
+
+        last_error = None
+        seen = set()
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+
+        raise json.JSONDecodeError("Empty JSON response", text, 0)
+
+    def _normalize_string(self, value: Any) -> str:
+        if value is None:
+            return ""
+        value = str(value).replace("\xa0", " ").strip()
+        value = re.sub(r"\s{2,}", " ", value)
+        return value
+
+    def _normalize_quantity(self, value: Any) -> str:
+        text = self._normalize_string(value)
+        text = text.replace(" ", "")
+        return text
+
+    def _normalize_position_name(self, value: str) -> str:
+        text = self._normalize_string(value)
+        text = re.sub(r"^[0-9]+[.)]?\s*", "", text)
+        text = re.sub(r"\bили\s+эквивалент\b", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bэквивалент\b", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s{2,}", " ", text)
+        return text.strip(" ,;:-")
+
+    def _normalize_characteristics(self, characteristics: Any) -> List[Dict[str, str]]:
+        result: List[Dict[str, str]] = []
+
+        if not isinstance(characteristics, list):
+            return result
+
+        seen = set()
+        for item in characteristics:
+            if not isinstance(item, dict):
+                continue
+            name = self._normalize_string(item.get("name"))
+            value = self._normalize_string(item.get("value"))
+            if not name and not value:
+                continue
+            key = (name.lower(), value.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({"name": name, "value": value})
 
         return result
 
-    def extract_text(self, file_path: str) -> str:
-        """
-        Обертка для обратной совместимости.
-        Возвращает именно extracted_text, а не несуществующий ключ text.
-        """
-        data = self.extract_document_data(file_path)
-        if data["status"] not in {"success"}:
-            logger.warning("Extraction issue: %s - %s", data["status"], data["error_message"])
-        return data.get("extracted_text", "")
+    def _normalize_source_documents(self, sources: Any) -> List[Dict[str, str]]:
+        result: List[Dict[str, str]] = []
+        if not isinstance(sources, list):
+            return result
 
-    def _is_text_quality_good(self, text: str) -> bool:
-        """
-        Проверяет качество извлеченного текста.
-        Возвращает True, если текст качественный, и False, если требуется OCR.
-        Ужесточенные критерии для PDF.
-        """
-        if not text or len(text.strip()) < 150: # Увеличили порог минимальной длины
-            return False
+        seen = set()
+        for item in sources:
+            if not isinstance(item, dict):
+                continue
+            file_name = self._normalize_string(item.get("file"))
+            page_or_sheet = self._normalize_string(item.get("page_or_sheet"))
+            fragment_type = self._normalize_string(item.get("fragment_type"))
+            evidence = self._normalize_string(item.get("evidence"))
 
-        total_chars = len(text)
-        
-        # 1. Доля мусорных символов
-        clean_pattern = r'[a-zA-Zа-яА-ЯёЁ0-9\s\.,!?;:()""\'\'\-\+=\[\]/\\<>@#\$%\^&\*«»№]'
-        clean_chars_count = len(re.findall(clean_pattern, text))
-        garbage_ratio = 1 - (clean_chars_count / total_chars) if total_chars > 0 else 1
-        
-        # 2. Доля нормальных слов на русском
-        words = text.split()
-        if not words:
-            return False
-            
-        russian_words = [w for w in words if re.search(r'[а-яА-ЯёЁ]{3,}', w)]
-        russian_words_ratio = len(russian_words) / len(words) if words else 0
-        
-        # 3. Наличие длинных испорченных строк
-        max_word_len = max(len(w) for w in words)
-        avg_word_len = sum(len(w) for w in words) / len(words)
-        
-        # 4. Доля нечитаемых фрагментов
-        unreadable_chars = len(re.findall(r'[\?\x00-\x08\x0b\x0c\x0e-\x1f]', text))
-        unreadable_ratio = unreadable_chars / total_chars if total_chars > 0 else 0
+            if not file_name and not evidence:
+                continue
 
-        logger.info(f"PDF Quality Metrics: Garbage={garbage_ratio:.2f}, RusWords={russian_words_ratio:.2f}, MaxWord={max_word_len}, AvgWord={avg_word_len:.1f}, Unreadable={unreadable_ratio:.2f}")
+            key = (file_name.lower(), page_or_sheet.lower(), fragment_type.lower(), evidence.lower())
+            if key in seen:
+                continue
+            seen.add(key)
 
-        # Ужесточенные пороговые значения:
-        # - Мусора > 10% (было 15%)
-        # - Русских слов < 30% (было 20%)
-        # - Слишком длинные "слова" (> 80 символов, было 100)
-        # - Слишком много нечитаемых знаков (> 3%, было 5%)
-        
-        if garbage_ratio > 0.10:
-            return False
-        if russian_words_ratio < 0.30:
-            # Если это не технический документ на английском
-            english_words = [w for w in words if re.search(r'[a-zA-Z]{3,}', w)]
-            english_words_ratio = len(english_words) / len(words)
-            if english_words_ratio < 0.40: # И не английский тоже
-                return False
-        if max_word_len > 80 or avg_word_len > 18:
-            return False
-        if unreadable_ratio > 0.03:
-            return False
+            result.append({
+                "file": file_name,
+                "page_or_sheet": page_or_sheet,
+                "fragment_type": fragment_type,
+                "evidence": evidence[:500]
+            })
 
-        return True
+        return result
 
-    def _perform_ocr(self, file_path: str) -> List[Dict[str, Any]]:
-        import time
-        start_time = time.time()
-        logger.info(f"Starting OCR for {file_path} using pypdfium2 + PaddleOCR")
+    def _position_key(self, item: Dict[str, Any]) -> str:
+        name = self._normalize_position_name(
+            item.get("position_name_normalized")
+            or item.get("position_name_raw")
+            or ""
+        ).lower()
+        name = re.sub(r"[^a-zа-я0-9]+", " ", name, flags=re.IGNORECASE)
+        name = re.sub(r"\s{2,}", " ", name).strip()
+        return name
 
-        pdf = pdfium.PdfDocument(file_path)
-        pages_to_process = min(len(pdf), 100)
-        ocr_pages = []
+    def _merge_positions(self, positions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+        merged: Dict[str, Dict[str, Any]] = {}
+        duplicates_merged = 0
 
-        try:
-            for i in range(pages_to_process):
-                logger.info(f"Processing page {i + 1}/{pages_to_process}...")
-                page = pdf[i]
-                bitmap = page.render(scale=3)
-                pil_image = bitmap.to_pil()
-                img_array = np.array(pil_image)
+        for item in positions:
+            key = self._position_key(item)
+            if not key:
+                continue
 
-                page_text = self._ocr_single_image(img_array)
-                page_text = self._normalize_extracted_text(page_text)
-                ocr_pages.append({"page_num": i + 1, "text": page_text})
-        finally:
-            pdf.close()
+            if key not in merged:
+                merged[key] = item
+                continue
 
-        full_ocr_text = "\n\n".join([p["text"] for p in ocr_pages]).strip()
-        end_time = time.time()
+            duplicates_merged += 1
+            base = merged[key]
 
-        if full_ocr_text:
-            logger.info(
-                f"OCR successful. Extracted {len(full_ocr_text)} characters from "
-                f"{pages_to_process} pages in {end_time - start_time:.2f}s."
+            if not base.get("quantity") and item.get("quantity"):
+                base["quantity"] = item.get("quantity")
+            if not base.get("unit") and item.get("unit"):
+                base["unit"] = item.get("unit")
+
+            existing_chars = {(c["name"].lower(), c["value"].lower()) for c in base.get("characteristics", [])}
+            for char in item.get("characteristics", []):
+                k = (char["name"].lower(), char["value"].lower())
+                if k not in existing_chars:
+                    base.setdefault("characteristics", []).append(char)
+                    existing_chars.add(k)
+
+            existing_sources = {
+                (
+                    s.get("file", "").lower(),
+                    s.get("page_or_sheet", "").lower(),
+                    s.get("fragment_type", "").lower(),
+                    s.get("evidence", "").lower(),
+                )
+                for s in base.get("source_documents", [])
+            }
+            for source in item.get("source_documents", []):
+                k = (
+                    source.get("file", "").lower(),
+                    source.get("page_or_sheet", "").lower(),
+                    source.get("fragment_type", "").lower(),
+                    source.get("evidence", "").lower(),
+                )
+                if k not in existing_sources:
+                    base.setdefault("source_documents", []).append(source)
+                    existing_sources.add(k)
+
+            if not base.get("notes") and item.get("notes"):
+                base["notes"] = item.get("notes")
+
+            if item.get("general_requirements_applied"):
+                base["general_requirements_applied"] = True
+
+        final = list(merged.values())
+        for idx, item in enumerate(final, start=1):
+            item["position_id"] = idx
+
+        return final, duplicates_merged
+
+    def _normalize_extraction_result(
+        self,
+        parsed: Dict[str, Any],
+        context_meta: Dict[str, Any],
+        tender_id: str = "N/A",
+        job_id: str = "N/A",
+    ) -> Dict[str, Any]:
+        raw_positions = parsed.get("positions", []) if isinstance(parsed, dict) else []
+        raw_general = parsed.get("general_goods_requirements", []) if isinstance(parsed, dict) else []
+        raw_summary = parsed.get("extraction_summary", {}) if isinstance(parsed, dict) else {}
+
+        positions: List[Dict[str, Any]] = []
+        rejected_count = 0
+
+        for item in raw_positions:
+            if not isinstance(item, dict):
+                continue
+
+            raw_name = self._normalize_string(item.get("position_name_raw"))
+            norm_name = self._normalize_position_name(
+                item.get("position_name_normalized") or raw_name
             )
-            return ocr_pages
-
-        logger.warning(f"OCR ran but found no text in {end_time - start_time:.2f}s.")
-        return [{"page_num": 1, "text": ""}]
-
-    def _extract_text_from_doc(self, file_path: str) -> str:
-        """
-        Извлечение текста из старого формата .doc.
-        Использует striprtf (если это RTF) или системную команду antiword.
-        """
-        # 1. Попытка через striprtf (некоторые .doc - это на самом деле RTF)
-        try:
-            from striprtf.striprtf import rtf_to_text
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                if "{\\rtf" in content:
-                    text = rtf_to_text(content)
-                    if text.strip():
-                        logger.info(f"Striprtf extracted {len(text)} characters from .doc (RTF)")
-                        return text
-        except Exception as e:
-            logger.warning(f"Striprtf failed for .doc: {e}")
-
-        # 2. Попытка через системную команду antiword
-        import shutil
-        import subprocess
-        
-        antiword_cmd = shutil.which('antiword')
-        if antiword_cmd:
-            try:
-                result = subprocess.run([antiword_cmd, file_path], capture_output=True, text=True, errors='ignore')
-                if result.returncode == 0 and result.stdout.strip():
-                    logger.info(f"Antiword extracted {len(result.stdout)} characters from .doc")
-                    return result.stdout
-            except Exception as e:
-                logger.warning(f"Antiword execution failed: {e}")
-        else:
-            logger.warning("Antiword executable not found in PATH.")
-
-        # 3. Последняя попытка: чтение как простого текста (иногда помогает для очень старых или поврежденных файлов)
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                raw_content = f.read()
-                # Пытаемся найти хоть какой-то осмысленный текст среди бинарных данных
-                import re
-                clean_text = re.sub(r'[^\x20-\x7E\u0400-\u04FF\n\t]', ' ', raw_content)
-                clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-                if len(clean_text) > 100:
-                    logger.info("Extracted partial text from .doc using raw fallback.")
-                    return f"[ВНИМАНИЕ: Текст извлечен частично]\n\n{clean_text}"
-        except:
-            pass
-
-        msg = f"Не удалось прочитать файл {os.path.basename(file_path)}."
-        if platform.system() == "Windows":
-            msg += "\n\nДЛЯ ИСПРАВЛЕНИЯ:\n1. Установите утилиту Antiword и добавьте её в PATH.\n2. ИЛИ (проще) пересохраните файл в формате .docx."
-        else:
-            msg += "\n\nУстановите пакет antiword (sudo apt install antiword)."
             
-        return f"[ОШИБКА ФОРМАТА] {msg}"
+            logger.debug(
+                f"[GOODS_EXTRACTION_POSITION_RAW] tender_id={tender_id} position_name_raw='{raw_name}' "
+                f"quantity='{item.get('quantity')}' unit='{item.get('unit')}' chars_count={len(item.get('characteristics', []))}"
+            )
+
+            if not raw_name and not norm_name:
+                rejected_count += 1
+                logger.warning(
+                    f"[GOODS_EXTRACTION_WARNING] tender_id={tender_id} reason='empty_name' "
+                    f"raw_data='{json.dumps(item, ensure_ascii=False)[:200]}'"
+                )
+                continue
+
+            validated_item = {
+                "position_id": 0,
+                "position_name_raw": raw_name or norm_name,
+                "position_name_normalized": norm_name or raw_name,
+                "quantity": self._normalize_string(item.get("quantity")), # DO NOT STRIP ALL SPACES
+                "unit": self._normalize_string(item.get("unit")),
+                "characteristics": self._normalize_characteristics(item.get("characteristics")),
+                "general_requirements_applied": bool(item.get("general_requirements_applied")),
+                "analog_allowed": bool(item.get("analog_allowed")),
+                "manufacturer_or_brand_required": bool(item.get("manufacturer_or_brand_required")),
+                "source_documents": self._normalize_source_documents(item.get("source_documents")),
+                "notes": self._normalize_string(item.get("notes")),
+            }
+            positions.append(validated_item)
+
+            logger.debug(
+                f"[GOODS_EXTRACTION_POSITION_NORMALIZED] tender_id={tender_id} position_name_normalized='{validated_item['position_name_normalized']}' "
+                f"quantity='{validated_item['quantity']}' unit='{validated_item['unit']}' chars_count={len(validated_item['characteristics'])} "
+                f"analog_allowed={validated_item['analog_allowed']}"
+            )
+
+        positions, duplicates_merged = self._merge_positions(positions)
+        
+        logger.info(
+            f"[GOODS_EXTRACTION_MERGE] tender_id={tender_id} initial_positions={len(raw_positions)} "
+            f"rejected_positions={rejected_count} duplicates_merged={duplicates_merged} final_positions={len(positions)}"
+        )
+
+        if not positions:
+            logger.warning(f"[GOODS_EXTRACTION_WARNING] tender_id={tender_id} reason='no_positions_found' raw_data=''")
+
+        general_goods_requirements: List[Dict[str, Any]] = []
+        seen_general = set()
+        for item in raw_general:
+            if not isinstance(item, dict):
+                continue
+            name = self._normalize_string(item.get("name"))
+            value = self._normalize_string(item.get("value"))
+            if not name and not value:
+                continue
+            key = (name.lower(), value.lower())
+            if key in seen_general:
+                continue
+            seen_general.add(key)
+            general_goods_requirements.append({
+                "name": name,
+                "value": value,
+                "source_documents": self._normalize_source_documents(item.get("source_documents"))
+            })
+
+        warnings = []
+        if context_meta["archives_skipped"]:
+            warnings.append(
+                "В пакете есть архивы, не пригодные для прямого анализа без распаковки: "
+                + ", ".join(item["filename"] for item in context_meta["archives_skipped"])
+            )
+
+        if isinstance(raw_summary, dict):
+            summary_warnings = raw_summary.get("warnings", [])
+            if isinstance(summary_warnings, list):
+                for w in summary_warnings:
+                    w = self._normalize_string(w)
+                    if w and w not in warnings:
+                        warnings.append(w)
+
+        positions_with_quantity = sum(1 for p in positions if p.get("quantity") and str(p.get("quantity")).lower() not in ["не указано", "нет", "null", "none", ""])
+        positions_with_unit = sum(1 for p in positions if p.get("unit") and str(p.get("unit")).lower() not in ["не указано", "нет", "null", "none", ""])
+        positions_with_characteristics = sum(1 for p in positions if p.get("characteristics"))
+
+        if positions:
+            missing_qty = len(positions) - positions_with_quantity
+            missing_chars = len(positions) - positions_with_characteristics
+            if missing_chars == len(positions):
+                warnings.append("У найденных позиций отсутствуют характеристики")
+            if missing_qty == len(positions):
+                warnings.append("У найденных позиций отсутствуют количества из-за неполного распознавания или их отсутствия в тексте")
+
+        quality_summary = {
+            "positions_found": len(positions),
+            "positions_with_quantity": positions_with_quantity,
+            "positions_with_unit": positions_with_unit,
+            "positions_with_characteristics": positions_with_characteristics,
+            "general_requirements_found": len(general_goods_requirements),
+            "archives_blocking": len(context_meta.get("archives_skipped", [])) > 0,
+            "critical_degraded": False
+        }
+        
+        # Determine degraded status
+        if (len(positions) > 0 and positions_with_characteristics == 0 and positions_with_quantity == 0) or quality_summary["archives_blocking"]:
+             quality_summary["critical_degraded"] = True
+
+        result = {
+            "positions": positions,
+            "general_goods_requirements": general_goods_requirements,
+            "warnings": warnings,
+            "debug": context_meta,
+            "extraction_summary": {
+                "positions_count": len(positions),
+                "duplicates_merged": duplicates_merged,
+                "ignored_fragments_types": ["CONTRACT_TERMS", "PROCUREMENT_RULES", "PRICE_JUSTIFICATION"],
+                "warnings": warnings,
+                "quality_summary": quality_summary
+            }
+        }
+        return result

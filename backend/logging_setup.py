@@ -17,7 +17,7 @@ def _project_root() -> str:
 def _build_log_file_path() -> str:
     log_dir = os.path.join(_project_root(), "logs")
     os.makedirs(log_dir, exist_ok=True)
-    return os.path.join(log_dir, "tendersmart.log")
+    return os.path.join(log_dir, "tendersmart.txt")
 
 
 def _configure_root_logger() -> None:

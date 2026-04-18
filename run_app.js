@@ -8,7 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = resolve(__filename, "..");
 
 const LOG_DIR = join(__dirname, "logs");
-const LOG_FILE = join(LOG_DIR, "tendersmart.log");
+const LOG_FILE = join(LOG_DIR, "tendersmart.txt");
 mkdirSync(LOG_DIR, { recursive: true });
 
 const logStream = createWriteStream(LOG_FILE, {
@@ -53,7 +53,7 @@ function writeFileLog(source, line) {
 
 function shouldMirrorBackendLineToFile(line) {
   const text = String(line ?? "");
-  // backend/logger.py / logging_setup.py уже сами пишут такие строки в tendersmart.log
+  // backend/logger.py / logging_setup.py уже сами пишут такие строки в tendersmart.txt
   if (/^\d{4}-\d{2}-\d{2}\s/.test(text)) return false;
   return true;
 }
