@@ -10,6 +10,35 @@ from .job_service import job_service
 from .legal_analysis_service import LegalAnalysisService
 
 
+SIDECAR_SUFFIXES = (".download_meta.json",)
+ARCHIVE_EXTENSIONS = (".zip", ".7z", ".rar")
+
+
+def _resolve_selected_file_path(tender_dir: str, filename: str) -> str:
+    normalized_name = os.path.normpath(str(filename or "").strip())
+    if not normalized_name or normalized_name == "." or os.path.isabs(normalized_name):
+        return ""
+
+    tender_dir_abs = os.path.abspath(tender_dir)
+    candidate_path = os.path.abspath(os.path.join(tender_dir_abs, normalized_name))
+
+    try:
+        if os.path.commonpath([tender_dir_abs, candidate_path]) != tender_dir_abs:
+            return ""
+    except ValueError:
+        return ""
+
+    if not os.path.isfile(candidate_path):
+        return ""
+
+    return candidate_path
+
+
+def _is_sidecar_file(filename: str) -> bool:
+    normalized_name = os.path.normpath(str(filename or "").strip()).lower()
+    return any(normalized_name.endswith(suffix) for suffix in SIDECAR_SUFFIXES)
+
+
 def analyze_tenders_batch_job(
     job_id: str,
     tender_ids: List[str],
@@ -63,26 +92,57 @@ def analyze_tenders_batch_job(
 
         files_data: List[Dict[str, Any]] = []
         file_statuses: List[Dict[str, Any]] = []
-        available_files = set(os.listdir(tender_dir))
 
         logger.info("--- [STARTING TEXT EXTRACTION FOR TENDER %s] ---", tid)
         logger.info("Requested files: %s", requested_files)
 
         docx_bases = {os.path.splitext(f)[0] for f in requested_files if f.lower().endswith(".docx")}
         filtered_files = []
+        skipped_archives_detected = False
         for f in requested_files:
+            if _is_sidecar_file(f):
+                logger.info("Skipping sidecar metadata file from batch analysis: %s", f)
+                continue
+            if str(f or "").lower().endswith(ARCHIVE_EXTENSIONS):
+                logger.info("Skipping archive file from batch analysis: %s", f)
+                skipped_archives_detected = True
+                continue
             base, ext = os.path.splitext(f)
             if ext.lower() == ".doc" and base in docx_bases:
                 logger.info("Skipping %s because %s.docx is also selected.", f, base)
                 continue
             filtered_files.append(f)
 
+        if not filtered_files:
+            logger.warning("All selected files were filtered out as sidecars or duplicates for tender %s", tid)
+            if skipped_archives_detected:
+                final_report_markdown = (
+                    "Ошибка: среди выбранных файлов не осталось пригодных документов для анализа. "
+                    "Архивы, служебные файлы загрузки и дубликаты были автоматически исключены."
+                )
+                summary_notes = "Выбраны только архивы, служебные файлы или дубликаты."
+            else:
+                final_report_markdown = (
+                    "Ошибка: среди выбранных файлов не осталось пригодных документов для анализа. "
+                    "Служебные файлы загрузки и дубликаты были автоматически исключены."
+                )
+                summary_notes = "Выбраны только служебные файлы или дубликаты."
+            job_service.complete_tender(job_id, tid, {
+                "status": "error",
+                "final_report_markdown": final_report_markdown,
+                "summary_notes": summary_notes,
+                "file_statuses": [],
+                "export_available": False,
+            })
+            continue
+
         extraction_start_time = time.time()
 
         for filename in filtered_files:
             logger.info("[FILE_PROCESS_START] tender_id=%s filename=%s", tid, filename)
 
-            if filename not in available_files:
+            filepath = _resolve_selected_file_path(tender_dir, filename)
+            if not filepath:
                 logger.warning("File %s not found in %s", filename, tender_dir)
                 file_statuses.append({
                     "filename": filename,
@@ -91,8 +151,6 @@ def analyze_tenders_batch_job(
                 })
                 logger.info("[FILE_PROCESS_RESULT] tender_id=%s filename=%s status=skipped_not_found text_length=0", tid, filename)
                 continue
-
-            filepath = os.path.join(tender_dir, filename)
 
             try:
                 doc_data = doc_service.extract_document_data(filepath)

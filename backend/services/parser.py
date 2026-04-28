@@ -1,198 +1,421 @@
 import asyncio
+import hashlib
+import html
+import json
 import logging
 import re
-from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse, urljoin, urlunparse, parse_qsl, urlencode
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import aiohttp
 from bs4 import BeautifulSoup
-from langchain_community.document_loaders.recursive_url_loader import RecursiveUrlLoader
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger("GidroizolParser")
-# logger.setLevel(logging.INFO) - Удалено для использования общего уровня DEBUG
 
-ASYNC_CONCURRENCY = 10
-ASYNC_TIMEOUT = 30
-ASYNC_RETRIES = 2
+FETCH_CONCURRENCY = 16
+FETCH_TIMEOUT = 25
+FETCH_RETRIES = 2
+PARSER_VERSION = "gidroizol-sitemap-v2"
 
 
 class GidroizolParser:
     BASE_URL = "https://gidroizol.ru"
     DOMAIN = "gidroizol.ru"
+    SITEMAP_URL = f"{BASE_URL}/sitemap.xml"
+    MOSCOW_CITY_ID = 1
 
-    MOSCOW_CITY_ID = "1"
-    CITY_PARAM = "city"
-
-    START_URLS = [
-        "https://gidroizol.ru/9",
-        "https://gidroizol.ru/18",
-        "https://gidroizol.ru/149",  # ИЗОПЛАСТ
-    ]
-
-    DROP_QUERY_PREFIXES = ("utm_",)
-    DROP_QUERY_KEYS = {"gclid", "fbclid", "yclid"}
-
-    PRICE_RE = re.compile(r"(\d+[.,]\d+|\d+)\s*р\./", re.IGNORECASE)
-
-    # Заголовки, при встрече которых парсинг описания останавливается
     STOP_DESC_HEADINGS = {
         "с этим товаром покупают",
         "аналоги",
         "отзывы",
         "сертификаты",
+        "характеристики",
         "написать сообщение",
         "запросить сертификат",
-        "характеристики", # часто характеристики идут после описания
+    }
+
+    IGNORE_PATH_PARTS = {
+        "o-nas",
+        "proektiruem-i-stroim",
+        "search",
+        "cart",
+        "basket",
+        "login",
+        "auth",
+        "manager",
+        "connectors",
+        "assets",
+        "core",
+        "privacy",
+        "agreement",
+        "policy",
+    }
+
+    FAMILY_ALIASES = {
+        "изопласт": "ИЗОПЛАСТ",
+        "изоэласт": "ИЗОЭЛАСТ",
+        "техноэласт": "ТЕХНОЭЛАСТ",
+        "унифлекс": "УНИФЛЕКС",
+        "эластобит": "ЭЛАСТОБИТ",
+        "эластоизол": "ЭЛАСТОИЗОЛ",
+        "стеклоэласт": "СТЕКЛОЭЛАСТ",
+        "стеклоизол": "СТЕКЛОИЗОЛ",
+        "стеклофлекс": "СТЕКЛОФЛЕКС",
+        "стеклокром": "СТЕКЛОКРОМ",
+        "гидроизол": "ГИДРОИЗОЛ",
+        "гидростеклоизол": "ГИДРОСТЕКЛОИЗОЛ",
+        "линокром": "ЛИНОКРОМ",
+        "рубероид": "РУБЕРОИД",
+        "рубитэкс": "РУБИТЭКС",
+        "филизол": "ФИЛИЗОЛ",
+        "мостослой": "МОСТОСЛОЙ",
+        "брит": "BRIT",
+        "тирослой": "ТИРОСЛОЙ",
+        "тэксослой": "ТЭКСОСЛОЙ",
+        "кинефлекс": "КИНЕФЛЕКС",
+        "виллатекс": "ВИЛЛАТЕКС",
+        "икопал": "ICOPAL",
+        "синтан": "СИНТАН",
+        "дорнит": "ДОРНИТ",
+        "пфг": "ПФГ",
+        "изостуд": "ИЗОСТУД",
+        "дрениз": "ДРЕНИЗ",
+        "plastguard": "PLASTGUARD",
+        "planter": "PLANTER",
+        "пенебар": "ПЕНЕБАР",
     }
 
     def __init__(self):
-        self.visited_urls: Set[str] = set()
-        self.product_urls: Set[str] = set()
-        self.product_data: List[Dict] = []
-
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Cookie": f"{self.CITY_PARAM}={self.MOSCOW_CITY_ID}",
+            "Cookie": f"city={self.MOSCOW_CITY_ID}",
         }
+        self._run_lock = asyncio.Lock()
 
     # ----------------------------
-    # URL helpers (Москва-only)
+    # URL helpers
     # ----------------------------
     def _is_asset(self, url: str) -> bool:
-        return url.lower().endswith(
-            (".jpg", ".jpeg", ".png", ".svg", ".ico", ".webp", ".css", ".js", ".pdf", ".zip")
+        return str(url or "").lower().endswith(
+            (".jpg", ".jpeg", ".png", ".svg", ".ico", ".webp", ".css", ".js", ".pdf", ".zip", ".xml")
         )
 
     def _is_same_domain(self, url: str) -> bool:
-        netloc = (urlparse(url).netloc or "").replace("www.", "")
-        return netloc == "" or netloc.endswith(self.DOMAIN)
+        netloc = (urlparse(url).netloc or "").replace("www.", "").lower()
+        return bool(netloc) and netloc.endswith(self.DOMAIN)
 
-    def _drop_tracking_qs(self, pairs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-        kept: List[Tuple[str, str]] = []
-        for k, v in pairs:
-            lk = k.lower()
-            if lk in self.DROP_QUERY_KEYS:
-                continue
-            if any(lk.startswith(pref) for pref in self.DROP_QUERY_PREFIXES):
-                continue
-            kept.append((k, v))
-        return kept
+    def canonicalize_url(self, url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith("/"):
+            raw = urljoin(self.BASE_URL, raw)
 
-    def _ensure_moscow_city(self, url: str) -> str:
-        url = (url or "").strip()
-        if not url:
-            return url
+        parsed = urlparse(raw)
+        scheme = "https"
+        host = (parsed.netloc or self.DOMAIN).replace("www.", "").lower()
+        path = re.sub(r"/{2,}", "/", parsed.path or "/").rstrip("/") or "/"
 
-        p = urlparse(url)
-        scheme = p.scheme or "https"
-        netloc = (p.netloc or self.DOMAIN).replace("www.", "")
-        path = (p.path or "").rstrip("/")
-
-        qs = self._drop_tracking_qs(list(parse_qsl(p.query, keep_blank_values=True)))
-        qs = [(k, v) for (k, v) in qs if k.lower() != self.CITY_PARAM]
-        qs.append((self.CITY_PARAM, self.MOSCOW_CITY_ID))
-        query = urlencode(qs, doseq=True)
-
-        return urlunparse((scheme, netloc, path, "", query, ""))
-
-    def _get_city_from_url(self, url: str) -> Optional[str]:
-        p = urlparse(url)
-        for k, v in parse_qsl(p.query, keep_blank_values=True):
-            if k.lower() == self.CITY_PARAM:
-                return v
-        return None
+        return urlunparse((scheme, host, path, "", "", ""))
 
     def normalize_url(self, url: str) -> str:
-        return self._ensure_moscow_city(url)
+        return self.canonicalize_url(url)
 
-    def _is_allowed_url(self, url: str) -> bool:
-        if not url:
+    def _is_allowed_candidate_url(self, url: str) -> bool:
+        canonical = self.canonicalize_url(url)
+        if not canonical:
             return False
-        if not self._is_same_domain(url):
+        if not self._is_same_domain(canonical):
             return False
-        if self._is_asset(url):
-            return False
-
-        city = self._get_city_from_url(url)
-        if city is not None and city != self.MOSCOW_CITY_ID:
+        if self._is_asset(canonical):
             return False
 
-        return True
+        path = (urlparse(canonical).path or "/").strip("/")
+        if not path:
+            return False
+
+        lowered = path.lower()
+        return not any(part in lowered for part in self.IGNORE_PATH_PARTS)
+
+    def _extract_site_product_id(self, url: str) -> str:
+        path = (urlparse(url).path or "/").strip("/")
+        if not path:
+            return ""
+        return path.split("/")[-1]
 
     # ----------------------------
-    # Listing vs product detection
+    # Text / value helpers
     # ----------------------------
-    def _count_price_occurrences(self, soup: BeautifulSoup) -> int:
-        txt = soup.get_text(" ", strip=True)
-        return len(self.PRICE_RE.findall(txt))
+    @staticmethod
+    def _clean_text(value: str) -> str:
+        return re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip()
 
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        normalized = str(value or "").lower().replace("ё", "е")
+        normalized = re.sub(r"[\"'`]", " ", normalized)
+        normalized = re.sub(r"[^0-9a-zа-я%+./,\- ]+", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
+    @staticmethod
+    def _clean_price(value: str) -> Optional[float]:
+        if not value:
+            return None
+        cleaned = str(value).replace("\xa0", " ").replace(" ", "").replace(",", ".")
+        cleaned = re.sub(r"[^\d.]", "", cleaned)
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_unit(unit: str) -> str:
+        cleaned = str(unit or "").strip().lower().replace("²", "2")
+        cleaned = cleaned.rstrip(".")
+        return cleaned
+
+    def _extract_numeric_measure(self, value: str) -> Optional[float]:
+        if not value:
+            return None
+        match = re.search(r"-?\d+(?:[.,]\d+)?", str(value))
+        if not match:
+            return None
+        return self._clean_price(match.group(0))
+
+    def _extract_temperature(self, value: str) -> Optional[float]:
+        if not value:
+            return None
+        match = re.search(r"(-?\d+(?:[.,]\d+)?)", str(value).replace("−", "-"))
+        if not match:
+            return None
+        try:
+            return float(match.group(1).replace(",", "."))
+        except Exception:
+            return None
+
+    def _extract_grade_markers(self, text: str) -> List[str]:
+        normalized = self._normalize_text(text)
+        markers: List[str] = []
+
+        def add_marker(value: str) -> None:
+            cleaned = self._clean_text(value)
+            if cleaned and cleaned not in markers:
+                markers.append(cleaned)
+
+        for left, right in re.findall(r"\b(\d{2,3})\s*(?:/|\s)\s*(\d{1,2})\b", normalized):
+            add_marker(f"{left}/{right}")
+            add_marker(f"{left} {right}")
+
+        for raw in re.findall(r"\b(\d{2,4})\b", normalized):
+            try:
+                value = int(raw)
+            except Exception:
+                continue
+            if 50 <= value <= 1200:
+                add_marker(raw)
+
+        weight_match = re.search(r"\b(\d{2,3})\s*кг\b", normalized)
+        if weight_match:
+            add_marker(f"{weight_match.group(1)}кг")
+
+        return markers
+
+    def _flatten_specs(self, specs: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for key, value in (specs or {}).items():
+            key_text = self._clean_text(str(key))
+            value_text = self._clean_text(str(value))
+            if key_text and value_text:
+                parts.append(f"{key_text}: {value_text}")
+        return "; ".join(parts)
+
+    def _spec_value_by_keys(self, specs: Dict[str, Any], patterns: Sequence[str]) -> str:
+        for key, value in (specs or {}).items():
+            key_low = self._normalize_text(str(key))
+            if any(pattern in key_low for pattern in patterns):
+                return self._clean_text(str(value))
+        return ""
+
+    # ----------------------------
+    # Network
+    # ----------------------------
+    async def _fetch_text(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
+        target = self.canonicalize_url(url)
+        if not target:
+            return None
+
+        timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
+        for attempt in range(FETCH_RETRIES + 1):
+            try:
+                async with session.get(target, timeout=timeout) as response:
+                    if response.status != 200:
+                        return None
+                    return await response.text(errors="ignore")
+            except Exception:
+                if attempt >= FETCH_RETRIES:
+                    return None
+                await asyncio.sleep(0.5 * (attempt + 1))
+        return None
+
+    async def _fetch_sitemap_urls(self, session: aiohttp.ClientSession) -> List[str]:
+        xml_text = await self._fetch_text(session, self.SITEMAP_URL)
+        if not xml_text:
+            logger.warning("Sitemap fetch failed: %s", self.SITEMAP_URL)
+            return []
+
+        urls: List[str] = []
+        seen: set[str] = set()
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as e:
+            logger.error("Sitemap XML parse error: %s", e)
+            return []
+
+        for loc in root.findall(".//{*}loc"):
+            canonical = self.canonicalize_url(loc.text or "")
+            if not self._is_allowed_candidate_url(canonical):
+                continue
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            urls.append(canonical)
+
+        logger.info("Sitemap loaded: %s candidate URLs", len(urls))
+        return urls
+
+    # ----------------------------
+    # Page classification
+    # ----------------------------
     def _count_add_to_cart_buttons(self, soup: BeautifulSoup) -> int:
         count = 0
-        for el in soup.find_all(["a", "button"], string=True):
-            t = el.get_text(" ", strip=True).lower()
-            if "в корзину" in t:
+        for el in soup.find_all(["a", "button"]):
+            text_value = self._normalize_text(el.get_text(" ", strip=True))
+            if "в корзину" in text_value:
                 count += 1
         return count
 
-    def is_listing_page(self, soup: BeautifulSoup) -> bool:
-        prices = self._count_price_occurrences(soup)
-        carts = self._count_add_to_cart_buttons(soup)
+    def _count_listing_cards(self, soup: BeautifulSoup) -> int:
+        selectors = [
+            ".list__item-wrapper",
+            ".list__item.ms2_product",
+            ".table__list .list__item",
+            "form.ms2_form",
+        ]
+        max_count = 0
+        for selector in selectors:
+            max_count = max(max_count, len(soup.select(selector)))
+        return max_count
 
-        if carts >= 3:
-            return True
-        if prices >= 8:
+    def is_listing_page(self, soup: BeautifulSoup) -> bool:
+        listing_cards = self._count_listing_cards(soup)
+        if listing_cards >= 4:
             return True
 
         heading_links = 0
-        for h in soup.select("h2 a[href], h3 a[href]"):
-            href = h.get("href", "")
-            if href and href.startswith("/"):
+        for link in soup.select("h2 a[href], h3 a[href], .left__heading a[href]"):
+            href = self.canonicalize_url(link.get("href", ""))
+            if href and self._is_allowed_candidate_url(href):
                 heading_links += 1
         if heading_links >= 6:
             return True
 
+        if self._count_add_to_cart_buttons(soup) >= 3 and listing_cards >= 2:
+            return True
         return False
 
-    # ----------------------------
-    # Parsing Logic
-    # ----------------------------
-    def _clean_price(self, s: str) -> float:
-        if not s:
-            return 0.0
-        s = s.replace("\xa0", " ").replace("&nbsp;", " ")
-        s = re.sub(r"[^\d.,]", "", s.replace(" ", ""))
-        s = s.replace(",", ".")
-        try:
-            return float(s)
-        except Exception:
-            return 0.0
+    def _extract_price_details(self, soup: BeautifulSoup) -> Dict[str, Any]:
+        selectors = [
+            ".dop-price",
+            ".price-block-wrap",
+            ".item__price",
+            ".price__text",
+        ]
+        texts: List[str] = []
+        for selector in selectors:
+            for el in soup.select(selector):
+                text_value = self._clean_text(el.get_text(" ", strip=True))
+                if text_value and text_value not in texts:
+                    texts.append(text_value)
 
-    def parse_price(self, soup: BeautifulSoup) -> float:
-        text = soup.get_text(" ", strip=True)
+        if not texts:
+            text_value = self._clean_text(soup.get_text(" ", strip=True))
+            if text_value:
+                texts.append(text_value)
 
-        m = re.search(r"(\d+[.,]\d+|\d+)\s*р\./[^\s]*\s*РОЗН", text, re.IGNORECASE)
-        if m:
-            return self._clean_price(m.group(1))
+        retail = wholesale = special = None
+        unit = ""
+        availability = "unknown"
+        combined = " || ".join(texts)
 
-        m = re.search(r"(\d+[.,]\d+|\d+)\s*р\./", text, re.IGNORECASE)
-        if m:
-            return self._clean_price(m.group(1))
+        if "под заказ" in self._normalize_text(combined):
+            availability = "on_request"
 
-        for sel in [".price_val", ".price", ".product-price", ".detail-price", "[itemprop='price']"]:
-            el = soup.select_one(sel)
-            if el:
-                val = self._clean_price(el.get_text(" ", strip=True))
-                if val > 0:
-                    return val
+        labeled_patterns = [
+            ("retail", r"(\d+(?:[.,]\d+)?)\s*р\./\s*([a-zа-я0-9²./-]+)\s*розн"),
+            ("wholesale", r"(\d+(?:[.,]\d+)?)\s*р\./\s*([a-zа-я0-9²./-]+)\s*опт"),
+            ("special", r"(\d+(?:[.,]\d+)?)\s*р\./\s*([a-zа-я0-9²./-]+)\s*спец"),
+        ]
+        for label, pattern in labeled_patterns:
+            match = re.search(pattern, combined, flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = self._clean_price(match.group(1))
+            unit = unit or self._normalize_unit(match.group(2))
+            if label == "retail":
+                retail = value
+            elif label == "wholesale":
+                wholesale = value
+            else:
+                special = value
 
-        return 0.0
+        if retail is None:
+            generic = re.search(r"(\d+(?:[.,]\d+)?)\s*р\./\s*([a-zа-я0-9²./-]+)", combined, flags=re.IGNORECASE)
+            if generic:
+                retail = self._clean_price(generic.group(1))
+                unit = unit or self._normalize_unit(generic.group(2))
+
+        if retail is None:
+            for selector in [".price_val", ".price", ".product-price", ".detail-price", "[itemprop='price']"]:
+                for el in soup.select(selector):
+                    value = self._clean_price(el.get_text(" ", strip=True))
+                    if value is not None:
+                        retail = value
+                        break
+                if retail is not None:
+                    break
+
+        if retail is not None and availability == "unknown":
+            availability = "in_stock"
+
+        return {
+            "retail": retail,
+            "wholesale": wholesale,
+            "special": special,
+            "unit": unit or None,
+            "availability": availability,
+        }
 
     def parse_specs(self, soup: BeautifulSoup) -> Dict[str, str]:
         specs: Dict[str, str] = {}
@@ -204,166 +427,98 @@ class GidroizolParser:
         ]
 
         rows = []
-        for rs in row_selectors:
-            rows = soup.select(rs)
+        for selector in row_selectors:
+            rows = soup.select(selector)
             if rows:
                 break
 
         for row in rows:
             tds = row.select("td")
             if len(tds) >= 2:
-                k = tds[0].get_text(" ", strip=True).replace(":", "")
-                v = tds[1].get_text(" ", strip=True)
-                if k and v:
-                    specs[k] = v
+                key = self._clean_text(tds[0].get_text(" ", strip=True)).rstrip(":")
+                value = self._clean_text(tds[1].get_text(" ", strip=True))
+                if key and value:
+                    specs[key] = value
                 continue
 
             cells = row.select("div.table-cell")
             if len(cells) >= 2:
-                k = cells[0].get_text(" ", strip=True).replace(":", "")
-                v = cells[1].get_text(" ", strip=True)
-                if k and v:
-                    specs[k] = v
+                key = self._clean_text(cells[0].get_text(" ", strip=True)).rstrip(":")
+                value = self._clean_text(cells[1].get_text(" ", strip=True))
+                if key and value:
+                    specs[key] = value
                 continue
 
-            txt = row.get_text(" ", strip=True)
-            if ":" in txt:
-                k, v = txt.split(":", 1)
-                k = k.strip().replace(":", "")
-                v = v.strip()
-                if k and v:
-                    specs[k] = v
+            text_value = self._clean_text(row.get_text(" ", strip=True))
+            if ":" in text_value:
+                key, value = text_value.split(":", 1)
+                key = self._clean_text(key).rstrip(":")
+                value = self._clean_text(value)
+                if key and value:
+                    specs[key] = value
 
         return specs
 
-    def parse_description(self, soup: BeautifulSoup) -> str:
-        """
-        Извлекает описание товара, комбинируя несколько стратегий.
-        """
-        description_text = ""
+    def _clean_description_block(self, text_value: str, title: str = "") -> str:
+        cleaned = self._clean_text(text_value)
+        if not cleaned:
+            return ""
+        cleaned = re.sub(r"^\s*описание\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*все описание\s*$", "", cleaned, flags=re.IGNORECASE)
+        if title:
+            normalized_title = self._normalize_text(title)
+            normalized_cleaned = self._normalize_text(cleaned)
+            if normalized_cleaned.startswith(normalized_title):
+                cleaned = cleaned[len(title):].strip(" .:-")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned[:3000]
 
-        # Стратегия 1: Поиск по itemprop="description"
-        desc_el = soup.select_one('[itemprop="description"]')
-        if desc_el:
-            description_text = desc_el.get_text(" ", strip=True)
+    def parse_description(self, soup: BeautifulSoup, title: str = "") -> str:
+        selectors = [
+            ".content_box.ver2 .visible-content",
+            ".content_box.ver2",
+            ".visible-content",
+            '[itemprop="description"]',
+            ".product-description",
+            ".detail-text",
+            ".desc",
+            "#tab-description",
+        ]
+        for selector in selectors:
+            for el in soup.select(selector):
+                text_value = self._clean_description_block(el.get_text(" ", strip=True), title=title)
+                if len(text_value) >= 40:
+                    return text_value
 
-        # Стратегия 2: Поиск заголовка "Описание" и взятие текста после него
-        if not description_text or len(description_text) < 50:
-            header_node = None
-            # Ищем заголовок, содержащий "Описание"
-            for tag in soup.find_all(['h2', 'h3', 'h4', 'div'], string=re.compile(r"Описание", re.IGNORECASE)):
-                if tag.name == 'div' and not tag.get('class'): # игнорируем пустые div
-                    continue
-                header_node = tag
-                break
-            
-            if header_node:
-                content_chunks = []
-                for sibling in header_node.next_siblings:
-                    if sibling.name in ['h2', 'h3', 'h4', 'section', 'footer']:
-                        # Проверяем, не начался ли новый смысловой блок
-                        stop_text = sibling.get_text(" ", strip=True).lower()
-                        if any(stop in stop_text for stop in self.STOP_DESC_HEADINGS):
-                            break
-                        # Если просто заголовок, но не из стоп-листа, считаем его частью описания? 
-                        # Обычно да, но лучше быть осторожным.
-                    
-                    if sibling.name in ['p', 'div', 'ul', 'ol', 'span']:
-                        text = sibling.get_text(" ", strip=True)
-                        if len(text) > 10: # Фильтр совсем коротких обрывков
-                            content_chunks.append(text)
-                
-                if content_chunks:
-                    description_text = "\n\n".join(content_chunks)
+        header_node = None
+        for tag in soup.find_all(["h2", "h3", "h4", "div"], string=re.compile(r"Описание", re.IGNORECASE)):
+            header_node = tag
+            break
 
-        # Стратегия 3: Стандартные классы
-        if not description_text or len(description_text) < 50:
-            for sel in [".product-description", ".detail-text", ".desc", "#tab-description"]:
-                el = soup.select_one(sel)
-                if el:
-                    description_text = el.get_text(" ", strip=True)
-                    break
+        if header_node:
+            chunks: List[str] = []
+            for sibling in header_node.next_siblings:
+                if getattr(sibling, "name", None) in ["h2", "h3", "h4", "section", "footer"]:
+                    stop_text = self._normalize_text(getattr(sibling, "get_text", lambda *args, **kwargs: "")(" ", strip=True))
+                    if any(marker in stop_text for marker in self.STOP_DESC_HEADINGS):
+                        break
 
-        # Очистка
-        if description_text:
-            # Убираем лишние пробелы
-            description_text = re.sub(r'\s+', ' ', description_text).strip()
-            # Убираем заголовки, если они попали в текст
-            description_text = description_text.replace("Описание товара", "").replace("Описание", "")
-            return description_text[:3000] # Лимит символов для БД
+                if getattr(sibling, "name", None) in ["p", "div", "ul", "ol", "span"]:
+                    text_value = self._clean_description_block(sibling.get_text(" ", strip=True), title=title)
+                    if len(text_value) >= 25:
+                        chunks.append(text_value)
+            if chunks:
+                return self._clean_description_block(" ".join(chunks), title=title)
 
+        meta_description = self.parse_meta_description(soup, title=title)
+        if meta_description:
+            return meta_description
         return ""
 
-    # ----------------------------
-    # Product page detection
-    # ----------------------------
-    def is_product_page(self, soup: BeautifulSoup, url: str = "") -> bool:
-        if self.is_listing_page(soup):
-            return False
-
-        if not soup.select_one("h1"):
-            return False
-
-        price = self.parse_price(soup)
-        if price <= 0:
-            return False
-
-        text = soup.get_text(" ", strip=True).lower()
-        specs = self.parse_specs(soup)
-        carts = self._count_add_to_cart_buttons(soup)
-
-        if "все характеристики" in text or len(specs) >= 3: # Снизил порог характеристик
-            return True
-
-        if carts <= 2 and ("розн" in text or "опт" in text or "спец" in text or "в корзину" in text or "заказать" in text):
-            return True
-
-        return False
-
-    # ----------------------------
-    # Parsing Entry Point
-    # ----------------------------
-    def parse_product_page(self, url: str, html: str) -> Optional[Dict]:
-        try:
-            if not self._is_allowed_url(url):
-                return None
-
-            soup = BeautifulSoup(html, "html.parser")
-
-            if not self.is_product_page(soup, url):
-                return None
-
-            title = None
-            for sel in ["section#tovar h1", "h1", "div.product-title h1", "div.product-title"]:
-                el = soup.select_one(sel)
-                if el and el.get_text(strip=True):
-                    title = el.get_text(strip=True)
-                    break
-            if not title:
-                return None
-
-            category_path = self.extract_category_path(soup)
-            price = self.parse_price(soup)
-            specs = self.parse_specs(soup)
-            description = self.parse_description(soup)
-
-            product_url = self.normalize_url(url)
-
-            return {
-                "url": product_url,
-                "title": title,
-                "category": category_path,
-                "price": price,
-                "description": description,
-                "specs": specs,
-                "material_type": "Рулонный" if "рулон" in category_path.lower() else "Гидроизоляция",
-                "type": "product",
-                "city_id": self.MOSCOW_CITY_ID,
-                "city_name": "Москва",
-            }
-        except Exception as e:
-            logger.error(f"parse_product_page error {url}: {e}")
-            return None
+    def parse_meta_description(self, soup: BeautifulSoup, title: str = "") -> str:
+        meta = soup.find("meta", attrs={"name": "description"})
+        content = meta.get("content", "") if meta else ""
+        return self._clean_description_block(content, title=title)
 
     def extract_category_path(self, soup: BeautifulSoup) -> str:
         breadcrumb_selectors = [
@@ -376,203 +531,794 @@ class GidroizolParser:
         ]
 
         crumbs: List[str] = []
-        for sel in breadcrumb_selectors:
-            items = soup.select(sel)
+        for selector in breadcrumb_selectors:
+            items = soup.select(selector)
             if items:
-                crumbs = [x.get_text(strip=True) for x in items if x.get_text(strip=True)]
+                crumbs = [self._clean_text(item.get_text(strip=True)) for item in items if item.get_text(strip=True)]
                 break
 
         drop = {"главная", "home", "каталог", "все категории"}
-        cats = [c for c in crumbs if c and c.strip().lower() not in drop]
+        categories = [item for item in crumbs if self._normalize_text(item) not in drop]
 
         h1 = soup.select_one("h1")
         if h1:
-            h1t = h1.get_text(strip=True)
-            if cats and cats[-1] == h1t:
-                cats = cats[:-1]
+            h1_text = self._clean_text(h1.get_text(strip=True))
+            if categories and categories[-1] == h1_text:
+                categories = categories[:-1]
 
-        return " / ".join(cats[-3:]) if cats else "Каталог"
+        return " / ".join(categories[-3:]) if categories else "Каталог"
+
+    def _extract_title(self, soup: BeautifulSoup) -> str:
+        for selector in ["section#tovar h1", "h1", "div.product-title h1", "div.product-title"]:
+            el = soup.select_one(selector)
+            if el:
+                title = self._clean_text(el.get_text(" ", strip=True))
+                if title:
+                    return title
+        return ""
+
+    def is_product_page(self, soup: BeautifulSoup, url: str = "") -> bool:
+        title = self._extract_title(soup)
+        if not title:
+            return False
+        if self.is_listing_page(soup):
+            return False
+
+        specs = self.parse_specs(soup)
+        price_details = self._extract_price_details(soup)
+        price_value = price_details.get("retail")
+        breadcrumb_count = len(soup.select("section#breadcrumbs ul li a, .breadcrumb a"))
+        description = self.parse_description(soup, title=title)
+
+        if len(specs) >= 3 and price_value is not None:
+            return True
+        if price_value is not None and breadcrumb_count >= 2:
+            return True
+        if len(description) >= 80 and len(specs) >= 2:
+            return True
+        return False
 
     # ----------------------------
-    # Crawler Logic
+    # Product normalization
     # ----------------------------
-    def _extract_links(self, soup: BeautifulSoup, base_url: str) -> Set[str]:
-        out: Set[str] = set()
-        for a in soup.select("a[href]"):
-            href = a.get("href")
-            if not href:
+    def _build_normalized_category(self, category: str, category_leaf: str, material_group: str) -> str:
+        parts = [self._normalize_text(category), self._normalize_text(category_leaf), self._normalize_text(material_group)]
+        return " | ".join(part for part in parts if part)
+
+    def _infer_product_family(self, title: str, category_leaf: str) -> str:
+        base = f"{category_leaf} {title}".lower()
+        for alias, canonical in self.FAMILY_ALIASES.items():
+            if alias in base:
+                return canonical
+        cleaned_leaf = self._clean_text(category_leaf)
+        if cleaned_leaf and len(cleaned_leaf) >= 4:
+            return cleaned_leaf
+        return ""
+
+    def _infer_material_group(self, title: str, category: str) -> str:
+        text_value = self._normalize_text(f"{title} {category}")
+        if any(token in text_value for token in ["мастик"]):
+            return "мастика"
+        if "праймер" in text_value:
+            return "праймер"
+        if "гермет" in text_value:
+            return "герметик"
+        if any(token in text_value for token in ["гидрошпонк", "пенебар", "гидропроклад"]):
+            return "гидрошпонка"
+        if any(token in text_value for token in ["геомембран", "изостуд", "дрениз", "plastguard", "planter"]):
+            return "геомембрана"
+        if any(token in text_value for token in ["геотекст", "дорнит", "пфг", "иглопробив", "фильерн"]):
+            return "геотекстиль"
+        if "мембран" in text_value:
+            return "мембрана"
+        if any(token in text_value for token in ["утеплител", "минват", "пенополист", "пеноплэкс", "isover", "ursa"]):
+            return "утеплитель"
+        if any(token in text_value for token in ["битум", "бн 90/10"]):
+            return "битум"
+        if any(token in text_value for token in ["контроллер", "вентиляц", "оборудован", "горелк", "баллон", "редуктор"]):
+            return "оборудование"
+        if any(
+            token in text_value
+            for token in [
+                "рулон",
+                "тпп",
+                "ткп",
+                "хпп",
+                "хкп",
+                "эпп",
+                "экп",
+                "эмп",
+                "изопласт",
+                "техноэласт",
+                "унифлекс",
+                "стеклоэласт",
+                "стеклоизол",
+                "линокром",
+                "рубероид",
+                "мостослой",
+                "эластобит",
+                "эластоизол",
+            ]
+        ):
+            return "рулонная гидроизоляция"
+        return "гидроизоляция"
+
+    def _infer_material_type(self, material_group: str) -> str:
+        mapping = {
+            "рулонная гидроизоляция": "Рулонный",
+            "мастика": "Мастика",
+            "праймер": "Праймер",
+            "герметик": "Герметик",
+            "гидрошпонка": "Гидрошпонка",
+            "геотекстиль": "Геотекстиль",
+            "геомембрана": "Геомембрана",
+            "мембрана": "Мембрана",
+            "утеплитель": "Утеплитель",
+            "битум": "Битум",
+            "оборудование": "Оборудование",
+            "гидроизоляция": "Гидроизоляция",
+        }
+        return mapping.get(material_group, "Гидроизоляция")
+
+    def _infer_material_subgroup(self, title: str, specs: Dict[str, Any]) -> str:
+        text_value = self._normalize_text(f"{title} {self._flatten_specs(specs)}")
+        for marker in ["тпп", "ткп", "хпп", "хкп", "эпп", "экп", "эмп"]:
+            if re.search(rf"\b{marker}\b", text_value):
+                return marker.upper()
+        if "битумно полимер" in text_value or "сбс" in text_value:
+            return "битумно-полимерный"
+        if "битум" in text_value:
+            return "битумный"
+        return ""
+
+    def _infer_application_scope(self, title: str, category: str, description: str) -> str:
+        text_value = self._normalize_text(f"{title} {category} {description}")
+        if "мост" in text_value:
+            return "мосты"
+        if "фундамент" in text_value:
+            return "фундамент"
+        if "кровл" in text_value:
+            return "кровля"
+        if "шв" in text_value:
+            return "швы"
+        if "гидроизоляц" in text_value:
+            return "гидроизоляция"
+        return ""
+
+    def _infer_base_material(self, title: str, specs: Dict[str, Any]) -> str:
+        base = self._spec_value_by_keys(specs, ["основа", "армирующая основа"])
+        if base:
+            normalized = self._normalize_text(base)
+            if "полиэстер" in normalized:
+                return "полиэстер"
+            if "стеклоткан" in normalized:
+                return "стеклоткань"
+            if "стеклохолст" in normalized:
+                return "стеклохолст"
+            return base
+
+        title_low = self._normalize_text(title)
+        if "п/э" in title_low:
+            return "полиэстер"
+        if "с/т" in title_low:
+            return "стеклоткань"
+        if "х/ст" in title_low:
+            return "стеклохолст"
+        return ""
+
+    def _infer_binder_type(self, title: str, specs: Dict[str, Any], description: str) -> str:
+        text_value = self._normalize_text(f"{title} {description} {self._flatten_specs(specs)}")
+        if "сбс" in text_value:
+            return "СБС"
+        if "полимер" in text_value:
+            return "полимер"
+        if "битум" in text_value:
+            return "битум"
+        return ""
+
+    def _infer_surface(self, specs: Dict[str, Any], surface_kind: str) -> str:
+        value = self._spec_value_by_keys(specs, ["покрытие верхнее/нижнее", "покрытие"])
+        if not value:
+            return ""
+        if "/" in value:
+            top, bottom = [self._clean_text(part) for part in value.split("/", 1)]
+            return top if surface_kind == "top" else bottom
+        return value if surface_kind == "top" else value
+
+    def _infer_color(self, title: str, specs: Dict[str, Any]) -> str:
+        from_specs = self._spec_value_by_keys(specs, ["цвет"])
+        if from_specs:
+            return from_specs
+        title_low = self._normalize_text(title)
+        for color in ["серый", "зеленый", "красный", "черный", "коричневый", "белый"]:
+            if color in title_low:
+                return color
+        return ""
+
+    def _infer_standard_code(self, title: str, specs: Dict[str, Any], description: str) -> str:
+        text_value = f"{title} {description} {self._flatten_specs(specs)}"
+        match = re.search(r"\b(?:ГОСТ|ТУ)\s*[\d.\-/]+\b", text_value, flags=re.IGNORECASE)
+        return self._clean_text(match.group(0)) if match else ""
+
+    def _calculate_quality_score(
+        self,
+        title: str,
+        category: str,
+        description: str,
+        meta_description: str,
+        specs: Dict[str, Any],
+        price_details: Dict[str, Any],
+    ) -> int:
+        score = 0
+        if title:
+            score += 20
+        if category:
+            score += 10
+        if price_details.get("retail") is not None:
+            score += 10
+        if price_details.get("unit"):
+            score += 5
+        specs_count = len(specs or {})
+        score += min(specs_count * 4, 30)
+        if len(description or "") >= 80:
+            score += 15
+        elif description:
+            score += 8
+        if meta_description:
+            score += 5
+        return min(score, 100)
+
+    def _build_family_specific_aliases(
+        self,
+        title: str,
+        product_family: str,
+        category_leaf: str,
+    ) -> List[Tuple[str, str]]:
+        source = self._normalize_text(f"{category_leaf} {product_family} {title}")
+        grade_markers = self._extract_grade_markers(source)
+        aliases: List[Tuple[str, str]] = []
+
+        def add_alias(value: str, alias_type: str = "family_synonym") -> None:
+            cleaned = self._clean_text(value)
+            normalized = self._normalize_text(cleaned)
+            if cleaned and normalized:
+                aliases.append((cleaned, alias_type))
+
+        if any(token in source for token in ["пфг", "полиэфирн", "фильерн"]):
+            add_alias("Геотекстиль ПФГ")
+            add_alias("Геотекстиль полиэфирный")
+            for marker in grade_markers:
+                if re.fullmatch(r"\d{2,4}", marker):
+                    add_alias(f"ПФГ {marker}")
+                    add_alias(f"Геотекстиль ПФГ {marker}")
+                    add_alias(f"Геотекстиль полиэфирный {marker}")
+
+        if "дорнит" in source:
+            add_alias("Геотекстиль Дорнит")
+            add_alias("Геотекстиль иглопробивной")
+            for marker in grade_markers:
+                if re.fullmatch(r"\d{2,4}", marker):
+                    add_alias(f"ДОРНИТ {marker}")
+                    add_alias(f"Геотекстиль Дорнит {marker}")
+
+        geomembrane_brands = {
+            "изостуд": "ИЗОСТУД",
+            "дрениз": "ДРЕНИЗ",
+            "plastguard": "PLASTGUARD",
+            "planter": "PLANTER",
+        }
+        matched_geomembrane_brand = ""
+        for token, canonical in geomembrane_brands.items():
+            if token in source:
+                matched_geomembrane_brand = canonical
+                break
+        if matched_geomembrane_brand:
+            add_alias(f"Геомембрана {matched_geomembrane_brand}")
+            add_alias(f"Профилированная мембрана {matched_geomembrane_brand}")
+
+        if "битум" in source:
+            add_alias("Битум")
+            for marker in grade_markers:
+                if re.fullmatch(r"\d{2,3}/\d{1,2}", marker):
+                    add_alias(f"Битум {marker}")
+                elif re.fullmatch(r"\d{2,3} \d{1,2}", marker):
+                    add_alias(f"Битум {marker}")
+                elif re.fullmatch(r"\d{2,3}кг", marker) and "брикет" in source:
+                    add_alias(f"Битум брикет {marker}")
+                    add_alias(f"Брикет {marker}")
+
+        if any(token in source for token in ["гидрошпонк", "пенебар", "гидропроклад"]):
+            add_alias("Гидрошпонка")
+            add_alias("Гидропрокладка")
+
+        return aliases
+
+    def _build_aliases(self, title: str, product_family: str, category_leaf: str) -> List[Tuple[str, str]]:
+        aliases: List[Tuple[str, str]] = []
+        for alias, alias_type in [
+            (title, "source_title"),
+            (product_family, "family"),
+            (category_leaf, "category_leaf"),
+        ]:
+            cleaned = self._clean_text(alias)
+            normalized = self._normalize_text(cleaned)
+            if cleaned and normalized:
+                aliases.append((cleaned, alias_type))
+
+        if product_family and title and self._normalize_text(product_family) not in self._normalize_text(title):
+            combined = f"{product_family} {title}"
+            aliases.append((combined, "family_title"))
+
+        aliases.extend(self._build_family_specific_aliases(title, product_family, category_leaf))
+
+        deduped: List[Tuple[str, str]] = []
+        seen: set[str] = set()
+        for alias, alias_type in aliases:
+            normalized = self._normalize_text(alias)
+            if normalized in seen:
                 continue
-            href = href.strip()
-            if href.startswith("#") or href.lower().startswith("javascript:"):
-                continue
+            seen.add(normalized)
+            deduped.append((alias, alias_type))
+        return deduped
 
-            full = urljoin(base_url, href)
-            if not self._is_allowed_url(full):
-                continue
+    def _build_content_hash(
+        self,
+        title: str,
+        category: str,
+        price_details: Dict[str, Any],
+        description: str,
+        specs: Dict[str, Any],
+    ) -> str:
+        payload = json.dumps(
+            {
+                "title": title,
+                "category": category,
+                "retail": price_details.get("retail"),
+                "wholesale": price_details.get("wholesale"),
+                "special": price_details.get("special"),
+                "description": description,
+                "specs": specs,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
-            out.add(self.normalize_url(full))
-        return out
+    # ----------------------------
+    # Parsing entry point
+    # ----------------------------
+    def parse_product_page(self, url: str, html_text: str) -> Optional[Dict[str, Any]]:
+        canonical_url = self.canonicalize_url(url)
+        if not self._is_allowed_candidate_url(canonical_url):
+            return None
 
-    async def _fetch_html(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
-        url = self.normalize_url(url)
-        for attempt in range(ASYNC_RETRIES + 1):
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=ASYNC_TIMEOUT)) as resp:
-                    if resp.status != 200:
-                        return None
-                    return await resp.text(errors="ignore")
-            except Exception:
-                if attempt >= ASYNC_RETRIES:
-                    return None
-                await asyncio.sleep(0.6)
-        return None
+        soup = BeautifulSoup(html_text, "html.parser")
+        if not self.is_product_page(soup, canonical_url):
+            return None
 
-    async def _process_urls_async(self, initial_urls: Set[str]):
-        sem = asyncio.Semaphore(ASYNC_CONCURRENCY)
-        async with aiohttp.ClientSession(headers=self.headers) as session:
-            queue: Set[str] = set(self.normalize_url(u) for u in initial_urls if self._is_allowed_url(u))
+        title = self._extract_title(soup)
+        if not title:
+            return None
 
-            while queue:
-                batch = list(queue)[: ASYNC_CONCURRENCY * 3]
-                queue.difference_update(batch)
+        category = self.extract_category_path(soup)
+        category_leaf = category.split(" / ")[-1] if category else ""
+        price_details = self._extract_price_details(soup)
+        specs = self.parse_specs(soup)
+        description = self.parse_description(soup, title=title)
+        meta_description = self.parse_meta_description(soup, title=title)
 
-                async def handle(u: str):
-                    async with sem:
-                        nu = self.normalize_url(u)
-                        if nu in self.visited_urls:
-                            return
-                        self.visited_urls.add(nu)
-
-                        html = await self._fetch_html(session, nu)
-                        if not html:
-                            return
-
-                        soup = BeautifulSoup(html, "html.parser")
-
-                        data = self.parse_product_page(nu, html)
-                        if data:
-                            purl = data["url"]
-                            if purl not in self.product_urls:
-                                self.product_urls.add(purl)
-                                self.product_data.append(data)
-                                logger.info(f"✅ PRODUCT: {data['title']} | {data['price']}rub")
-                            return
-
-                        links = self._extract_links(soup, nu)
-                        for l in links:
-                            nl = self.normalize_url(l)
-                            if nl not in self.visited_urls:
-                                queue.add(nl)
-
-                await asyncio.gather(*(handle(u) for u in batch))
-
-    def extractor(self, html: str) -> str:
-        return html
-
-    async def crawl_pages(self, start_url: str, max_depth: int = 7):
-        start_url = self.normalize_url(start_url)
-        logger.info(f"Starting crawl (MSK) from: {start_url}")
-
-        loader = RecursiveUrlLoader(
-            url=start_url,
-            max_depth=max_depth,
-            extractor=self.extractor,
-            prevent_outside=True,
-            timeout=20,
-            use_async=False,
-            exclude_dirs=["contacts", "about", "news", "blog", "articles", "login", "auth"],
-            headers=self.headers,
+        material_group = self._infer_material_group(title, category)
+        quality_score = self._calculate_quality_score(
+            title=title,
+            category=category,
+            description=description,
+            meta_description=meta_description,
+            specs=specs,
+            price_details=price_details,
         )
 
-        documents = await asyncio.to_thread(loader.load)
-        logger.info(f"RecursiveUrlLoader finished. Loaded {len(documents)} documents from {start_url}")
+        return {
+            "vendor": "gidroizol",
+            "site_product_id": self._extract_site_product_id(canonical_url),
+            "url": canonical_url,
+            "source_url": canonical_url,
+            "city_id": self.MOSCOW_CITY_ID,
+            "title": title,
+            "category": category,
+            "category_leaf": category_leaf,
+            "normalized_category": self._build_normalized_category(category, category_leaf, material_group),
+            "searchable_for_analogs": quality_score >= 20,
+            "material_type": self._infer_material_type(material_group),
+            "price": price_details.get("retail"),
+            "price_wholesale": price_details.get("wholesale"),
+            "price_special": price_details.get("special"),
+            "price_currency": "RUB",
+            "price_unit": price_details.get("unit"),
+            "availability_status": price_details.get("availability") or "unknown",
+            "specs": specs,
+            "specs_text": self._flatten_specs(specs),
+            "description": description,
+            "meta_description": meta_description,
+            "quality_score": quality_score,
+            "content_hash": self._build_content_hash(title, category, price_details, description, specs),
+            "parse_version": PARSER_VERSION,
+            "is_active": True,
+        }
 
-        next_urls: Set[str] = set()
+    # ----------------------------
+    # Async sitemap parsing
+    # ----------------------------
+    async def _parse_catalog(self) -> List[Dict[str, Any]]:
+        products_by_url: Dict[str, Dict[str, Any]] = {}
+        visited = 0
+        parsed_products = 0
 
-        for doc in documents:
-            raw_url = doc.metadata.get("source", "")
-            if not raw_url:
-                continue
+        connector = aiohttp.TCPConnector(limit=FETCH_CONCURRENCY, ssl=False)
+        async with aiohttp.ClientSession(headers=self.headers, connector=connector) as session:
+            sitemap_urls = await self._fetch_sitemap_urls(session)
+            if not sitemap_urls:
+                return []
 
-            url = self.normalize_url(raw_url)
-            if not self._is_allowed_url(url):
-                continue
+            semaphore = asyncio.Semaphore(FETCH_CONCURRENCY)
 
-            if url in self.visited_urls:
-                continue
-            self.visited_urls.add(url)
+            async def handle(url: str) -> None:
+                nonlocal visited, parsed_products
+                async with semaphore:
+                    visited += 1
+                    html_text = await self._fetch_text(session, url)
+                    if not html_text:
+                        return
 
-            data = self.parse_product_page(url, doc.page_content)
-            if data:
-                purl = data["url"]
-                if purl not in self.product_urls:
-                    self.product_urls.add(purl)
-                    self.product_data.append(data)
+                    product = self.parse_product_page(url, html_text)
+                    if not product:
+                        return
 
-            soup = BeautifulSoup(doc.page_content, "html.parser")
-            for l in self._extract_links(soup, url):
-                nl = self.normalize_url(l)
-                if nl not in self.visited_urls:
-                    next_urls.add(nl)
+                    products_by_url[product["url"]] = product
+                    parsed_products += 1
 
-        await self._process_urls_async(next_urls)
-        logger.info(f"Finished crawl (MSK) from {start_url}. Total products: {len(self.product_data)}")
+                    if parsed_products % 100 == 0:
+                        logger.info(
+                            "Parser progress: visited=%s/%s parsed_products=%s",
+                            visited,
+                            len(sitemap_urls),
+                            parsed_products,
+                        )
+
+            await asyncio.gather(*(handle(url) for url in sitemap_urls))
+
+        products = list(products_by_url.values())
+        logger.info("Catalog parsing completed: %s product pages", len(products))
+        return products
+
+    # ----------------------------
+    # Analog index rebuild
+    # ----------------------------
+    def _build_analog_index_record(self, product: Any) -> Dict[str, Any]:
+        specs = product.specs if isinstance(product.specs, dict) else {}
+        if product.specs and not specs:
+            try:
+                specs = json.loads(product.specs) if isinstance(product.specs, str) else {}
+            except Exception:
+                specs = {}
+
+        title = self._clean_text(getattr(product, "title", ""))
+        category = self._clean_text(getattr(product, "category", ""))
+        category_leaf = self._clean_text(getattr(product, "category_leaf", ""))
+        description = self._clean_text(getattr(product, "description", ""))
+        meta_description = self._clean_text(getattr(product, "meta_description", ""))
+        material_type = self._clean_text(getattr(product, "material_type", ""))
+
+        product_family = self._infer_product_family(title, category_leaf)
+        material_group = self._infer_material_group(title, category)
+        material_subgroup = self._infer_material_subgroup(title, specs)
+        application_scope = self._infer_application_scope(title, category, description)
+        base_material = self._infer_base_material(title, specs)
+        binder_type = self._infer_binder_type(title, specs, description)
+        top_surface = self._infer_surface(specs, "top")
+        bottom_surface = self._infer_surface(specs, "bottom")
+
+        extracted_attrs = {
+            "price_unit": getattr(product, "price_unit", None),
+            "availability_status": getattr(product, "availability_status", None),
+            "quality_score": getattr(product, "quality_score", None),
+        }
+
+        normalized_title = self._normalize_text(title)
+        search_parts = [
+            normalized_title,
+            self._normalize_text(category),
+            self._normalize_text(material_type),
+            self._normalize_text(product_family),
+            self._normalize_text(material_group),
+            self._normalize_text(material_subgroup),
+            self._normalize_text(base_material),
+            self._normalize_text(description),
+            self._normalize_text(meta_description),
+            self._normalize_text(getattr(product, "specs_text", self._flatten_specs(specs))),
+        ]
+        search_text = " ".join(part for part in search_parts if part)
+
+        exact_model_key = " | ".join(
+            part for part in [normalized_title, self._normalize_text(product_family), self._normalize_text(base_material)] if part
+        )
+        analog_group_key = " | ".join(
+            part
+            for part in [
+                self._normalize_text(material_group),
+                self._normalize_text(product_family),
+                self._normalize_text(base_material),
+                self._normalize_text(material_subgroup),
+            ]
+            if part
+        )
+
+        return {
+            "product_id": product.id,
+            "normalized_title": normalized_title or self._normalize_text(title),
+            "brand": product_family or None,
+            "series": category_leaf or None,
+            "product_family": product_family or None,
+            "material_group": material_group or "гидроизоляция",
+            "material_subgroup": material_subgroup or None,
+            "application_scope": application_scope or None,
+            "base_material": base_material or None,
+            "binder_type": binder_type or None,
+            "top_surface": top_surface or None,
+            "bottom_surface": bottom_surface or None,
+            "thickness_mm": self._extract_numeric_measure(self._spec_value_by_keys(specs, ["толщин"])),
+            "mass_kg_m2": self._extract_numeric_measure(self._spec_value_by_keys(specs, ["масса 1м2", "масса 1 м2", "масса 1м²"])),
+            "density_kg_m3": self._extract_numeric_measure(self._spec_value_by_keys(specs, ["плотност"])),
+            "roll_length_m": self._extract_numeric_measure(self._spec_value_by_keys(specs, ["длина"])),
+            "roll_width_m": self._extract_numeric_measure(self._spec_value_by_keys(specs, ["ширина"])),
+            "roll_area_m2": self._extract_numeric_measure(self._spec_value_by_keys(specs, ["площадь рулона", "площадь"])),
+            "package_weight_kg": self._extract_numeric_measure(self._spec_value_by_keys(specs, ["вес", "масса упаковки"])),
+            "flexibility_temp_c": self._extract_temperature(self._spec_value_by_keys(specs, ["гибкость"])),
+            "heat_resistance_c": self._extract_temperature(self._spec_value_by_keys(specs, ["теплостойк"])),
+            "color": self._infer_color(title, specs) or None,
+            "standard_code": self._infer_standard_code(title, specs, description) or None,
+            "extracted_attrs_json": extracted_attrs,
+            "search_text": search_text or normalized_title,
+            "analog_group_key": analog_group_key or None,
+            "exact_model_key": exact_model_key or None,
+            "updated_at": datetime.utcnow(),
+        }
+
+    def _rebuild_analog_tables(self, db: Session) -> None:
+        try:
+            from backend.models import ProductAliasModel, ProductAnalogIndexModel, ProductModel  # type: ignore
+        except Exception:
+            from ..models import ProductAliasModel, ProductAnalogIndexModel, ProductModel  # type: ignore
+
+        products = db.query(ProductModel).all()
+        analog_rows: List[Dict[str, Any]] = []
+        alias_rows: List[Dict[str, Any]] = []
+        fts_rows: List[Dict[str, Any]] = []
+
+        for product in products:
+            analog_row = self._build_analog_index_record(product)
+            analog_rows.append(analog_row)
+
+            aliases = self._build_aliases(
+                product.title or "",
+                analog_row.get("product_family") or "",
+                product.category_leaf or "",
+            )
+            alias_texts: List[str] = []
+            for alias, alias_type in aliases:
+                normalized_alias = self._normalize_text(alias)
+                alias_rows.append(
+                    {
+                        "product_id": product.id,
+                        "alias": alias,
+                        "alias_normalized": normalized_alias,
+                        "alias_type": alias_type,
+                    }
+                )
+                alias_texts.append(normalized_alias)
+
+            fts_rows.append(
+                {
+                    "product_id": product.id,
+                    "normalized_title": analog_row["normalized_title"],
+                    "search_text": analog_row["search_text"],
+                    "specs_text": self._normalize_text(getattr(product, "specs_text", "") or ""),
+                    "description": self._normalize_text(getattr(product, "description", "") or ""),
+                    "aliases": " ".join(alias_texts),
+                }
+            )
+
+        db.execute(text("DELETE FROM product_analog_index"))
+        db.execute(text("DELETE FROM product_aliases"))
+        try:
+            db.execute(text("DELETE FROM product_search_fts"))
+        except Exception:
+            logger.debug("FTS delete skipped: product_search_fts is not available")
+
+        if analog_rows:
+            db.bulk_insert_mappings(ProductAnalogIndexModel, analog_rows)
+        if alias_rows:
+            db.bulk_insert_mappings(ProductAliasModel, alias_rows)
+        if fts_rows:
+            try:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO product_search_fts
+                            (product_id, normalized_title, search_text, specs_text, description, aliases)
+                        VALUES
+                            (:product_id, :normalized_title, :search_text, :specs_text, :description, :aliases)
+                        """
+                    ),
+                    fts_rows,
+                )
+            except Exception as e:
+                logger.warning("FTS insert skipped: %s", e)
+
+        db.commit()
+        logger.info(
+            "Analog index rebuilt: products=%s analog_rows=%s alias_rows=%s",
+            len(products),
+            len(analog_rows),
+            len(alias_rows),
+        )
 
     # ----------------------------
     # DB upsert
     # ----------------------------
-    def _upsert_products_to_db(self, db: Session) -> int:
+    def _upsert_products_to_db(self, db: Session, products: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         try:
             from backend.models import ProductModel  # type: ignore
         except Exception:
             from ..models import ProductModel  # type: ignore
 
-        created = 0
-        for p in self.product_data:
-            url = p.get("url")
-            if not url:
+        existing_rows = db.query(ProductModel).all()
+        existing_by_url = {
+            self.canonicalize_url(row.url or ""): row
+            for row in existing_rows
+            if self.canonicalize_url(row.url or "")
+        }
+
+        now = datetime.utcnow()
+        inserts: List[Dict[str, Any]] = []
+        updates: List[Dict[str, Any]] = []
+        seen_existing_urls: set[str] = set()
+        missing_url = 0
+
+        for product in products:
+            canonical_url = self.canonicalize_url(product.get("url", ""))
+            if not canonical_url:
+                missing_url += 1
                 continue
 
-            existing = db.query(ProductModel).filter(ProductModel.url == url).first()
-            if existing:
-                existing.title = p.get("title", existing.title)
-                existing.category = p.get("category", getattr(existing, "category", "Каталог"))
-                existing.material_type = p.get("material_type", getattr(existing, "material_type", ""))
-                existing.price = p.get("price", getattr(existing, "price", 0))
-                existing.specs = p.get("specs", getattr(existing, "specs", {}))
-                
-                # Явное обновление описания
-                new_desc = p.get("description", "")
-                if new_desc:
-                    existing.description = new_desc
-                    
-            else:
-                obj = ProductModel(
-                    title=p.get("title", "Не указано"),
-                    category=p.get("category", "Каталог"),
-                    material_type=p.get("material_type", ""),
-                    price=p.get("price", 0),
-                    specs=p.get("specs", {}),
-                    url=url,
-                    description=p.get("description", ""),
-                )
-                db.add(obj)
-                created += 1
+            existing = existing_by_url.get(canonical_url)
+            payload = {
+                "vendor": product.get("vendor", "gidroizol"),
+                "site_product_id": product.get("site_product_id"),
+                "source_url": product.get("source_url") or canonical_url,
+                "city_id": product.get("city_id", self.MOSCOW_CITY_ID),
+                "title": product.get("title", "Не указано"),
+                "category": product.get("category", "Каталог"),
+                "category_leaf": product.get("category_leaf"),
+                "normalized_category": product.get("normalized_category"),
+                "searchable_for_analogs": bool(product.get("searchable_for_analogs", True)),
+                "material_type": product.get("material_type", "Гидроизоляция"),
+                "price": product.get("price"),
+                "price_wholesale": product.get("price_wholesale"),
+                "price_special": product.get("price_special"),
+                "price_currency": product.get("price_currency", "RUB"),
+                "price_unit": product.get("price_unit"),
+                "availability_status": product.get("availability_status", "unknown"),
+                "specs": product.get("specs", {}),
+                "specs_text": product.get("specs_text") or self._flatten_specs(product.get("specs", {})),
+                "url": canonical_url,
+                "description": product.get("description", ""),
+                "meta_description": product.get("meta_description", ""),
+                "quality_score": product.get("quality_score", 0),
+                "content_hash": product.get("content_hash"),
+                "parse_version": product.get("parse_version", PARSER_VERSION),
+                "last_seen_at": now,
+                "scraped_at": now,
+                "updated_at": now,
+                "is_active": True,
+            }
 
+            if existing:
+                seen_existing_urls.add(canonical_url)
+                payload["id"] = existing.id
+                if not payload["description"] and existing.description:
+                    payload["description"] = existing.description
+                if not payload["meta_description"] and getattr(existing, "meta_description", None):
+                    payload["meta_description"] = existing.meta_description
+                if not payload["specs"] and existing.specs:
+                    payload["specs"] = existing.specs
+                    payload["specs_text"] = getattr(existing, "specs_text", "") or self._flatten_specs(existing.specs or {})
+                updates.append(payload)
+            else:
+                payload["first_seen_at"] = now
+                inserts.append(payload)
+
+        if inserts:
+            db.bulk_insert_mappings(ProductModel, inserts)
+        if updates:
+            db.bulk_update_mappings(ProductModel, updates)
         db.commit()
-        return created
+        not_seen_rows = [
+            row
+            for canonical_url, row in existing_by_url.items()
+            if canonical_url not in seen_existing_urls
+        ]
+        not_seen_sample = [
+            self._clean_text(getattr(row, "title", "")) or f"id={getattr(row, 'id', '?')}"
+            for row in not_seen_rows[:5]
+        ]
+        stats = {
+            "parsed_input": len(products),
+            "inserted": len(inserts),
+            "updated": len(updates),
+            "affected": len(inserts) + len(updates),
+            "missing_url": missing_url,
+            "existing_before": len(existing_by_url),
+            "matched_existing": len(seen_existing_urls),
+            "not_seen_existing": len(not_seen_rows),
+            "not_seen_existing_sample": not_seen_sample,
+        }
+        logger.info(
+            "DB upsert completed | parsed_input=%s | inserted=%s | updated=%s | missing_url=%s | "
+            "existing_before=%s | not_seen_existing=%s",
+            stats["parsed_input"],
+            stats["inserted"],
+            stats["updated"],
+            stats["missing_url"],
+            stats["existing_before"],
+            stats["not_seen_existing"],
+        )
+        if stats["inserted"] == 0 and stats["updated"] > 0:
+            logger.info(
+                "No new products inserted: all parsed URLs already existed in DB and were updated."
+            )
+        if stats["not_seen_existing"]:
+            logger.info(
+                "Existing products not seen in current sitemap run: %s | sample=%s",
+                stats["not_seen_existing"],
+                ", ".join(not_seen_sample) or "-",
+            )
+        return stats
 
     # ----------------------------
     # Public entry
     # ----------------------------
-    async def parse_and_save(self, db: Session) -> int:
-        self.visited_urls.clear()
-        self.product_urls.clear()
-        self.product_data.clear()
+    async def parse_and_save(self, db: Session) -> Dict[str, Any]:
+        async with self._run_lock:
+            logger.info("Starting gidroizol sitemap parse | version=%s", PARSER_VERSION)
+            products = await self._parse_catalog()
+            if not products:
+                logger.warning("Catalog parse returned no products")
+                return {
+                    "parsed": 0,
+                    "inserted": 0,
+                    "updated": 0,
+                    "affected": 0,
+                    "missing_url": 0,
+                    "existing_before": 0,
+                    "matched_existing": 0,
+                    "not_seen_existing": 0,
+                    "not_seen_existing_sample": [],
+                }
 
-        for u in self.START_URLS:
-            await self.crawl_pages(u, max_depth=7)
-
-        created = self._upsert_products_to_db(db)
-        logger.info(f"DB upsert done (MSK). New created: {created}. Total parsed: {len(self.product_data)}")
-        return created
+            upsert_stats = self._upsert_products_to_db(db, products)
+            self._rebuild_analog_tables(db)
+            logger.info(
+                "Catalog parse completed | parsed=%s | inserted=%s | updated=%s | missing_url=%s | "
+                "existing_before=%s | not_seen_existing=%s | version=%s",
+                len(products),
+                upsert_stats["inserted"],
+                upsert_stats["updated"],
+                upsert_stats["missing_url"],
+                upsert_stats["existing_before"],
+                upsert_stats["not_seen_existing"],
+                PARSER_VERSION,
+            )
+            return {
+                "parsed": len(products),
+                **upsert_stats,
+            }

@@ -18,6 +18,7 @@ aiohttp==3.9.3
 langchain==0.1.0
 langchain-community==0.0.28
 python-docx==1.1.0
+aspose-imaging-python-net==26.4.0
 openpyxl==3.1.2
 xlrd==2.0.1
 pydantic==2.6.3

@@ -9,6 +9,7 @@ import asyncio
 import sys
 import html
 import zipfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import dataclass
@@ -31,6 +32,12 @@ if sys.platform == 'win32':
 from backend.services.auto_ssh import RfProxyTunnelConfig, RfProxyHttpClient
 
 from backend.config import DOCUMENTS_ROOT, DATA_DIR
+from backend.services.download_retry_service import (
+    cleanup_download_duplicates,
+    ensure_non_empty_downloaded_file,
+    register_downloaded_file,
+    resolve_download_target_path,
+)
 
 # =========================
 # НАСТРОЙКИ
@@ -50,6 +57,12 @@ DIRECT_READ_TIMEOUT = int(os.getenv("EIS_DIRECT_READ_TIMEOUT", "60"))
 PROXY_CONNECT_TIMEOUT = int(os.getenv("EIS_PROXY_CONNECT_TIMEOUT", "25"))
 PROXY_READ_TIMEOUT = int(os.getenv("EIS_PROXY_READ_TIMEOUT", "120"))
 DOCS_HTTP_TIMEOUT = int(os.getenv("EIS_DOCS_HTTP_TIMEOUT", "30"))
+ORGANIZATION_INFO_FAILURE_TTL_SECONDS = int(
+    os.getenv("EIS_ORGANIZATION_INFO_FAILURE_TTL_SECONDS", "1800")
+)
+ORGANIZATION_INFO_ENDPOINT_COOLDOWN_SECONDS = int(
+    os.getenv("EIS_ORGANIZATION_INFO_ENDPOINT_COOLDOWN_SECONDS", "180")
+)
 
 def ensure_dir(p: str):
     if p:
@@ -97,6 +110,10 @@ RF_CFG = RfProxyTunnelConfig(
 
 RF_CLIENT_PROXY: Optional[RfProxyHttpClient] = None
 RF_CLIENT_DIRECT: Optional[requests.Session] = None
+
+SOCKS5_BOOT_ERROR_MARKER = "Не удалось поднять SOCKS5"
+SEARCH_RETRYABLE_PROXY_ATTEMPTS = 10
+SEARCH_RETRYABLE_PROXY_DELAY_SECONDS = 5
 
 # =========================
 # SQLite + CSV
@@ -152,6 +169,8 @@ RUB_PRICE_RE = re.compile(
 DEADLINE_RE = re.compile(
     r"\b\d{2}\.\d{2}\.\d{4}(?:\s+\d{2}:\d{2})?\b"
 )
+
+INN_RE = re.compile(r"\b\d{10}(?:\d{2})?\b")
 
 NO_RESULTS_PATTERNS = [
     "по вашему запросу ничего не найдено",
@@ -269,6 +288,9 @@ class Notice:
     object_info: str = ""
     initial_price: str = ""
     application_deadline: str = ""
+    customer_name: str = ""
+    customer_inn: str = ""
+    customer_location: str = ""
     seen: bool = False
     docs_url: str = ""
 
@@ -496,123 +518,118 @@ def _validate_saved_file(path: str, filename: str, content_type: str) -> None:
 
 def download_file_with_real_name(file_url: str, reg_dir: str, suggested_title: str) -> str:
     last_errors = []
+    ensure_dir(reg_dir)
 
-    for force_direct in ([False, True] if USE_PROXY else [True]):
-        mode = "direct" if force_direct else "proxy"
-        temp_path = None
+    for retry_round in range(2):
+        round_errors = []
+        for force_direct in ([False, True] if USE_PROXY else [True]):
+            mode = "direct" if force_direct else "proxy"
+            temp_path = None
 
-        try:
-            client = get_http_client(force_direct=force_direct)
-            response = client.get(
-                file_url,
-                timeout=_request_timeout(force_direct),
-                stream=True,
-            )
-            response.raise_for_status()
+            try:
+                client = get_http_client(force_direct=force_direct)
+                response = client.get(
+                    file_url,
+                    timeout=_request_timeout(force_direct),
+                    stream=True,
+                )
+                response.raise_for_status()
 
-            cd = response.headers.get("Content-Disposition", "")
-            ct = response.headers.get("Content-Type", "")
+                cd = response.headers.get("Content-Disposition", "")
+                ct = response.headers.get("Content-Type", "")
 
-            filename = filename_from_content_disposition(cd)
-            if not filename:
-                ext = guess_extension_from_content_type(ct)
-                if suggested_title:
-                    if ext and suggested_title.lower().endswith(ext):
-                        filename = suggested_title
+                filename = filename_from_content_disposition(cd)
+                ext = ""
+                if not filename:
+                    ext = guess_extension_from_content_type(ct)
+                    if suggested_title:
+                        if ext and suggested_title.lower().endswith(ext):
+                            filename = suggested_title
+                        else:
+                            filename = suggested_title + (ext if ext else "")
                     else:
-                        filename = suggested_title + (ext if ext else "")
-                else:
-                    uid = uid_from_url(file_url) or str(abs(hash(file_url)))
-                    filename = uid + (ext if ext else ".bin")
+                        uid = uid_from_url(file_url) or str(abs(hash(file_url)))
+                        filename = uid + (ext if ext else ".bin")
 
-            filename = safe_filename(filename) or "file.bin"
+                filename = safe_filename(filename) or "file.bin"
+                ext = Path(filename).suffix.lower()
 
-            base, ext = os.path.splitext(filename)
-            out_path = os.path.join(reg_dir, filename)
-            counter = 1
-            while os.path.exists(out_path):
-                out_path = os.path.join(reg_dir, f"{base}_{counter}{ext}")
-                counter += 1
+                out_path = resolve_download_target_path(reg_dir, filename, file_url)
 
-            content = response.content
-            url = file_url
+                content = response.content
+                url = file_url
 
-            # Проверяем что скачанный контент является реальным документом,
-            # а не HTML-страницей редиректа или ошибки
-            content_lower = content[:2000].lower() if content else b""
-            is_html_response = (
-                content_lower.startswith(b"<!doctype html") or
-                content_lower.startswith(b"<html") or
-                b"<html" in content_lower[:500]
-            )
-
-            if is_html_response:
-                html_preview = content[:500].decode("utf-8", errors="replace")
-                logger.error(
-                    f"[DOWNLOAD_VALIDATION] Got HTML instead of file content! "
-                    f"url={url} | size={len(content)} | "
-                    f"preview={html_preview[:200]!r}"
-                )
-                raise ValueError(
-                    f"Server returned HTML page instead of file content. "
-                    f"URL may require authentication or redirect. url={url}"
-                )
-
-            # Проверяем минимальный размер файла (менее 100 байт — явно ошибка)
-            if len(content) < 100:
-                logger.error(
-                    f"[DOWNLOAD_VALIDATION] File too small ({len(content)} bytes), "
-                    f"likely an error page. url={url}"
-                )
-                raise ValueError(
-                    f"Downloaded content too small ({len(content)} bytes). "
-                    f"Likely an error response. url={url}"
-                )
-
-            if ext in ("doc", "xls"):
-                ole_magic = b'\xD0\xCF\x11\xE0'
-                xml_magic_variants = [b'<?xml', b'<html', b'PK\x03\x04']
-                is_ole = content[:4] == ole_magic[:4]
-                is_xml_or_zip = any(
-                    content[:len(m)] == m for m in xml_magic_variants
-                )
-                if not is_ole and not is_xml_or_zip:
-                    # Предупреждаем но НЕ бросаем исключение
-                    # Файлы с госзакупок могут быть RTF или другого формата
-                    logger.warning(
-                        f"[OLE_CHECK] File {filename} has unexpected signature. "
-                        f"First bytes: {content[:8].hex()}. "
-                        f"Saving anyway — user can open manually."
+                if len(content) < 100:
+                    logger.error(
+                        f"[DOWNLOAD_VALIDATION] File too small ({len(content)} bytes), "
+                        f"likely an error page. url={url}"
                     )
-                elif not is_ole and is_xml_or_zip:
-                    logger.info(
-                        f"[OLE_CHECK] File {filename} is XML/ZIP format "
-                        f"(not binary OLE). This is normal for modern .doc/.xls files."
+                    raise ValueError(
+                        f"Downloaded content too small ({len(content)} bytes). "
+                        f"Likely an error response. url={url}"
                     )
-                # НЕ бросаем исключение ни в каком случае — просто сохраняем
 
-            # Всё в порядке — сохраняем файл
-            with open(out_path, "wb") as f:
-                f.write(content)
+                _validate_download_prefix(content[:4096], filename, ct)
 
-            logger.info(
-                "Downloaded file successfully | mode=%s | url=%s | path=%s",
-                mode,
+                if ext.lower() in (".doc", ".xls"):
+                    ole_magic = b"\xD0\xCF\x11\xE0"
+                    xml_magic_variants = [b"<?xml", b"<html", b"PK\x03\x04"]
+                    is_ole = content[:4] == ole_magic[:4]
+                    is_xml_or_zip = any(
+                        content[:len(m)] == m for m in xml_magic_variants
+                    )
+                    if not is_ole and not is_xml_or_zip:
+                        logger.warning(
+                            f"[OLE_CHECK] File {filename} has unexpected signature. "
+                            f"First bytes: {content[:8].hex()}. "
+                            f"Saving anyway — user can open manually."
+                        )
+                    elif not is_ole and is_xml_or_zip:
+                        logger.info(
+                            f"[OLE_CHECK] File {filename} is XML/ZIP format "
+                            f"(not binary OLE). This is normal for modern .doc/.xls files."
+                        )
+
+                with open(out_path, "wb") as f:
+                    f.write(content)
+
+                _validate_saved_file(out_path, filename, ct)
+                register_downloaded_file(out_path, file_url, suggested_title or filename)
+                removed_duplicates = cleanup_download_duplicates(
+                    reg_dir,
+                    filename,
+                    file_url,
+                    out_path,
+                    logger=logger,
+                )
+
+                logger.info(
+                    "Downloaded file successfully | mode=%s | url=%s | path=%s | cleaned_duplicates=%s",
+                    mode,
+                    file_url,
+                    out_path,
+                    len(removed_duplicates),
+                )
+                return out_path
+
+            except Exception as e:
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+
+                error_text = f"round={retry_round + 1} {mode}: {e}"
+                last_errors.append(error_text)
+                round_errors.append(error_text)
+                logger.warning("Download attempt failed | %s | url=%s", error_text, file_url)
+
+        if retry_round == 0:
+            logger.warning(
+                "Downloaded file failed validation and will be retried once | url=%s | errors=%s",
                 file_url,
-                out_path,
+                " ; ".join(round_errors),
             )
-            return out_path
-
-        except Exception as e:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
-
-            error_text = f"{mode}: {e}"
-            last_errors.append(error_text)
-            logger.warning("Download attempt failed | %s | url=%s", error_text, file_url)
 
     raise RuntimeError(" ; ".join(last_errors))
 
@@ -1311,19 +1328,26 @@ class EisService:
                             except Exception as e:
                                 logger.error(f"Error unpacking docs in process_tenders: {e}")
 
-                            final_files = []
-                            for root, _, files in os.walk(reg_dir):
-                                for f in files:
-                                    final_files.append(os.path.join(root, f))
+                            final_files = self._list_usable_tender_files(reg_dir)
 
-                            mark_seen(n.reg)
-                            results.append({
-                                "reg": n.reg,
-                                "status": "selected",
-                                "docs_url": d_url,
-                                "files": final_files,
-                                "failed_downloads": failed_downloads,
-                            })
+                            if final_files:
+                                mark_seen(n.reg)
+                                results.append({
+                                    "reg": n.reg,
+                                    "status": "selected",
+                                    "docs_url": d_url,
+                                    "files": final_files,
+                                    "failed_downloads": failed_downloads,
+                                })
+                            else:
+                                results.append({
+                                    "reg": n.reg,
+                                    "status": "skip",
+                                    "reason": "no_usable_files_after_unpack",
+                                    "docs_url": d_url,
+                                    "files": [],
+                                    "failed_downloads": failed_downloads,
+                                })
                         else:
                             results.append({
                                 "reg": n.reg,
@@ -1369,11 +1393,25 @@ class EisService:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         }
-        self._cancel_flag = False
+        self._cancel_generation = 0
+        self._cancel_lock = threading.Lock()
+        self._page_html_cache: dict[str, str] = {}
+        self._organization_info_cache: dict[str, dict[str, str]] = {}
+        self._organization_info_failure_cache: dict[str, float] = {}
+        self._organization_info_endpoint_blocked_until = 0.0
 
     def cancel_search(self):
-        self._cancel_flag = True
-        logger.info("Search cancellation requested.")
+        with self._cancel_lock:
+            self._cancel_generation += 1
+            cancel_generation = self._cancel_generation
+        logger.info("Search cancellation requested. generation=%s", cancel_generation)
+
+    def _get_cancel_generation(self) -> int:
+        with self._cancel_lock:
+            return self._cancel_generation
+
+    def _is_search_cancelled(self, cancel_generation: int) -> bool:
+        return self._get_cancel_generation() != cancel_generation
 
     def _publish_date_from_str(self, days_back: int) -> str:
         dt = datetime.now() - timedelta(days=days_back)
@@ -1412,6 +1450,15 @@ class EisService:
     def _normalize_text(self, text: str) -> str:
         return re.sub(r"\s+", " ", (text or "").strip())
 
+    def _class_value_contains(self, class_value, expected: set[str]) -> bool:
+        if not class_value:
+            return False
+        if isinstance(class_value, str):
+            classes = class_value.split()
+        else:
+            classes = list(class_value)
+        return any(cls in expected for cls in classes)
+
     def _extract_field_by_label(self, block, labels: List[str]) -> str:
         if block is None:
             return ""
@@ -1423,6 +1470,7 @@ class EisService:
             "Объект закупки", "Начальная цена", "Начальная (максимальная) цена контракта",
             "Начальная (максимальная) цена договора", "Начальная сумма цен единиц товара, работы, услуги",
             "Окончание подачи заявок", "Дата окончания срока подачи заявок", "Цена", "Заказчик",
+            "ИНН", "КПП", "ОГРН", "Место нахождения", "Почтовый адрес",
             "Организация, осуществляющая размещение", "Дата размещения", "Размещено", "Обновлено",
             "Способ определения поставщика", "Регион", "Валюта", "Преимущества, требования к участникам",
             "Информация о лоте", "Этап закупки",
@@ -1437,6 +1485,89 @@ class EisService:
                 value = self._normalize_text(m.group(1))
                 if value:
                     return value
+        return ""
+
+    def _trim_value_before_inline_labels(self, value: str, stop_labels: List[str]) -> str:
+        value = self._normalize_text(value)
+        if not value:
+            return ""
+
+        if stop_labels:
+            split_pattern = r"\b(?:%s)\b" % "|".join(re.escape(label) for label in stop_labels)
+            parts = re.split(split_pattern, value, maxsplit=1, flags=re.IGNORECASE)
+            if parts:
+                value = parts[0].strip(" ,;:-")
+
+        return self._normalize_text(value)
+
+    def _extract_inn_from_text(self, text: str) -> str:
+        text = self._normalize_text(text)
+        if not text:
+            return ""
+
+        patterns = (
+            r"ИНН(?:\s*/\s*КПП)?(?:\s+заказчика|\s+организации|\s+поставщика)?\s*[:№]?\s*(\d{10,12})",
+            r"ИНН\s*/\s*КПП\s*[:№]?\s*(\d{10,12})",
+            r"ИНН\s+(\d{10,12})",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+
+        return ""
+
+    def _extract_soup_field_by_label(self, soup: BeautifulSoup, labels: List[str]) -> str:
+        if soup is None:
+            return ""
+
+        normalized_titles = {self._normalize_text(label).lower() for label in labels if label}
+        if not normalized_titles:
+            return ""
+
+        selectors = (
+            ".section__title",
+            ".registry-entry__body-title",
+            ".common-text__title",
+            ".common-text__value--gray",
+            ".cardMainInfo__title",
+        )
+        container_classes = {
+            "registry-entry__body-block",
+            "cardMainInfo__item",
+            "row",
+        }
+
+        for selector in selectors:
+            for label_node in soup.select(selector):
+                label_text = self._normalize_text(label_node.get_text(" ", strip=True))
+                if label_text.lower() not in normalized_titles:
+                    continue
+
+                candidate_containers = []
+                seen_container_ids: set[int] = set()
+                for container in (
+                    label_node.find_parent("section"),
+                    label_node.find_parent(
+                        "div",
+                        class_=lambda value: self._class_value_contains(value, container_classes),
+                    ),
+                    label_node.parent,
+                    label_node.parent.parent if getattr(label_node, "parent", None) else None,
+                ):
+                    if container is None:
+                        continue
+                    container_id = id(container)
+                    if container_id in seen_container_ids:
+                        continue
+                    seen_container_ids.add(container_id)
+                    candidate_containers.append(container)
+
+                for container in candidate_containers:
+                    value = self._extract_field_by_label(container, [label_text])
+                    if value:
+                        return value
+
         return ""
 
     def _extract_initial_price(self, block) -> str:
@@ -1483,6 +1614,322 @@ class EisService:
         if m:
             return self._normalize_text(m.group(0))
         return ""
+
+    def _extract_customer_name(self, block) -> str:
+        value = self._extract_field_by_label(
+            block,
+            ["Заказчик", "Организация, осуществляющая размещение"],
+        )
+        return self._trim_value_before_inline_labels(
+            value,
+            ["ИНН", "КПП", "ОГРН", "Место нахождения", "Почтовый адрес"],
+        )
+
+    def _extract_customer_inn(self, block) -> str:
+        if block is None:
+            return ""
+
+        value = self._extract_field_by_label(
+            block,
+            ["ИНН", "ИНН / КПП", "ИНН/КПП", "ИНН заказчика", "ИНН организации"],
+        )
+        if not value:
+            value = self._normalize_text(block.get_text(" ", strip=True))
+
+        inn = self._extract_inn_from_text(value)
+        if inn:
+            return inn
+
+        match = INN_RE.search(value)
+        return match.group(0) if match else ""
+
+    def _extract_customer_location(self, block) -> str:
+        value = self._extract_field_by_label(
+            block,
+            ["Место нахождения", "Место нахождения заказчика", "Почтовый адрес"],
+        )
+        return self._trim_value_before_inline_labels(
+            value,
+            ["Почтовый адрес", "ИНН", "КПП", "ОГРН"],
+        )
+
+    def _build_common_info_url(self, notice: Notice) -> str:
+        href = urljoin(BASE, str(notice.href or "").strip())
+        if "/common-info" in href.lower():
+            return href
+
+        reg = str(notice.reg or "").strip()
+        ntype = str(notice.ntype or "").strip()
+
+        if reg.startswith("223-"):
+            notice_info_id = reg.replace("223-", "", 1).strip()
+            if notice_info_id:
+                notice_type = ntype or "notice223"
+                return f"{BASE}/epz/order/notice/{notice_type}/view/common-info.html?noticeInfoId={notice_info_id}"
+
+        if reg and ntype:
+            return f"{BASE}/epz/order/notice/{ntype}/view/common-info.html?regNumber={reg}"
+
+        return href
+
+    def _fetch_page_html(self, url: str) -> str:
+        url = str(url or "").strip()
+        if not url:
+            return ""
+
+        cached = self._page_html_cache.get(url)
+        if cached is not None:
+            return cached
+
+        last_error = None
+        modes = [False, True] if USE_PROXY else [True]
+
+        for force_direct in modes:
+            try:
+                client = get_http_client(force_direct=force_direct)
+                response = client.get(url, timeout=_request_timeout(force_direct))
+                response.raise_for_status()
+                text = str(getattr(response, "text", "") or "")
+                self._page_html_cache[url] = text
+                return text
+            except Exception as exc:
+                last_error = exc
+
+        if last_error:
+            raise last_error
+        return ""
+
+    def _extract_section_info(self, soup: BeautifulSoup, titles: List[str]) -> str:
+        normalized_titles = {self._normalize_text(title).lower() for title in titles if title}
+        if not normalized_titles:
+            return ""
+
+        for section in soup.select("section.blockInfo__section"):
+            title_tag = section.select_one(".section__title")
+            info_tag = section.select_one(".section__info")
+            title = self._normalize_text(title_tag.get_text(" ", strip=True) if title_tag else "")
+            if title.lower() not in normalized_titles:
+                continue
+
+            value = self._normalize_text(info_tag.get_text(" ", strip=True) if info_tag else "")
+            if value:
+                return value
+
+        return self._extract_soup_field_by_label(soup, titles)
+
+    def _extract_common_info_customer_name(self, soup: BeautifulSoup) -> str:
+        name = self._extract_soup_field_by_label(
+            soup,
+            ["Организация, осуществляющая размещение", "Заказчик", "Наименование организации"],
+        )
+        if name and name.lower() != "заказчик":
+            return self._trim_value_before_inline_labels(
+                name,
+                ["ИНН", "КПП", "ОГРН", "Место нахождения", "Почтовый адрес"],
+            )
+
+        for block in soup.select("div.cardMainInfo__item"):
+            title_tag = block.select_one(".cardMainInfo__title")
+            title = self._normalize_text(title_tag.get_text(" ", strip=True) if title_tag else "")
+            if title.lower() != "заказчик":
+                continue
+
+            content_tag = block.select_one(".cardMainInfo__content")
+            content = self._normalize_text(content_tag.get_text(" ", strip=True) if content_tag else "")
+            if content and content.lower() != "заказчик":
+                return content
+
+        return ""
+
+    def _extract_common_info_customer_inn(self, soup: BeautifulSoup) -> str:
+        value = self._extract_soup_field_by_label(
+            soup,
+            ["ИНН", "ИНН / КПП", "ИНН/КПП", "ИНН заказчика", "ИНН организации"],
+        )
+        if not value:
+            value = self._normalize_text(soup.get_text(" ", strip=True))
+        inn = self._extract_inn_from_text(value)
+        if inn:
+            return inn
+        match = INN_RE.search(value)
+        return match.group(0) if match else ""
+
+    def _extract_organization_info_url(self, soup: BeautifulSoup) -> str:
+        for a_tag in soup.select("a[href]"):
+            href = str(a_tag.get("href") or "").strip()
+            if (
+                "/epz/organization/view/info.html" in href
+                or "/epz/organization/view223/info.html" in href
+            ):
+                return urljoin(BASE, href)
+        return ""
+
+    def _load_organization_info(self, org_url: str) -> dict[str, str]:
+        org_url = str(org_url or "").strip()
+        if not org_url:
+            return {}
+
+        if self._organization_info_endpoint_blocked_until > time.time():
+            return {}
+
+        cached = self._organization_info_cache.get(org_url)
+        if cached is not None:
+            return cached
+
+        blocked_until = self._organization_info_failure_cache.get(org_url)
+        if blocked_until is not None:
+            if blocked_until > time.time():
+                return {}
+            self._organization_info_failure_cache.pop(org_url, None)
+
+        try:
+            html_text = self._fetch_page_html(org_url)
+        except Exception as exc:
+            self._organization_info_failure_cache[org_url] = (
+                time.time() + ORGANIZATION_INFO_FAILURE_TTL_SECONDS
+            )
+            if self._is_retryable_organization_info_error(exc):
+                self._organization_info_endpoint_blocked_until = (
+                    time.time() + ORGANIZATION_INFO_ENDPOINT_COOLDOWN_SECONDS
+                )
+            raise
+
+        soup = BeautifulSoup(html_text, "html.parser")
+        info = {
+            "name": self._extract_section_info(soup, ["Полное наименование", "Наименование организации"]),
+            "inn": self._extract_section_info(soup, ["ИНН"]),
+            "location": self._extract_section_info(soup, ["Место нахождения", "Адрес (место нахождения)"]),
+            "postal_address": self._extract_section_info(soup, ["Почтовый адрес"]),
+        }
+        self._organization_info_failure_cache.pop(org_url, None)
+        self._organization_info_cache[org_url] = info
+        self._organization_info_endpoint_blocked_until = 0.0
+        return info
+
+    def _is_retryable_organization_info_error(self, error: Exception) -> bool:
+        if isinstance(error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return True
+
+        error_text = str(error or "").lower()
+        retryable_markers = (
+            "timed out",
+            "timeout",
+            "max retries exceeded",
+            "failed to establish a new connection",
+            "temporary failure in name resolution",
+            "connection aborted",
+        )
+        return any(marker in error_text for marker in retryable_markers)
+
+    def _list_usable_tender_files(self, tender_dir: str) -> list[str]:
+        usable_files: list[str] = []
+        tender_dir = str(tender_dir or "").strip()
+        if not tender_dir or not os.path.isdir(tender_dir):
+            return usable_files
+
+        for root, _, files in os.walk(tender_dir):
+            for filename in files:
+                if filename.endswith(".download_meta.json"):
+                    continue
+                if filename.lower().endswith((".zip", ".rar", ".7z")):
+                    continue
+                file_path = os.path.join(root, filename)
+                ensure_result = ensure_non_empty_downloaded_file(
+                    file_path,
+                    reason="empty_file_detected_after_download",
+                    logger=logger,
+                )
+                if not ensure_result.get("exists"):
+                    continue
+                if not ensure_result.get("non_empty"):
+                    continue
+                usable_files.append(file_path)
+
+        return usable_files
+
+    def _has_complete_customer_info(self, notice: Notice) -> bool:
+        return bool(
+            (notice.customer_name or "").strip()
+            and (notice.customer_inn or "").strip()
+            and (notice.customer_location or "").strip()
+        )
+
+    def enrich_notice_customer_info(self, notice: Notice) -> Notice:
+        if self._has_complete_customer_info(notice):
+            return notice
+
+        common_info_url = self._build_common_info_url(notice)
+        if not common_info_url:
+            return notice
+
+        try:
+            html_text = self._fetch_page_html(common_info_url)
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch common-info for tender %s: %s",
+                notice.reg,
+                exc,
+            )
+            return notice
+
+        soup = BeautifulSoup(html_text, "html.parser")
+
+        if not notice.customer_name:
+            notice.customer_name = self._extract_common_info_customer_name(soup)
+
+        if not notice.customer_inn:
+            notice.customer_inn = self._extract_common_info_customer_inn(soup)
+
+        if not notice.customer_location:
+            notice.customer_location = self._trim_value_before_inline_labels(
+                self._extract_section_info(
+                    soup,
+                    ["Место нахождения", "Адрес (место нахождения)", "Почтовый адрес"],
+                ),
+                ["Почтовый адрес", "ИНН", "КПП", "ОГРН"],
+            )
+
+        if self._has_complete_customer_info(notice):
+            return notice
+
+        org_url = self._extract_organization_info_url(soup)
+        if not org_url:
+            return notice
+
+        try:
+            org_info = self._load_organization_info(org_url)
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch organization info for tender %s: %s",
+                notice.reg,
+                exc,
+            )
+            return notice
+
+        if not org_info:
+            return notice
+
+        if not notice.customer_name:
+            notice.customer_name = str(org_info.get("name") or "").strip()
+        if not notice.customer_inn:
+            notice.customer_inn = str(org_info.get("inn") or "").strip()
+        if not notice.customer_location:
+            notice.customer_location = str(
+                org_info.get("location") or org_info.get("postal_address") or ""
+            ).strip()
+
+        if not notice.customer_inn:
+            notice.customer_inn = self._extract_inn_from_text(
+                " ".join(
+                    [
+                        notice.customer_name or "",
+                        notice.customer_location or "",
+                        soup.get_text(" ", strip=True),
+                    ]
+                )
+            )
+
+        return notice
 
     def _extract_notice_key_from_href(self, href: str):
         full_href = urljoin(BASE, (href or "").strip())
@@ -1715,6 +2162,9 @@ class EisService:
             object_info = self._extract_field_by_label(card, ["Объект закупки", "Наименование объекта закупки"])
             initial_price = self._extract_initial_price(card)
             application_deadline = self._extract_application_deadline(card)
+            customer_name = self._extract_customer_name(card)
+            customer_inn = self._extract_customer_inn(card)
+            customer_location = self._extract_customer_location(card)
             
             docs_url = ""
             for vl in valid_links:
@@ -1738,6 +2188,9 @@ class EisService:
                 object_info=object_info,
                 initial_price=initial_price,
                 application_deadline=application_deadline,
+                customer_name=customer_name,
+                customer_inn=customer_inn,
+                customer_location=customer_location,
                 seen=is_seen(reg_id),
                 docs_url=docs_url,
             )
@@ -1753,9 +2206,61 @@ class EisService:
         except Exception:
             return False
 
+    def _get_page_content_with_retry(
+        self,
+        page,
+        *,
+        retries: int = 6,
+        wait_ms: int = 500,
+        settle_ms: int = 250,
+        slog: 'SearchLogger' = None,
+        context: str = "",
+    ) -> str:
+        last_error = None
+        transient_markers = [
+            "page is navigating",
+            "changing the content",
+            "execution context was destroyed",
+        ]
+
+        for attempt in range(1, retries + 1):
+            try:
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=4000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(settle_ms)
+                return page.content()
+            except Exception as e:
+                last_error = e
+                err_text = str(e).lower()
+                is_transient = any(marker in err_text for marker in transient_markers)
+                if not is_transient or attempt == retries:
+                    raise
+
+                msg = (
+                    f"{context} page snapshot retry {attempt}/{retries} "
+                    f"because DOM is still changing: {e}"
+                ).strip()
+                if slog:
+                    slog.warning("SEARCH_PAGE", msg)
+                else:
+                    logger.info(msg)
+                page.wait_for_timeout(wait_ms)
+
+        if last_error:
+            raise last_error
+        return ""
+
     def _has_no_results_banner(self, page) -> bool:
         try:
-            html = page.content().lower()
+            html = self._get_page_content_with_retry(
+                page,
+                retries=3,
+                wait_ms=300,
+                settle_ms=150,
+                context="no_results_banner_check",
+            ).lower()
         except Exception:
             return False
         return any(p in html for p in NO_RESULTS_PATTERNS)
@@ -1913,10 +2418,116 @@ class EisService:
         if last_exc:
             raise last_exc
 
+    def _is_retryable_proxy_boot_error(self, error: Exception) -> bool:
+        return SOCKS5_BOOT_ERROR_MARKER in str(error or "")
+
+    def _sleep_with_cancel_checks(self, total_seconds: float, cancel_generation: int, step_seconds: float = 0.25) -> bool:
+        deadline = time.time() + max(0.0, float(total_seconds))
+        while time.time() < deadline:
+            if self._is_search_cancelled(cancel_generation):
+                return False
+            time.sleep(min(step_seconds, max(0.0, deadline - time.time())))
+        return not self._is_search_cancelled(cancel_generation)
+
+    def _reset_proxy_client_state(self) -> None:
+        global RF_CLIENT_PROXY
+
+        proxy_client = RF_CLIENT_PROXY
+        RF_CLIENT_PROXY = None
+
+        if proxy_client is None:
+            return
+
+        tunnel = getattr(proxy_client, "tunnel", None)
+        close_tunnel = getattr(tunnel, "close", None)
+        if callable(close_tunnel):
+            try:
+                close_tunnel()
+            except Exception:
+                logger.warning("Failed to close proxy tunnel during retry reset.", exc_info=True)
+
+        session = getattr(proxy_client, "session", None)
+        close_session = getattr(session, "close", None)
+        if callable(close_session):
+            try:
+                close_session()
+            except Exception:
+                logger.warning("Failed to close proxy session during retry reset.", exc_info=True)
+
     def search_tenders(self, query: str, fz44: bool = True, fz223: bool = True, only_application_stage: bool = True, publish_days_back: int = 30, search_id: str = None):
         import uuid
         if not search_id:
             search_id = uuid.uuid4().hex[:8]
+
+        cancel_generation = self._get_cancel_generation()
+        last_exc = None
+        for attempt in range(1, SEARCH_RETRYABLE_PROXY_ATTEMPTS + 1):
+            if self._is_search_cancelled(cancel_generation):
+                logger.info(
+                    "[SEARCH_PROXY_RETRY] [SearchID:%s] Search cancelled before attempt %s.",
+                    search_id,
+                    attempt,
+                )
+                return []
+            try:
+                return self._search_tenders_once(
+                    query=query,
+                    fz44=fz44,
+                    fz223=fz223,
+                    only_application_stage=only_application_stage,
+                    publish_days_back=publish_days_back,
+                    search_id=search_id,
+                    cancel_generation=cancel_generation,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if self._is_search_cancelled(cancel_generation):
+                    self._reset_proxy_client_state()
+                    logger.info(
+                        "[SEARCH_PROXY_RETRY] [SearchID:%s] Search cancelled after proxy startup failure.",
+                        search_id,
+                    )
+                    return []
+                if not self._is_retryable_proxy_boot_error(exc):
+                    raise
+
+                self._reset_proxy_client_state()
+                if attempt >= SEARCH_RETRYABLE_PROXY_ATTEMPTS:
+                    logger.error(
+                        "[SEARCH_PROXY_RETRY] [SearchID:%s] SOCKS5 tunnel startup failed after %s attempts. Error: %s",
+                        search_id,
+                        SEARCH_RETRYABLE_PROXY_ATTEMPTS,
+                        exc,
+                    )
+                    raise
+
+                logger.warning(
+                    "[SEARCH_PROXY_RETRY] [SearchID:%s] SOCKS5 tunnel startup failed on attempt %s/%s. "
+                    "Waiting %s sec before retry. Error: %s",
+                    search_id,
+                    attempt,
+                    SEARCH_RETRYABLE_PROXY_ATTEMPTS,
+                    SEARCH_RETRYABLE_PROXY_DELAY_SECONDS,
+                    exc,
+                )
+                if not self._sleep_with_cancel_checks(SEARCH_RETRYABLE_PROXY_DELAY_SECONDS, cancel_generation):
+                    logger.info(
+                        "[SEARCH_PROXY_RETRY] [SearchID:%s] Search cancelled during proxy retry wait.",
+                        search_id,
+                    )
+                    return []
+
+        if last_exc:
+            raise last_exc
+
+        return []
+
+    def _search_tenders_once(self, query: str, fz44: bool = True, fz223: bool = True, only_application_stage: bool = True, publish_days_back: int = 30, search_id: str = None, cancel_generation: int | None = None):
+        import uuid
+        if not search_id:
+            search_id = uuid.uuid4().hex[:8]
+        if cancel_generation is None:
+            cancel_generation = self._get_cancel_generation()
         slog = SearchLogger(search_id)
         start_time = time.time()
 
@@ -1929,6 +2540,10 @@ class EisService:
             except Exception:
                 pass
 
+        if self._is_search_cancelled(cancel_generation):
+            slog.info("SEARCH_START", "Search cancelled before warmup.")
+            return []
+
         if USE_PROXY:
             try:
                 client = get_http_client() # This ensures tunnel is up
@@ -1936,10 +2551,12 @@ class EisService:
                 logger.info("Warming up proxy session...")
                 client.warmup()
             except Exception as e:
+                if self._is_search_cancelled(cancel_generation):
+                    slog.info("SEARCH_START", "Search cancelled during proxy warmup.")
+                    return []
                 logger.error(f"Proxy warmup failed: {e}")
                 raise e
 
-        self._cancel_flag = False
         slog.info("SEARCH_START", f"Searching EIS via Playwright for: {query}")
         collected: List[Notice] = []
         op_counter = 0
@@ -1981,11 +2598,11 @@ class EisService:
                     keywords = [k.strip() for k in query.split(',')] if ',' in query else [query]
 
                     for kw in keywords:
-                        if self._cancel_flag:
+                        if self._is_search_cancelled(cancel_generation):
                             slog.info("SEARCH_START", "Search cancelled by user.")
                             break
                         for pn in range(1, self.MAX_PAGES + 1):
-                            if self._cancel_flag:
+                            if self._is_search_cancelled(cancel_generation):
                                 slog.info("SEARCH_START", "Search cancelled by user.")
                                 break
                             url = self.build_search_url(kw, pn, fz44, fz223, only_application_stage, publish_days_back)
@@ -2007,7 +2624,15 @@ class EisService:
                                 slog.error("SEARCH_PAGE", f"error kw='{kw}' page={pn}: {e}")
                                 break
 
-                            items = self._extract_notices_from_results(page.content(), kw, url, pn, slog)
+                            html_snapshot = self._get_page_content_with_retry(
+                                page,
+                                retries=8,
+                                wait_ms=700,
+                                settle_ms=350,
+                                slog=slog,
+                                context=f"kw='{kw}' page={pn}",
+                            )
+                            items = self._extract_notices_from_results(html_snapshot, kw, url, pn, slog)
                             slog.info("SEARCH_PAGE", f"found notices after per-page dedup: {len(items)}")
                             
                             if not items:
@@ -2063,6 +2688,12 @@ class EisService:
                                 best.initial_price = current.initial_price
                             if current.application_deadline and len(current.application_deadline) > len(best.application_deadline):
                                 best.application_deadline = current.application_deadline
+                            if current.customer_name and len(current.customer_name) > len(best.customer_name):
+                                best.customer_name = current.customer_name
+                            if current.customer_inn and len(current.customer_inn) > len(best.customer_inn):
+                                best.customer_inn = current.customer_inn
+                            if current.customer_location and len(current.customer_location) > len(best.customer_location):
+                                best.customer_location = current.customer_location
                             if not best.href:
                                 best.href = current.href
 

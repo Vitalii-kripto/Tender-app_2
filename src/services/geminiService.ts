@@ -8,8 +8,11 @@ import {
   CompanyProfile,
   LegalAnalysisResult,
   TenderRequirementItem,
+  TenderRequirementGroup,
+  RequirementExtractionWarning,
   RequirementExtractionResponse,
-  MatchingSearchMode
+  MatchingSearchMode,
+  RequirementCharacteristic,
 } from "../types";
 import { logger } from "./loggerService";
 
@@ -258,11 +261,181 @@ export const getSelectedTendersForMatching = async (): Promise<Tender[]> => {
     return tenders.filter(t => !!t.selected_for_matching);
 };
 
+const normalizeRequirementWarnings = (warnings: any): RequirementExtractionWarning[] => {
+    if (!Array.isArray(warnings)) {
+        return [];
+    }
+
+    return warnings
+        .map((warning): RequirementExtractionWarning | null => {
+            if (typeof warning === 'string') {
+                const message = warning.trim();
+                return message ? { message } : null;
+            }
+
+            if (!warning || typeof warning !== 'object') {
+                return null;
+            }
+
+            const message = String(warning.message || warning.detail || '').trim();
+            if (!message) {
+                return null;
+            }
+
+            return {
+                tender_id: warning.tender_id ? String(warning.tender_id) : undefined,
+                filename: warning.filename ? String(warning.filename) : undefined,
+                status: warning.status ? String(warning.status) : undefined,
+                message,
+            };
+        })
+        .filter((warning): warning is RequirementExtractionWarning => Boolean(warning));
+};
+
+const normalizeRequirementItems = (items: any, fallback?: Partial<TenderRequirementItem>): TenderRequirementItem[] => {
+    if (!Array.isArray(items)) {
+        return [];
+    }
+
+    return items
+        .map((item, index): TenderRequirementItem | null => {
+            if (!item || typeof item !== 'object') {
+                return null;
+            }
+
+            const source = item.source === 'manual' ? 'manual' : 'crm';
+            const tenderId = item.tender_id ? String(item.tender_id) : fallback?.tender_id;
+            const itemId = item.id
+                ? String(item.id)
+                : `${tenderId || fallback?.source || 'item'}:${index}`;
+            const structuredCharacteristics: RequirementCharacteristic[] = Array.isArray(item.structured_characteristics)
+                ? item.structured_characteristics
+                    .map((char: any): RequirementCharacteristic | null => {
+                        if (!char || typeof char !== 'object') {
+                            return null;
+                        }
+                        const name = String(char.name || '').trim();
+                        const value = String(char.value || '').trim();
+                        if (!name && !value) {
+                            return null;
+                        }
+                        return { name, value };
+                    })
+                    .filter((char: RequirementCharacteristic | null): char is RequirementCharacteristic => Boolean(char))
+                : Array.isArray(item.characteristics)
+                    ? item.characteristics
+                        .map((char: any): RequirementCharacteristic | null => {
+                            const text = String(char || '').trim();
+                            if (!text) {
+                                return null;
+                            }
+                            if (text.includes(':')) {
+                                const [name, ...valueParts] = text.split(':');
+                                return {
+                                    name: name.trim(),
+                                    value: valueParts.join(':').trim(),
+                                };
+                            }
+                            return { name: '', value: text };
+                        })
+                        .filter((char: RequirementCharacteristic | null): char is RequirementCharacteristic => Boolean(char))
+                    : [];
+            const formattedCharacteristics = structuredCharacteristics
+                .map(char => {
+                    if (char.name && char.value) {
+                        return `${char.name}: ${char.value}`;
+                    }
+                    return char.value || char.name;
+                })
+                .filter(Boolean);
+
+            return {
+                id: itemId,
+                tender_id: tenderId,
+                tender_title: item.tender_title ? String(item.tender_title) : fallback?.tender_title,
+                source,
+                source_label: item.source_label ? String(item.source_label) : fallback?.source_label,
+                position_name: String(item.position_name || ''),
+                normalized_name: item.normalized_name ? String(item.normalized_name) : undefined,
+                quantity: item.quantity ? String(item.quantity) : undefined,
+                unit: item.unit ? String(item.unit) : undefined,
+                characteristics: formattedCharacteristics,
+                structured_characteristics: structuredCharacteristics,
+                notes: item.notes ? String(item.notes) : undefined,
+                search_query: String(item.search_query || item.position_name || ''),
+                source_documents: Array.isArray(item.source_documents) ? item.source_documents : undefined,
+                general_requirements_applied: Boolean(item.general_requirements_applied),
+                analog_allowed: Boolean(item.analog_allowed),
+                quality_status: item.quality_status === 'degraded' ? 'degraded' : 'good',
+            };
+        })
+        .filter((item): item is TenderRequirementItem => Boolean(item && item.position_name));
+};
+
+const normalizeRequirementGroups = (groups: any): TenderRequirementGroup[] => {
+    if (!Array.isArray(groups)) {
+        return [];
+    }
+
+    return groups
+        .map((group): TenderRequirementGroup | null => {
+            if (!group || typeof group !== 'object') {
+                return null;
+            }
+
+            const source = group.source === 'manual' ? 'manual' : 'crm';
+            const tenderId = String(group.tender_id || '');
+            const tenderTitle = String(group.tender_title || tenderId || 'Тендер');
+            const sourceLabel = group.source_label ? String(group.source_label) : undefined;
+
+            return {
+                tender_id: tenderId,
+                tender_title: tenderTitle,
+                source,
+                source_label: sourceLabel,
+                items: normalizeRequirementItems(group.items, {
+                    tender_id: tenderId,
+                    tender_title: tenderTitle,
+                    source,
+                    source_label: sourceLabel,
+                }),
+                warnings: normalizeRequirementWarnings(group.warnings),
+                general_requirements: Array.isArray(group.general_requirements)
+                    ? group.general_requirements.map((value: any) => String(value)).filter(Boolean)
+                    : [],
+                processing_stats: group.processing_stats && typeof group.processing_stats === 'object'
+                    ? group.processing_stats
+                    : undefined,
+            };
+        })
+        .filter((group): group is TenderRequirementGroup => Boolean(group));
+};
+
+const normalizeRequirementExtractionResponse = (data: any): RequirementExtractionResponse => {
+    const tenders = normalizeRequirementGroups(data?.tenders);
+    const items = tenders.length > 0
+        ? tenders.flatMap(group => group.items)
+        : normalizeRequirementItems(data?.items);
+    const warnings = tenders.length > 0
+        ? tenders.flatMap(group => group.warnings)
+        : normalizeRequirementWarnings(data?.warnings);
+    const generalRequirements = Array.isArray(data?.general_requirements)
+        ? data.general_requirements.map((value: any) => String(value)).filter(Boolean)
+        : tenders.flatMap(group => group.general_requirements || []);
+
+    return {
+        items,
+        tenders,
+        warnings,
+        general_requirements: Array.from(new Set(generalRequirements)),
+    };
+};
+
 export const extractTenderRequirementsFromText = async (
     text: string
 ): Promise<RequirementExtractionResponse> => {
     if (!text.trim()) {
-        return { items: [], warnings: [] };
+        return { items: [], tenders: [], warnings: [] };
     }
 
     const response = await fetch(`${API_BASE_URL}/api/ai/extract-tender-requirements`, {
@@ -277,17 +450,14 @@ export const extractTenderRequirementsFromText = async (
         throw new Error(data.detail || 'Не удалось обработать ручное ТЗ');
     }
 
-    return {
-        items: data.items || [],
-        warnings: data.warnings || []
-    };
+    return normalizeRequirementExtractionResponse(data);
 };
 
 export const extractTenderRequirementsFromCrm = async (
     tenderIds: string[]
 ): Promise<RequirementExtractionResponse> => {
     if (!tenderIds.length) {
-        return { items: [], warnings: [] };
+        return { items: [], tenders: [], warnings: [] };
     }
 
     const response = await fetch(`${API_BASE_URL}/api/ai/extract-tender-requirements`, {
@@ -302,10 +472,39 @@ export const extractTenderRequirementsFromCrm = async (
         throw new Error(data.detail || 'Не удалось извлечь ТЗ из CRM');
     }
 
-    return {
-        items: data.items || [],
-        warnings: data.warnings || []
-    };
+    return normalizeRequirementExtractionResponse(data);
+};
+
+export const exportParsedTenderTzWord = async (
+    tenders: TenderRequirementGroup[],
+    selectedItemIds: string[] = []
+): Promise<void> => {
+    const response = await fetch(`${API_BASE_URL}/api/ai/export-parsed-tz-word`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            tenders,
+            selected_item_ids: selectedItemIds,
+        })
+    });
+
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.detail || 'Не удалось выгрузить ТЗ в Word');
+    }
+
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const filenameMatch = disposition.match(/filename="?([^"]+)"?/i);
+    const filename = filenameMatch?.[1] || 'parsed_tz.docx';
+    const url = window.URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.URL.revokeObjectURL(url);
 };
 
 export const searchRequirementAnalogs = async (
@@ -459,6 +658,43 @@ export const processSelectedTenders = async (
     }
 };
 
+export const uploadManualTenderDocuments = async (files: File[]): Promise<Tender> => {
+    if (IS_DEMO_MODE) {
+        await delay(1200);
+        return {
+            id: `manual_demo_${Date.now()}`,
+            eis_number: `manual_demo_${Date.now()}`,
+            title: 'Загруженный тендер (Демо)',
+            description: 'Тендер создан из вручную загруженной документации.',
+            initial_price: 1500000,
+            deadline: '31.12.2026',
+            status: 'Found',
+            risk_level: 'Low',
+            region: 'Ручная загрузка',
+            law_type: '44-ФЗ',
+            customer_name: 'Демо-заказчик',
+            customer_inn: '7701234567',
+            customer_location: 'Москва',
+        };
+    }
+
+    const formData = new FormData();
+    files.forEach(file => formData.append('files', file));
+
+    const response = await fetch(`${API_BASE_URL}/api/search-tenders/manual-upload`, {
+        method: 'POST',
+        body: formData,
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+        throw new Error(data.detail || 'Не удалось обработать загруженную документацию');
+    }
+
+    return data as Tender;
+};
+
 export const requeueTenderDocs = async (tenderId: string): Promise<{ status: string }> => {
     if (IS_DEMO_MODE) {
         await delay(1000);
@@ -504,6 +740,9 @@ export const searchTenders = async (
             risk_level: 'Medium',
             region: 'Москва',
             law_type: '44-ФЗ',
+            customer_name: 'ГБУЗ "Городская поликлиника №1 ДЗМ"',
+            customer_inn: '7701234567',
+            customer_location: 'г. Москва, ул. Профсоюзная, д. 15',
             url: 'https://zakupki.gov.ru'
         },
         {
@@ -517,6 +756,9 @@ export const searchTenders = async (
             risk_level: 'Low',
             region: 'Санкт-Петербург',
             law_type: '223-ФЗ',
+            customer_name: 'ГУП "Водоканал Санкт-Петербурга"',
+            customer_inn: '7830000426',
+            customer_location: 'г. Санкт-Петербург, ул. Кавалергардская, д. 42',
             url: 'https://zakupki.gov.ru'
         }
     ];

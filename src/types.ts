@@ -41,6 +41,9 @@ export interface Tender {
   keyword?: string;
   seen?: boolean;
   ntype?: string;
+  customer_name?: string;
+  customer_inn?: string;
+  customer_location?: string;
   selected_for_matching?: boolean;
 }
 
@@ -85,6 +88,11 @@ export interface AnalysisResult {
 
 export type MatchingSearchMode = 'local' | 'ai' | 'both';
 
+export interface RequirementCharacteristic {
+  name: string;
+  value: string;
+}
+
 export interface TenderRequirementItem {
   id: string;
   tender_id?: string;
@@ -92,11 +100,17 @@ export interface TenderRequirementItem {
   source: 'manual' | 'crm';
   source_label?: string;
   position_name: string;
+  normalized_name?: string;
   quantity?: string;
   unit?: string;
   characteristics: string[];
+  structured_characteristics?: RequirementCharacteristic[];
   notes?: string;
   search_query: string;
+  source_documents?: Array<Record<string, unknown>>;
+  general_requirements_applied?: boolean;
+  analog_allowed?: boolean;
+  quality_status?: 'good' | 'degraded';
 }
 
 export interface RequirementExtractionWarning {
@@ -106,8 +120,20 @@ export interface RequirementExtractionWarning {
   message: string;
 }
 
+export interface TenderRequirementGroup {
+  tender_id: string;
+  tender_title: string;
+  source: 'manual' | 'crm';
+  source_label?: string;
+  items: TenderRequirementItem[];
+  warnings: RequirementExtractionWarning[];
+  general_requirements?: string[];
+  processing_stats?: Record<string, unknown>;
+}
+
 export interface RequirementExtractionResponse {
   items: TenderRequirementItem[];
+  tenders?: TenderRequirementGroup[];
   warnings: RequirementExtractionWarning[];
   general_requirements?: string[];
 }

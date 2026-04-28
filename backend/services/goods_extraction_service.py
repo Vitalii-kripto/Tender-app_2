@@ -1,10 +1,13 @@
+import hashlib
 import json
 import re
 import time
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend.logger import logger
 from .ai_service import AiService
+from .tz_extractor import extract_relevant_text, extract_tz_from_relevant_text, extract_tz_from_text
 
 
 PROMPT_UNIFIED_GOODS_EXTRACTION = """
@@ -158,6 +161,18 @@ class GoodsExtractionService:
 
         prompt = PROMPT_UNIFIED_GOODS_EXTRACTION.replace("__DOCUMENTS__", documents_block)
 
+        if not self.ai_service or not getattr(self.ai_service, "client", None):
+            logger.warning(
+                f"[GOODS_EXTRACTION_WARNING] tender_id={tender_id} reason='ai_unavailable_use_rule_based_fallback' raw_data=''"
+            )
+            return self._build_rule_based_fallback_result(
+                files_data,
+                context_meta,
+                tender_id,
+                job_id,
+                "AI недоступен. Использован локальный rule-based fallback для извлечения ТЗ.",
+            )
+
         try:
             if callback:
                 callback("Извлечение товарных позиций из всей документации", 55, "running")
@@ -211,6 +226,18 @@ class GoodsExtractionService:
             normalized = self._normalize_extraction_result(parsed, context_meta, tender_id, job_id)
             duration = time.time() - start_time
 
+            if not normalized.get("positions"):
+                logger.warning(
+                    f"[GOODS_EXTRACTION_WARNING] tender_id={tender_id} reason='ai_returned_no_positions_use_rule_based_fallback' raw_data=''"
+                )
+                return self._build_rule_based_fallback_result(
+                    files_data,
+                    context_meta,
+                    tender_id,
+                    job_id,
+                    "AI не выделил позиции. Использован локальный rule-based fallback для поиска ТЗ.",
+                )
+
             logger.info(
                 f"[GOODS_EXTRACTION_DONE] tender_id={tender_id} job_id={job_id} "
                 f"final_positions_count={len(normalized.get('positions', []))} final_general_requirements_count={len(normalized.get('general_goods_requirements', []))} "
@@ -224,9 +251,12 @@ class GoodsExtractionService:
                 f"[GOODS_EXTRACTION_JSON_PARSE] tender_id={tender_id} job_id={job_id} "
                 f"status='failed' raw_positions_count=0 raw_general_requirements_count=0"
             )
-            return self._empty_result(
+            return self._build_rule_based_fallback_result(
+                files_data,
                 context_meta,
-                [f"Ошибка извлечения товарных данных: {str(e)}"]
+                tender_id,
+                job_id,
+                f"AI-извлечение завершилось ошибкой ({str(e)}). Использован локальный rule-based fallback.",
             )
 
     def _empty_result(self, context_meta: Dict[str, Any], warnings: List[str]) -> Dict[str, Any]:
@@ -261,6 +291,37 @@ class GoodsExtractionService:
             return (6, "price")
         return (10, "other")
 
+    def _document_priority_for_goods_file(self, file_data: Dict[str, Any]) -> Tuple[int, str]:
+        filename = file_data.get("filename", "")
+        priority, doc_hint = self._document_priority_for_goods(filename)
+        if doc_hint != "other":
+            return priority, doc_hint
+
+        text = self._clean_text(file_data.get("extracted_text", "") or "")
+        head = text.lower()[:8000]
+        if not head:
+            return priority, doc_hint
+
+        if self._looks_like_contract_content(text):
+            return priority, doc_hint
+
+        strong_goods_markers = [
+            "техническое задание",
+            "перечень товаров",
+            "перечь товаров",
+            "на поставку",
+            "требования к функциональным, техническим и качественным характеристикам",
+            "наименование | единица измерения",
+            "№п/п | наименование | единица измерения",
+        ]
+        if any(marker in head for marker in strong_goods_markers):
+            return 2, "goods_spec"
+
+        if self._excerpt_has_goods_position_signals(text):
+            return 3, "goods_spec"
+
+        return priority, doc_hint
+
     def _is_archive(self, filename: str) -> bool:
         ext = ""
         if "." in (filename or ""):
@@ -274,6 +335,403 @@ class GoodsExtractionService:
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
+
+    def _should_include_without_relevant_excerpt(self, doc_hint: str, text: str) -> bool:
+        text_len = len(text or "")
+        if doc_hint in {"goods_main", "goods_spec"}:
+            return text_len <= 25000
+        if doc_hint == "goods_excel":
+            return text_len <= 30000
+        return False
+
+    def _has_goods_filename_hint(self, filename: str) -> bool:
+        low = (filename or "").lower()
+        return any(marker in low for marker in [
+            "тз", "тех", "описан", "объект", "специфик",
+            "ведомост", "номенклат", "товар", "материал",
+        ])
+
+    def _looks_like_contract_content(self, text: str) -> bool:
+        head = (text or "").lower()[:6000]
+        if not head:
+            return False
+
+        strong_markers = [
+            "проект контракта",
+            "электронный контракт",
+            "условия контракта",
+            "реквизиты контракта",
+            "стороны контракта",
+            "предмет контракта",
+            "цена контракта",
+            "сроки исполнения контракта",
+            "поставщик обязуется",
+            "заказчик обязуется",
+            "электронного контракта",
+        ]
+        hits = sum(1 for marker in strong_markers if marker in head)
+        return hits >= 2 or head.startswith("договор") or head.startswith("проект контракта")
+
+    def _excerpt_has_goods_position_signals(self, text: str) -> bool:
+        low = (text or "").lower()
+        if not low:
+            return False
+        if self._looks_like_contract_content(text):
+            return False
+
+        if re.search(
+            r"\b(гидроизол|мастик|техноэласт|линокром|рубероид|смесь|кирпич|блок|"
+            r"цемент|бетон|утеплител|труба|кабель|мембран|геотекстил)\w*\b",
+            low,
+        ) and re.search(r"\b\d+(?:[.,]\d+)?\s*(шт|м2|м3|м|мм|кг|л|рулон|меш|компл)\b", low):
+            return True
+
+        if re.search(r"\bнаименование\s+товара\b", low) and re.search(r"\bколичеств", low):
+            return True
+
+        if (
+            low.count("|") >= 4
+            and re.search(r"\b(наименование\s+товара|товар\b|материал\b)\b", low)
+            and re.search(r"\b(ед\.?\s*изм|ед-?цаизм|ед-?ца\s*изм|к-?во|кол-?во|количеств)\b", low)
+        ):
+            return True
+
+        return False
+
+    def _extract_contract_goods_appendix_excerpt(self, text: str) -> str:
+        cleaned = self._clean_text(text)
+        if not cleaned or not self._looks_like_contract_content(cleaned):
+            return ""
+
+        lower = cleaned.lower()
+        start_candidates: list[int] = []
+        appendix_patterns = [
+            r"(?:^|\n)\s*приложение\s*№?\s*1[\s\S]{0,250}?спецификац(?:ия)?[\s\S]{0,120}?поставляемого\s+товара",
+            r"(?:^|\n)\s*приложение\s*№?\s*2[\s\S]{0,250}?техническ(?:ое|ого)?\s+задани[ея]",
+            r"спецификац(?:ия)?\s+поставляемого\s+товара",
+            r"техническ(?:ое|ого)?\s+задани[ея]\s+на\s+поставк",
+            r"описание\s+объекта\s+закупки\s*:?",
+            r"№\s*п/?п\s*\|\s*наименование\s+товара[, ]*техническ",
+        ]
+
+        min_late_offset = 0 if len(cleaned) <= 12000 else max(4000, len(cleaned) // 5)
+        for pattern in appendix_patterns:
+            for match in re.finditer(pattern, lower, flags=re.IGNORECASE):
+                start = match.start()
+                context_before = lower[max(0, start - 300):start]
+                if "перечень приложений" in context_before:
+                    continue
+                if start < min_late_offset and "приложение" not in pattern and "описание" not in pattern:
+                    continue
+                start_candidates.append(start)
+
+        if not start_candidates:
+            return ""
+
+        excerpt = cleaned[min(start_candidates):].strip()
+        if not excerpt:
+            return ""
+
+        if self._excerpt_has_goods_position_signals(excerpt):
+            return excerpt
+
+        strong_goods_markers = [
+            "спецификация",
+            "техническое задание",
+            "описание объекта закупки",
+            "наименование товара",
+            "характеристики",
+        ]
+        if (
+            any(marker in excerpt.lower() for marker in strong_goods_markers)
+            and re.search(
+                r"\b(гидроизол|мастик|праймер|рулон|кровел|мембран|герметик|утеплител|"
+                r"профнастил|стеклопласт|материал)\w*\b",
+                excerpt.lower(),
+            )
+        ):
+            return excerpt
+
+        return ""
+
+    def _should_skip_filename_for_goods(self, filename: str) -> bool:
+        low = (filename or "").lower()
+        if re.search(r"требован\w*.*заявк", low):
+            return True
+        if re.search(r"инструкц\w*.*заявк", low):
+            return True
+        return any(marker in low for marker in [
+            "report_",
+            "отчет",
+            "обоснован",
+            "нмцк",
+            "нмцд",
+            "смет",
+            "составу заявки",
+            "заявки",
+            "инструкц",
+            "образцы форм",
+            "форма заявки",
+            "критери",
+            "уведомлен",
+            "протокол",
+        ])
+
+    def _build_relevant_excerpt_file_data(
+        self,
+        file_data: Dict[str, Any],
+        tender_id: str = "N/A",
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
+        filename = file_data.get("filename", "Unknown")
+        status = file_data.get("status", "success")
+        _, doc_hint = self._document_priority_for_goods_file(file_data)
+        goods_filename_hint = self._has_goods_filename_hint(filename)
+
+        if self._should_skip_filename_for_goods(filename) and not goods_filename_hint:
+            return None, {
+                "filename": filename,
+                "reason": "filename_filtered_as_non_goods_document",
+            }
+
+        if status != "success":
+            return None, {
+                "filename": filename,
+                "reason": f"status_{status}",
+            }
+
+        source_text = self._clean_text(file_data.get("extracted_text", "") or "")
+        if not source_text:
+            return None, {
+                "filename": filename,
+                "reason": "empty_text",
+            }
+
+        contract_appendix_excerpt = ""
+        relevant_debug: Dict[str, Any] = {}
+        if doc_hint == "contract":
+            contract_appendix_excerpt = self._extract_contract_goods_appendix_excerpt(source_text)
+            if contract_appendix_excerpt:
+                relevant_text = contract_appendix_excerpt
+                relevant_debug = {"mode": "contract_goods_appendix"}
+            else:
+                relevant_text, relevant_debug = extract_relevant_text(source_text)
+        else:
+            relevant_text, relevant_debug = extract_relevant_text(source_text)
+        relevant_text = self._clean_text(relevant_text)
+
+        if relevant_text:
+            if (
+                doc_hint in {"contract", "price"}
+                and not goods_filename_hint
+                and not self._excerpt_has_goods_position_signals(relevant_text)
+            ):
+                return None, {
+                    "filename": filename,
+                    "reason": "secondary_doc_filtered_from_goods_context",
+                }
+            if (
+                doc_hint == "notice"
+                and not goods_filename_hint
+                and not self._excerpt_has_goods_position_signals(relevant_text)
+            ):
+                return None, {
+                    "filename": filename,
+                    "reason": "secondary_doc_filtered_from_goods_context",
+                }
+            if (
+                doc_hint == "other"
+                and not goods_filename_hint
+                and relevant_debug.get("mode") != "explicit_section"
+                and not self._excerpt_has_goods_position_signals(relevant_text)
+            ):
+                return None, {
+                    "filename": filename,
+                    "reason": "other_doc_without_goods_filename_hint",
+                }
+            excerpt_text = relevant_text
+            excerpt_reason = f"relevant_excerpt_{relevant_debug.get('mode', 'unknown')}"
+        elif self._should_include_without_relevant_excerpt(doc_hint, source_text):
+            excerpt_text = source_text
+            excerpt_reason = f"full_document_{doc_hint}"
+        else:
+            return None, {
+                "filename": filename,
+                "reason": "no_relevant_excerpt",
+            }
+
+        if (
+            doc_hint in {"contract", "other", "notice"}
+            and self._looks_like_contract_content(excerpt_text)
+            and not self._excerpt_has_goods_position_signals(excerpt_text)
+        ):
+            return None, {
+                "filename": filename,
+                "reason": "contract_like_content_filtered",
+            }
+
+        if doc_hint in {"contract", "other"} and not self._excerpt_has_goods_position_signals(excerpt_text):
+            return None, {
+                "filename": filename,
+                "reason": "doc_without_goods_position_signals",
+            }
+
+        excerpt_file_data = dict(file_data)
+        excerpt_file_data["extracted_text"] = excerpt_text
+        excerpt_file_data["pages"] = [{
+            "page_num": "excerpt",
+            "text": excerpt_text,
+            "tables": [],
+        }]
+        excerpt_file_data["_context_excerpt_reason"] = excerpt_reason
+
+        logger.info(
+            f"[GOODS_CONTEXT_RELEVANT_EXCERPT] tender_id={tender_id} filename='{filename}' "
+            f"doc_class_hint='{doc_hint}' excerpt_reason='{excerpt_reason}' excerpt_chars={len(excerpt_text)}"
+        )
+
+        return excerpt_file_data, None
+
+    def _characteristic_text_to_entry(self, text: str) -> Optional[Dict[str, str]]:
+        value = self._normalize_string(text)
+        if not value:
+            return None
+        if self._looks_like_commercial_characteristic_noise("", value):
+            return None
+        if ":" in value:
+            name, raw_value = value.split(":", 1)
+            name = self._normalize_string(name)
+            raw_value = self._normalize_string(raw_value)
+            if name and raw_value:
+                return {"name": name, "value": raw_value}
+        return {"name": "", "value": value}
+
+    def _build_rule_based_fallback_result(
+        self,
+        files_data: List[Dict[str, Any]],
+        context_meta: Dict[str, Any],
+        tender_id: str,
+        job_id: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        parsed_positions: List[Dict[str, Any]] = []
+        parsed_general: List[Dict[str, Any]] = []
+        fallback_warnings: List[str] = [reason]
+
+        for file_data in files_data:
+            filename = file_data.get("filename", "Unknown")
+            _, doc_hint = self._document_priority_for_goods_file(file_data)
+            goods_filename_hint = self._has_goods_filename_hint(filename)
+
+            if doc_hint == "price" and not goods_filename_hint:
+                continue
+            if doc_hint == "goods_excel" and not goods_filename_hint:
+                continue
+
+            excerpt_file_data, skip_meta = self._build_relevant_excerpt_file_data(file_data, tender_id=tender_id)
+            if not excerpt_file_data:
+                continue
+
+            rb_result = extract_tz_from_relevant_text(
+                excerpt_file_data.get("extracted_text", "") or "",
+                debug_info={"mode": "prebuilt_goods_excerpt", "blocks": 1},
+            )
+            filename = excerpt_file_data.get("filename", "Unknown")
+            has_structured_positions = any(
+                item.get("quantity") or item.get("unit")
+                for item in rb_result.get("items", [])
+            )
+            analog_allowed = any(
+                marker in (req or "").lower()
+                for req in rb_result.get("general_requirements", [])
+                for marker in ["аналог", "эквивалент"]
+            )
+
+            for item in rb_result.get("items", []):
+                if (
+                    has_structured_positions
+                    and not item.get("quantity")
+                    and not item.get("unit")
+                ):
+                    continue
+
+                chars = []
+                for raw_char in item.get("characteristics", []) or []:
+                    entry = self._characteristic_text_to_entry(raw_char)
+                    if entry:
+                        chars.append(entry)
+
+                parsed_positions.append({
+                    "position_name_raw": item.get("position_name") or item.get("normalized_name") or "",
+                    "position_name_normalized": item.get("normalized_name") or item.get("position_name") or "",
+                    "quantity": item.get("quantity"),
+                    "unit": item.get("unit"),
+                    "characteristics": chars,
+                    "general_requirements_applied": bool(rb_result.get("general_requirements")),
+                    "analog_allowed": analog_allowed,
+                    "manufacturer_or_brand_required": False,
+                    "source_documents": [{
+                        "file": filename,
+                        "page_or_sheet": "excerpt",
+                        "fragment_type": "GOODS_SPEC",
+                        "evidence": self._normalize_string(item.get("source_fragment"))[:500],
+                    }],
+                    "notes": item.get("notes") or "",
+                })
+
+            for req_index, req in enumerate(rb_result.get("general_requirements", []), start=1):
+                req_text = self._normalize_string(req)
+                if not req_text:
+                    continue
+                parsed_general.append({
+                    "name": f"Общее требование {req_index}",
+                    "value": req_text,
+                    "source_documents": [{
+                        "file": filename,
+                        "page_or_sheet": "excerpt",
+                        "fragment_type": "GOODS_GENERAL_REQUIREMENTS",
+                        "evidence": req_text[:500],
+                    }],
+                })
+
+            for warning in rb_result.get("warnings", []):
+                warning = self._normalize_string(warning)
+                if warning and warning not in fallback_warnings:
+                    fallback_warnings.append(warning)
+
+        if parsed_positions:
+            fallback_warnings = [
+                warning
+                for warning in fallback_warnings
+                if warning not in {
+                    "Не найден релевантный фрагмент ТЗ/спецификации",
+                    "Позиции не выделены автоматически. Требуется ручная проверка блока ТЗ.",
+                }
+            ]
+
+        normalized = self._normalize_extraction_result(
+            {
+                "positions": parsed_positions,
+                "general_goods_requirements": parsed_general,
+                "extraction_summary": {
+                    "warnings": fallback_warnings,
+                },
+            },
+            context_meta,
+            tender_id,
+            job_id,
+        )
+
+        if reason not in normalized["warnings"]:
+            normalized["warnings"].insert(0, reason)
+            normalized["extraction_summary"]["warnings"] = normalized["warnings"]
+
+        logger.info(
+            f"[GOODS_EXTRACTION_RULE_BASED_FALLBACK] tender_id={tender_id} job_id={job_id} "
+            f"positions_count={len(normalized.get('positions', []))} "
+            f"general_requirements_count={len(normalized.get('general_goods_requirements', []))}"
+        )
+
+        return normalized
 
     def _classify_text_fragment(self, text: str) -> str:
         low = (text or "").lower()
@@ -303,10 +761,10 @@ class GoodsExtractionService:
             "смета", "коммерческое предложение", "расчет цены"
         ]
 
-        if any(marker in low for marker in goods_general_markers):
-            return "GOODS_GENERAL_REQUIREMENTS"
         if any(marker in low for marker in goods_spec_markers):
             return "GOODS_SPEC"
+        if any(marker in low for marker in goods_general_markers):
+            return "GOODS_GENERAL_REQUIREMENTS"
         if any(marker in low for marker in contract_markers):
             return "CONTRACT_TERMS"
         if any(marker in low for marker in procurement_markers):
@@ -325,7 +783,7 @@ class GoodsExtractionService:
         status = file_data.get("status", "success")
         pages = file_data.get("pages", []) or []
         text = file_data.get("extracted_text", "") or ""
-        priority, doc_hint = self._document_priority_for_goods(filename)
+        priority, doc_hint = self._document_priority_for_goods_file(file_data)
 
         header = (
             f"=== FILE: {filename} | DOC_CLASS_HINT: {doc_hint} | "
@@ -405,6 +863,21 @@ class GoodsExtractionService:
 
         return "\n\n".join(blocks).strip() + "\n"
 
+    def _is_primary_goods_doc_candidate(self, file_data: Dict[str, Any]) -> bool:
+        if file_data.get("status", "success") != "success":
+            return False
+
+        filename = file_data.get("filename", "")
+        _, doc_hint = self._document_priority_for_goods_file(file_data)
+        if doc_hint not in {"goods_main", "goods_spec"}:
+            return False
+
+        goods_filename_hint = self._has_goods_filename_hint(filename)
+        if self._should_skip_filename_for_goods(filename) and not goods_filename_hint:
+            return False
+
+        return True
+
     def _build_goods_documents_block(
         self,
         files_data: List[Dict[str, Any]],
@@ -413,7 +886,20 @@ class GoodsExtractionService:
     ) -> Tuple[str, Dict[str, Any]]:
         logger.info(f"[GOODS_CONTEXT_BUILD_START] tender_id={tender_id} files_count={len(files_data)}")
 
-        sorted_files = sorted(files_data, key=lambda f: self._document_priority_for_goods(f.get("filename", "")))
+        sorted_files = sorted(files_data, key=self._document_priority_for_goods_file)
+        primary_goods_candidates = [
+            file_data.get("filename", "Unknown")
+            for file_data in sorted_files
+            if self._is_primary_goods_doc_candidate(file_data)
+        ]
+        has_primary_goods_docs = bool(primary_goods_candidates)
+
+        if primary_goods_candidates:
+            logger.info(
+                "[GOODS_CONTEXT_PRIMARY_DOCS] tender_id=%s candidates=%s",
+                tender_id,
+                primary_goods_candidates,
+            )
 
         included_files: List[str] = []
         skipped_files: List[Dict[str, Any]] = []
@@ -422,10 +908,12 @@ class GoodsExtractionService:
         total_chars = 0
         total_pages = 0
         total_tables = 0
+        seen_excerpt_hashes = set()
 
         for file_data in sorted_files:
             filename = file_data.get("filename", "Unknown")
             status = file_data.get("status", "success")
+            _, doc_hint = self._document_priority_for_goods_file(file_data)
 
             if self._is_archive(filename):
                 archives_skipped.append({
@@ -442,7 +930,27 @@ class GoodsExtractionService:
                 })
                 continue
 
-            rendered = self._render_goods_pages(file_data, tender_id=tender_id)
+            if has_primary_goods_docs and doc_hint == "contract":
+                skipped_files.append({
+                    "filename": filename,
+                    "reason": "contract_skipped_because_primary_goods_doc_present",
+                })
+                continue
+
+            prepared_file_data, skip_meta = self._build_relevant_excerpt_file_data(file_data, tender_id=tender_id)
+            if not prepared_file_data:
+                skipped_files.append(skip_meta or {"filename": filename, "reason": "not_relevant_for_goods_context"})
+                continue
+
+            excerpt_hash = hashlib.sha1(
+                (prepared_file_data.get("extracted_text", "") or "").encode("utf-8", errors="ignore")
+            ).hexdigest()
+            if excerpt_hash in seen_excerpt_hashes:
+                skipped_files.append({"filename": filename, "reason": "duplicate_excerpt"})
+                continue
+            seen_excerpt_hashes.add(excerpt_hash)
+
+            rendered = self._render_goods_pages(prepared_file_data, tender_id=tender_id)
             if not rendered.strip():
                 skipped_files.append({"filename": filename, "reason": "empty_render"})
                 continue
@@ -454,8 +962,8 @@ class GoodsExtractionService:
             rendered_parts.append(rendered)
             included_files.append(filename)
             total_chars += len(rendered)
-            total_pages += len(file_data.get("pages", []))
-            total_tables += sum(len(p.get("tables", [])) for p in file_data.get("pages", []))
+            total_pages += len(prepared_file_data.get("pages", []))
+            total_tables += sum(len(p.get("tables", [])) for p in prepared_file_data.get("pages", []))
 
         block = "\n\n".join(rendered_parts).strip()
         meta = {
@@ -541,9 +1049,70 @@ class GoodsExtractionService:
                 last_error = exc
 
         if last_error is not None:
+            partial = self._recover_partial_json_payload(text)
+            if partial is not None:
+                return partial
             raise last_error
 
         raise json.JSONDecodeError("Empty JSON response", text, 0)
+
+    def _recover_partial_json_payload(self, text: str) -> Optional[Dict[str, Any]]:
+        positions = self._parse_partial_json_array_by_key(text, "positions")
+        general_requirements = self._parse_partial_json_array_by_key(
+            text,
+            "general_goods_requirements",
+        )
+        warnings = self._parse_partial_json_array_by_key(text, "warnings")
+
+        if not positions and not general_requirements:
+            return None
+
+        summary_warnings = [
+            "AI вернул неполный JSON. Сохранена только корректно разобранная часть ответа."
+        ]
+        if isinstance(warnings, list):
+            for warning in warnings:
+                warning_text = self._normalize_string(warning)
+                if warning_text and warning_text not in summary_warnings:
+                    summary_warnings.append(warning_text)
+
+        return {
+            "positions": positions if isinstance(positions, list) else [],
+            "general_goods_requirements": (
+                general_requirements if isinstance(general_requirements, list) else []
+            ),
+            "warnings": warnings if isinstance(warnings, list) else [],
+            "extraction_summary": {
+                "warnings": summary_warnings,
+            },
+        }
+
+    def _parse_partial_json_array_by_key(self, text: str, key: str) -> List[Any]:
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*\[', text)
+        if not match:
+            return []
+
+        array_start = text.find("[", match.start())
+        if array_start < 0:
+            return []
+
+        decoder = json.JSONDecoder()
+        items: List[Any] = []
+        idx = array_start + 1
+        length = len(text)
+
+        while idx < length:
+            while idx < length and text[idx] in " \t\r\n,":
+                idx += 1
+            if idx >= length or text[idx] == "]":
+                break
+            try:
+                item, idx = decoder.raw_decode(text, idx)
+            except json.JSONDecodeError:
+                break
+            items.append(item)
+
+        return items
 
     def _normalize_string(self, value: Any) -> str:
         if value is None:
@@ -551,6 +1120,116 @@ class GoodsExtractionService:
         value = str(value).replace("\xa0", " ").strip()
         value = re.sub(r"\s{2,}", " ", value)
         return value
+
+    def _clean_characteristic_value(self, value: Any) -> str:
+        text = self._normalize_string(value)
+        if not text:
+            return ""
+
+        text = re.sub(
+            r"\s*[:;,. -]*\b(?:рул(?:он)?|шт|кг|м2|м²|м3|м³|м|мм)\b\s+"
+            r"(?=(?:в\s+течение|с\s+момента|с\s+даты|не\s+позднее|календарн\w+\s+дн|рабоч\w+\s+дн))"
+            r".*$",
+            "",
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r"\b(?:в\s+течение|с\s+момента\s+подписания|с\s+даты\s+подписания|"
+            r"не\s+позднее|календарн\w+\s+дн|рабоч\w+\s+дн|момента\s+подписания)\b.*$",
+            "",
+            text,
+            flags=re.I,
+        )
+        text = text.strip(" .;,:-–—")
+        text = re.sub(r"^\s*[-–—]+\s*", "", text)
+        return text
+
+    def _has_technical_characteristic_markers(self, text: str) -> bool:
+        normalized = self._normalize_string(text).lower()
+        if not normalized:
+            return False
+        return bool(
+            re.search(
+                r"\b("
+                r"гост|сто|ту|мм|м2|м²|м3|м³|кг|кг/м2|кг/м²|л|"
+                r"толщин|масса|плотност|разрыв|гибкост|теплостойк|"
+                r"водопоглощ|водонепроницаем|водоупор|основ|покрыти|"
+                r"посыпк|материал|стеклоткан|стеклохолст|полиэстер|"
+                r"битум|пленк|сланец|гранулят|цвет|размер|диаметр|"
+                r"длина|ширина|высота|профиль|серия|назначени|монтаж"
+                r")\b",
+                normalized,
+                re.I,
+            )
+        )
+
+    def _looks_like_commercial_characteristic_noise(self, name: str, value: str) -> bool:
+        normalized_name = self._normalize_string(name)
+        normalized_value = self._normalize_string(value)
+        combined = f"{normalized_name} {normalized_value}".strip()
+        if not combined:
+            return False
+
+        combined_low = combined.lower()
+        if any(
+            marker in combined_low
+            for marker in [
+                "преимущество",
+                "запрет",
+                "не применяется на основании",
+                "преференц",
+                "цена",
+                "стоимость",
+                "сумма",
+                "итого",
+                "ндс",
+                "налог",
+                "руб",
+                "коп",
+                "окпд",
+            ]
+        ):
+            return True
+
+        generic_unit_names = {
+            "шт",
+            "м2",
+            "м²",
+            "м3",
+            "м³",
+            "м",
+            "мм",
+            "кг",
+            "л",
+            "рулон",
+            "рул",
+            "рул.",
+        }
+        if normalized_name.lower() in generic_unit_names:
+            numeric_parts = re.findall(r"\d+(?:[.,]\d+)?", normalized_value)
+            if len(numeric_parts) >= 1 and not self._has_technical_characteristic_markers(
+                re.sub(r"\b(?:шт|м2|м²|м3|м³|м|мм|кг|л|рулон|рул\.?)\b", "", normalized_value, flags=re.I)
+            ):
+                return True
+
+        if (
+            re.fullmatch(r"\d+(?:\s+\d+)*(?:[.,]\d+)?", normalized_name)
+            and not self._has_technical_characteristic_markers(normalized_value)
+        ):
+            if re.search(r"\d+[.,]\d+", normalized_value) or re.search(r"\b00\b", normalized_value):
+                return True
+            if re.fullmatch(r"(?:\d+(?:[.,]\d+)?\s*){1,4}", normalized_value):
+                return True
+
+        if (
+            not self._has_technical_characteristic_markers(combined)
+            and len(re.findall(r"\d+(?:[.,]\d+)?", combined)) >= 3
+            and not re.search(r"[xх]\d", combined, re.I)
+        ):
+            return True
+
+        return False
 
     def _normalize_quantity(self, value: Any) -> str:
         text = self._normalize_string(value)
@@ -565,6 +1244,360 @@ class GoodsExtractionService:
         text = re.sub(r"\s{2,}", " ", text)
         return text.strip(" ,;:-")
 
+    def _normalize_unit_for_compare(self, value: Any) -> str:
+        low = self._normalize_string(value).lower().strip(" .")
+        unit_aliases = [
+            (r"(м2|м²|кв\.?\s*м\.?)", "м2"),
+            (r"(м3|м³|куб\.?\s*м\.?)", "м3"),
+            (r"(м|метр\w*)", "м"),
+            (r"(мм|миллиметр\w*)", "мм"),
+            (r"(кг|килограмм\w*)", "кг"),
+            (r"(л|литр\w*)", "л"),
+            (r"(шт|штук\w*|штука\w*)", "шт"),
+            (r"(рул(?:он)?(?:ов)?|рул\.?|рулон\w*)", "рулон"),
+        ]
+        for pattern, canonical in unit_aliases:
+            if re.fullmatch(pattern, low, re.I):
+                return canonical
+        return low
+
+    def _quantity_compare_key(self, value: Any) -> str:
+        text = self._normalize_quantity(value).replace(",", ".")
+        if not text:
+            return ""
+        if re.fullmatch(r"\d+(?:\.\d+)?", text):
+            try:
+                decimal_value = Decimal(text)
+                normalized = format(decimal_value.normalize(), "f")
+                return normalized.rstrip("0").rstrip(".") or "0"
+            except (InvalidOperation, ValueError):
+                return text
+        return text
+
+    def _position_name_signature(self, value: str) -> List[str]:
+        text = self._normalize_position_name(value).lower()
+        for pattern, replacement in [
+            (r"гидроизоляцион\w*|гидроизоляц\w*", "гидроизоляц"),
+            (r"кровельн\w*|кровл\w*", "кровл"),
+            (r"битумн\w*", "битум"),
+            (r"полимерн\w*", "полимер"),
+            (r"стеклоткан\w*", "стеклоткан"),
+            (r"посыпк\w*", "посыпк"),
+            (r"рулонн\w*", "рулон"),
+            (r"мастик\w*", "мастика"),
+            (r"праймер\w*", "праймер"),
+        ]:
+            text = re.sub(pattern, replacement, text, flags=re.I)
+
+        stopwords = {
+            "материал", "товар", "для", "по", "на", "с", "и",
+            "готового", "готовый", "применению",
+        }
+        tokens = []
+        for token in re.split(r"[^a-zа-я0-9]+", text, flags=re.I):
+            token = token.strip()
+            if not token or token in stopwords:
+                continue
+            if len(token) < 4 and not re.search(r"\d", token):
+                continue
+            tokens.append(token)
+        return sorted(set(tokens))
+
+    def _position_name_score(self, value: str) -> int:
+        name = self._normalize_position_name(value)
+        signature = self._position_name_signature(name)
+        score = len(signature) * 10 + len(name)
+        if re.search(r"\d", name):
+            score += 5
+        if "(" in name or ")" in name:
+            score += 3
+        return score
+
+    def _positions_can_merge_by_similarity(self, base: Dict[str, Any], item: Dict[str, Any]) -> bool:
+        base_qty = self._quantity_compare_key(base.get("quantity"))
+        item_qty = self._quantity_compare_key(item.get("quantity"))
+        if not base_qty or not item_qty or base_qty != item_qty:
+            return False
+
+        base_unit = self._normalize_unit_for_compare(base.get("unit"))
+        item_unit = self._normalize_unit_for_compare(item.get("unit"))
+        if not base_unit or not item_unit or base_unit != item_unit:
+            return False
+
+        base_signature = set(
+            self._position_name_signature(
+                base.get("position_name_normalized") or base.get("position_name_raw") or ""
+            )
+        )
+        item_signature = set(
+            self._position_name_signature(
+                item.get("position_name_normalized") or item.get("position_name_raw") or ""
+            )
+        )
+        if not base_signature or not item_signature:
+            return False
+
+        intersection = base_signature & item_signature
+        if len(intersection) < 2:
+            return False
+
+        return (
+            intersection == base_signature
+            or intersection == item_signature
+            or len(intersection) / min(len(base_signature), len(item_signature)) >= 0.75
+        )
+
+    def _parse_characteristic_piece(self, piece: str) -> Optional[Dict[str, str]]:
+        piece = self._normalize_string(piece).strip(" .;,")
+        if not piece:
+            return None
+        if self._looks_like_commercial_characteristic_noise("", piece):
+            return None
+        if re.fullmatch(r"(шт|м2|м3|м|мм|кг|л|рул(?:он)?|рулон)", piece, re.I):
+            return None
+        if re.match(r"^(?:\d+(?:[.,]\d+)?\s*м2\s*)?[ОO][КK]ПД2?\b", piece, re.I):
+            return None
+        area_match = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*м2", piece, re.I)
+        if area_match:
+            return {"name": "Площадь рулона, м2", "value": area_match.group(1)}
+
+        piece = re.sub(r"^по\s+способу\s+монтажа\s+(.+)$", r"Способ монтажа: \1", piece, flags=re.I)
+        piece = re.sub(r"^по\s+назначению\s+(.+)$", r"Назначение: \1", piece, flags=re.I)
+        piece = re.sub(r"(°[CС])(?=не\s+)", r"\1 ", piece, flags=re.I)
+        piece = re.sub(r"(\))(?=\d)", r"\1 ", piece)
+        piece = re.sub(
+            r"^(Масса\s*1\s*м2(?:,\s*кг)?(?:,\s*\([^)]*\))?)\s*(\d+(?:[.,]\d+)?)$",
+            r"\1: \2",
+            piece,
+            flags=re.I,
+        )
+        piece = re.sub(
+            r"^(Теплостойкость(?:,\s*°?[CС])?)\s*(не\s+менее|не\s+более|не\s+выше|не\s+ниже)\s*(.+)$",
+            r"\1: \2 \3",
+            piece,
+            flags=re.I,
+        )
+        piece = re.sub(
+            r"^(Температура\s+гибкости[^:]+?)\s*(не\s+менее|не\s+более|не\s+выше|не\s+ниже)\s*(.+)$",
+            r"\1: \2 \3",
+            piece,
+            flags=re.I,
+        )
+        piece = re.sub(r"\s*:\s*(?:шт|м2|м3|м|мм|кг|л|рул(?:он)?|рулон)\s+\d+(?:[.,]\d+)?\s*$", "", piece, flags=re.I)
+        piece = re.sub(r"\s*:\s*(?:шт|м2|м3|м|мм|кг|л|рул(?:он)?|рулон)\s*$", "", piece, flags=re.I)
+
+        label_re = (
+            r"(Посыпка|Основа покрытия|Основа|Материал основы|Материал покрытия верхней стороны|"
+            r"Тип защитного покрытия|Цветовой оттенок|Цвет|Покрытие|"
+            r"Высота(?:\s*\(мм\)|,\s*мм)?|Ширина(?: листа| общая| рулона)?(?:\s*\(мм\)|,\s*м|,\s*мм)?|"
+            r"Длина(?: рулона)?(?:\s*\(мм\)|,\s*мм)?|Диаметр(?:,\s*мм)?|Толщина(?: металла)?(?:\s*\(мм\)|,\s*мм)?|"
+            r"Масса\s*1\s*м2(?:,\s*кг(?:,\s*\([^)]*\))?)?|"
+            r"Разрывная сила(?:\s+[^:]+)?|Температура гибкости(?:\s+[^:]+)?|Теплостойкость(?:,\s*°?[CС])?|"
+            r"Водопоглощение|Профиль|Серия|Материал|Вид|Размер|Тип продукции|Тип формы|Тип изоляции|Тип|"
+            r"Тип наконечника|Тип шлица|Тип шляпки\s*\(головка\)|Шайба|"
+            r"Количество слоев(?:,\s*шт)?|Площадь рулона(?:,\s*м2)?|"
+            r"Верхняя сторона|Нижняя сторона|"
+            r"Водонепроницаемость|Водоупорность(?:,\s*мм\.?\s*вод\.?\s*ст\.?)?|"
+            r"Назначение|Способ монтажа)"
+        )
+
+        if ":" in piece:
+            name, value = piece.split(":", 1)
+        else:
+            match = re.match(rf"^(?P<name>{label_re})\s+(?P<value>.+)$", piece, re.I)
+            if match:
+                name = match.group("name")
+                value = match.group("value")
+            else:
+                match = re.match(
+                    r"^(?P<name>.+?),\s*(?P<value>(?:не\s+менее|не\s+более|не\s+выше|не\s+ниже|от\s+|до\s+|в\s+пределах\b|\d).+)$",
+                    piece,
+                    re.I,
+                )
+                if match:
+                    name = match.group("name")
+                    value = match.group("value")
+                else:
+                    if len(piece) <= 160 and re.search(
+                        r"\b(не\s+менее|не\s+более|мм|м2|м3|кг|л|сталь|битум|полиэстер|коричнев|белый|гидроизоляц)\b",
+                        piece,
+                        re.I,
+                    ):
+                        return {"name": "", "value": piece}
+                    return None
+
+        name = self._normalize_string(name)
+        name = re.sub(
+            r",?\s*(не\s+менее|не\s+более|не\s+выше|не\s+ниже)\s*$",
+            "",
+            name,
+            flags=re.I,
+        ).strip(" .;,:")
+        value = self._normalize_string(value).strip(" .;,:")
+        value = re.sub(
+            r"^(не\s+(?:менее|более|выше|ниже))(?=\d)",
+            r"\1 ",
+            value,
+            flags=re.I,
+        )
+        if not value:
+            return None
+        if self._looks_like_commercial_characteristic_noise(name, value):
+            return None
+        return {"name": name, "value": value}
+
+    def _split_characteristic_blob(self, text: str) -> List[Dict[str, str]]:
+        text = self._normalize_string(text)
+        if not text:
+            return []
+
+        area_entries: List[Dict[str, str]] = []
+        text = re.sub(r"https?://\S+", "", text, flags=re.I)
+        text = text.replace("мм. вод.ст.", "мм вод ст")
+        text = text.replace("час.", "час")
+        for match in re.finditer(r"(?<!\d)(\d+(?:[.,]\d+)?)\s*м2(?=\s*[ОO][КK]ПД2?\b)", text, re.I):
+            area_entries.append({"name": "Площадь рулона, м2", "value": match.group(1)})
+        text = re.sub(r"(?<!\d)\d+(?:[.,]\d+)?\s*м2(?=\s*[ОO][КK]ПД2?\b)", "", text, flags=re.I)
+        text = re.sub(r"\b[ОO][КK]ПД2?\s*:\s*[\d.\-]+", "", text, flags=re.I)
+        text = re.sub(r"^\s*рул(?:он)?\.?\s*\d+(?:[.,]\d+)?\s*м2\s*", "", text, flags=re.I)
+        text = re.sub(r"^\s*рул(?:он)?\.?\s*\d+(?:[.,]\d+)?\s*м\b", "", text, flags=re.I)
+        text = re.sub(r"^\s*\d+(?:[.,]\d+)?\s*м2\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*:\s*(?:шт|м2|м3|м|мм|кг|л|рул(?:он)?|рулон)\s+\d+(?:[.,]\d+)?\s*$", "", text, flags=re.I)
+        text = self._normalize_string(text)
+
+        marker_patterns = [
+            r"Материал\s*:",
+            r"Материал основы\s*:",
+            r"Материал покрытия верхней стороны\s*:",
+            r"Тип защитного покрытия\s*:",
+            r"Цвет\s*:",
+            r"Покрытие\s*:",
+            r"Высота(?:\s*\(мм\)|,\s*мм)?\s*:",
+            r"Ширина(?: листа| общая| рулона)?(?:\s*\(мм\)|,\s*м|,\s*мм)?\s*:",
+            r"Длина(?: рулона)?(?:\s*\(мм\)|,\s*мм)?\s*:",
+            r"Диаметр(?:,\s*мм)?\s*:",
+            r"Толщина(?: металла)?(?:\s*\(мм\)|,\s*мм)?\s*:",
+            r"Масса\s*1\s*м2(?:,\s*кг(?:,\s*\([^)]*\))?)?\s*:",
+            r"Разрывная сила(?:\s+[^:]+)?\s*:",
+            r"Температура гибкости(?:\s+[^:]+)?\s*:",
+            r"Теплостойкость(?:,\s*°?[CС])?\s*:",
+            r"Профиль\s*:",
+            r"Серия\s*:",
+            r"Основа покрытия\s*:",
+            r"Цветовой оттенок\s*:",
+            r"Тип формы\s*:",
+            r"Тип продукции\s*:",
+            r"Тип изоляции\s*:",
+            r"Тип наконечника\s*:",
+            r"Тип шлица\s*:",
+            r"Тип шляпки\s*\(головка\)\s*:",
+            r"Шайба\s*:",
+            r"Водонепроницаемость\s*:",
+            r"Водоупорность(?:,\s*мм\.?\s*вод\.?\s*ст\.?)?\s*:",
+            r"Количество слоев(?:,\s*шт)?\s*:",
+            r"Площадь рулона(?:,\s*м2)?\s*:",
+            r"Водопоглощение\s*:",
+            r"Вид\s*:",
+            r"Размер\s*:",
+        ]
+        for pattern in marker_patterns:
+            text = re.sub(rf"(?<!^)(?={pattern})", "||", text, flags=re.I)
+
+        for pattern in [
+            r"По\s+способу\s+монтажа\b",
+            r"Толщина\b",
+            r"Масса\s*1\s*м2\b",
+            r"Разрывная\s+сила\b",
+            r"Температура\s+гибкости\b",
+            r"Теплостойкость\b",
+            r"Ширина\b",
+            r"Высота\b",
+            r"Длина\b",
+            r"Длина\s+рулона\b",
+            r"Диаметр\b",
+            r"Посыпка\b",
+            r"Материал\s+основы\b",
+            r"Материал\s+покрытия\s+верхней\s+стороны\b",
+            r"Тип\s+защитного\s+покрытия\b",
+            r"Основа\b",
+            r"Покрытие\b",
+            r"Тип\b",
+            r"Количество\s+слоев\b",
+            r"Площадь\s+рулона\b",
+            r"Водопоглощение\b",
+            r"Водоупорность\b",
+            r"Верхняя\s+сторона\b",
+            r"Нижняя\s+сторона\b",
+        ]:
+            text = re.sub(rf"(?<!^)(?={pattern})", "||", text, flags=re.I)
+
+        pieces: List[Dict[str, str]] = []
+        for chunk in text.split("||"):
+            for sentence in re.split(r"(?<!\d)[.;](?!\d)", chunk):
+                entry = self._parse_characteristic_piece(sentence)
+                if entry:
+                    pieces.append(entry)
+
+        seen = set()
+        normalized_entries: List[Dict[str, str]] = []
+        for entry in area_entries + pieces:
+            key = (entry["name"].lower(), entry["value"].lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized_entries.append(entry)
+        return normalized_entries
+
+    def _should_skip_characteristic_entry(self, name: str, value: str) -> bool:
+        name = self._normalize_string(name)
+        value = self._normalize_string(value)
+        combined = f"{name} {value}".strip()
+        if not combined:
+            return True
+        if self._looks_like_commercial_characteristic_noise(name, value):
+            return True
+        if re.match(r"^(?:\d+(?:[.,]\d+)?\s*м2\s*)?[ОO][КK]ПД2?\b", combined, re.I):
+            return True
+        if "в составе последнего" in combined.lower():
+            return True
+        if name.lower() == "материал" and value.lower().startswith("покрытия верхней стороны"):
+            return True
+        return False
+
+    def _is_generic_characteristic_name(self, name: str) -> bool:
+        normalized = self._normalize_string(name).lower()
+        if not normalized:
+            return True
+        if normalized in {"м2", "м3", "м", "мм", "кг", "л"}:
+            return True
+        if normalized in {"тип", "вид", "характеристика"}:
+            return True
+        return len(normalized) <= 2
+
+    def _expand_characteristic_entry(self, name: str, value: str) -> List[Dict[str, str]]:
+        if not name and not value:
+            return []
+
+        if self._is_generic_characteristic_name(name):
+            if self._normalize_string(name).lower() == "тип" and value:
+                combined = f"Тип {value}"
+            else:
+                combined = value or name
+        else:
+            combined = f"{name}: {value}" if name and value else value or name
+        split_entries = self._split_characteristic_blob(combined)
+        if len(split_entries) > 1:
+            return split_entries
+
+        if split_entries:
+            return split_entries
+
+        fallback_name = self._normalize_string(name)
+        fallback_value = self._normalize_string(value)
+        if fallback_name or fallback_value:
+            return [{"name": fallback_name, "value": fallback_value}]
+        return []
+
     def _normalize_characteristics(self, characteristics: Any) -> List[Dict[str, str]]:
         result: List[Dict[str, str]] = []
 
@@ -576,14 +1609,27 @@ class GoodsExtractionService:
             if not isinstance(item, dict):
                 continue
             name = self._normalize_string(item.get("name"))
-            value = self._normalize_string(item.get("value"))
-            if not name and not value:
-                continue
-            key = (name.lower(), value.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append({"name": name, "value": value})
+            value = self._clean_characteristic_value(item.get("value"))
+            for entry in self._expand_characteristic_entry(name, value):
+                if self._should_skip_characteristic_entry(entry.get("name", ""), entry.get("value", "")):
+                    continue
+                if not entry.get("name") and not entry.get("value"):
+                    continue
+                clean_name = self._normalize_string(entry.get("name"))
+                clean_value = self._clean_characteristic_value(entry.get("value"))
+                if not clean_name and not clean_value:
+                    continue
+                key = (
+                    clean_name.lower(),
+                    clean_value.lower(),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append({
+                    "name": clean_name,
+                    "value": clean_value,
+                })
 
         return result
 
@@ -637,17 +1683,49 @@ class GoodsExtractionService:
             if not key:
                 continue
 
-            if key not in merged:
+            merge_key = None
+
+            if key in merged:
+                base = merged[key]
+                base_qty = self._normalize_string(base.get("quantity"))
+                item_qty = self._normalize_string(item.get("quantity"))
+                base_unit = self._normalize_string(base.get("unit")).lower()
+                item_unit = self._normalize_string(item.get("unit")).lower()
+
+                if (
+                    (base_qty and item_qty and base_qty != item_qty)
+                    or (base_unit and item_unit and base_unit != item_unit)
+                ):
+                    alt_key = f"{key}__{item_qty}__{item_unit}"
+                    if alt_key not in merged:
+                        merged[alt_key] = item
+                        continue
+                    merge_key = alt_key
+                else:
+                    merge_key = key
+            else:
+                for existing_key, existing_item in merged.items():
+                    if self._positions_can_merge_by_similarity(existing_item, item):
+                        merge_key = existing_key
+                        break
+
+            if merge_key is None and key not in merged:
                 merged[key] = item
                 continue
 
             duplicates_merged += 1
-            base = merged[key]
+            base = merged[merge_key or key]
 
             if not base.get("quantity") and item.get("quantity"):
                 base["quantity"] = item.get("quantity")
             if not base.get("unit") and item.get("unit"):
                 base["unit"] = item.get("unit")
+
+            base_name = base.get("position_name_normalized") or base.get("position_name_raw") or ""
+            item_name = item.get("position_name_normalized") or item.get("position_name_raw") or ""
+            if self._position_name_score(item_name) > self._position_name_score(base_name):
+                base["position_name_raw"] = item.get("position_name_raw") or item_name
+                base["position_name_normalized"] = item.get("position_name_normalized") or item_name
 
             existing_chars = {(c["name"].lower(), c["value"].lower()) for c in base.get("characteristics", [])}
             for char in item.get("characteristics", []):
